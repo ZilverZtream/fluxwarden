@@ -1,0 +1,70 @@
+{
+  "numTotalTestSuites": 2,
+  "numPassedTestSuites": 2,
+  "numFailedTestSuites": 0,
+  "numPendingTestSuites": 0,
+  "numTotalTests": 3,
+  "numPassedTests": 3,
+  "numFailedTests": 0,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "snapshot": {},
+  "startTime": 0,
+  "success": true,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": [
+            "suite"
+          ],
+          "fullName": "suite one",
+          "status": "passed",
+          "title": "one",
+          "duration": 1,
+          "failureMessages": [],
+          "meta": {},
+          "tags": []
+        },
+        {
+          "ancestorTitles": [
+            "suite"
+          ],
+          "fullName": "suite two",
+          "status": "passed",
+          "title": "two",
+          "duration": 1,
+          "failureMessages": [],
+          "meta": {},
+          "tags": []
+        }
+      ],
+      "startTime": 0,
+      "endTime": 1,
+      "status": "passed",
+      "message": "",
+      "name": "/repo/test/a.test.ts"
+    },
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": [
+            "suite"
+          ],
+          "fullName": "suite three",
+          "status": "passed",
+          "title": "three",
+          "duration": 1,
+          "failureMessages": [],
+          "meta": {},
+          "tags": []
+        }
+      ],
+      "startTime": 0,
+      "endTime": 1,
+      "status": "passed",
+      "message": "",
+      "name": "/repo/test/b.test.ts"
+    }
+  ]
+}

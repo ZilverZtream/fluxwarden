@@ -1,0 +1,72 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+# A newer push to a pull request or feature branch cancels the run it supersedes;
+# every run on main completes, so each main commit keeps its own result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Every platform reports its own result; one failure does not cancel the rest.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: ['22.23.2', '22.x', '24.18.1', '24.x']
+        include:
+          - { os: windows-latest, node: '22.23.2' }
+          - { os: windows-latest, node: '24.x' }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
+      - run: npm run test:harness -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-harness.json"
+      # Vitest exits 0 with skipped tests; every test must have run and passed.
+      - run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json" "$RUNNER_TEMP/vitest-harness.json"
+  # The regtest lab and chaos runs: Linux only, started by hand, never a test loop.
+  lab:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '22.23.2'
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run test:lab
+  chaos:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '22.23.2'
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm run test:chaos

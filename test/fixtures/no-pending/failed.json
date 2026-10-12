@@ -1,0 +1,51 @@
+{
+  "numTotalTestSuites": 1,
+  "numPassedTestSuites": 1,
+  "numFailedTestSuites": 0,
+  "numPendingTestSuites": 0,
+  "numTotalTests": 2,
+  "numPassedTests": 1,
+  "numFailedTests": 1,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "snapshot": {},
+  "startTime": 0,
+  "success": false,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": [
+            "suite"
+          ],
+          "fullName": "suite one",
+          "status": "passed",
+          "title": "one",
+          "duration": 1,
+          "failureMessages": [],
+          "meta": {},
+          "tags": []
+        },
+        {
+          "ancestorTitles": [
+            "suite"
+          ],
+          "fullName": "suite two",
+          "status": "failed",
+          "title": "two",
+          "duration": 1,
+          "failureMessages": [
+            "AssertionError: expected 1 to be 2"
+          ],
+          "meta": {},
+          "tags": []
+        }
+      ],
+      "startTime": 0,
+      "endTime": 1,
+      "status": "failed",
+      "message": "",
+      "name": "/repo/test/a.test.ts"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "numTotalTestSuites": 2,
+  "numPassedTestSuites": 1,
+  "numFailedTestSuites": 1,
+  "numPendingTestSuites": 0,
+  "numTotalTests": 1,
+  "numPassedTests": 1,
+  "numFailedTests": 0,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "snapshot": {},
+  "startTime": 0,
+  "success": false,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": [
+            "suite"
+          ],
+          "fullName": "suite one",
+          "status": "passed",
+          "title": "one",
+          "duration": 1,
+          "failureMessages": [],
+          "meta": {},
+          "tags": []
+        }
+      ],
+      "startTime": 0,
+      "endTime": 1,
+      "status": "passed",
+      "message": "",
+      "name": "/repo/test/a.test.ts"
+    },
+    {
+      "assertionResults": [],
+      "startTime": 0,
+      "endTime": 1,
+      "status": "failed",
+      "message": "Failed to load test file",
+      "name": "/repo/test/broken.test.ts"
+    }
+  ]
+}
