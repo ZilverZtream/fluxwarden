@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "cln": [
+    {
+      "name": "listchannels",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/listchannels.json",
+      "sha256": "7d1460bd5962758658fdacc7bc1f32c44faf5a1b99ae26084dcdab9c6a8d6c1a"
+    },
+    {
+      "name": "listpeerchannels",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/listpeerchannels.json",
+      "sha256": "f51030f9ba2780c5f35c6cbce3b937951887826d83f300f0c2c6fba0fd6ca420"
+    },
+    {
+      "name": "getinfo",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/getinfo.json",
+      "sha256": "d7340d3cb44f6d7f5077c6a1d612a94f5188d90c058accd3472467221e6e02b9"
+    },
+    {
+      "name": "askrene-listlayers",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/askrene-listlayers.json",
+      "sha256": "091deb5f88573cdfc8fd81b3084d7ac3c6b52adb43a8d6b8ce564320797205a2"
+    },
+    {
+      "name": "newaddr",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/newaddr.json",
+      "sha256": "b4497fba159cb911df92617eff3c54608c161c3f37fa3ad203e0ef0e49b7105d"
+    },
+    {
+      "name": "listfunds",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/listfunds.json",
+      "sha256": "13c5ab4e4dc36e0692fe6d12fb0604ccddb5faec4fdbdcfd0198b700e2f4001a"
+    },
+    {
+      "name": "listpeers",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/listpeers.json",
+      "sha256": "f3d2e672b631651e4c2d4e9bf0c8f7aeea999cb058fa503c4f97059bbb8ed213"
+    },
+    {
+      "name": "fundchannel",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/fundchannel.json",
+      "sha256": "e50e32d24389cf33c95b0adb788dd2af9188be63fac6736bc03cfec6d4c83ecc"
+    },
+    {
+      "name": "setchannel",
+      "url": "https://raw.githubusercontent.com/ElementsProject/lightning/v26.06.9/doc/schemas/setchannel.json",
+      "sha256": "903f7aedb1aa5833ec70b0cd78061c8c30145c96f56c31482eb02bef4c5ca2e7"
+    }
+  ],
+  "correction": {
+    "rpc": "askrene-listlayers",
+    "example": 2,
+    "allowed": "persistent xpay only when all setup constraint/update collections are empty"
+  },
+  "failedLookup": {
+    "name": "getnewaddr",
+    "status": 404,
+    "correctRpc": "newaddr"
+  }
+}

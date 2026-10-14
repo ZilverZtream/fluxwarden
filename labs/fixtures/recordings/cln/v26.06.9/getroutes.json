@@ -1,0 +1,25 @@
+{
+  "id": "getroutes",
+  "impl": "cln",
+  "version": "v26.06.9",
+  "node": "cln-m",
+  "request": {
+    "method": "POST",
+    "path": "/v1/getroutes",
+    "body": {
+      "source": "038f46d8dc70879ff815d1174f0db91ea353c77e96ed33e54620856e87036c11a3",
+      "destination": "023f19f78eb4984ec2f908994a73060bb661d94d0220ba3236e35f76431d7dcd0a",
+      "amount_msat": 100000000,
+      "layers": [
+        "auto.localchans"
+      ],
+      "maxfee_msat": 10000000,
+      "final_cltv": 34,
+      "maxparts": 1
+    }
+  },
+  "response": {
+    "status": 201,
+    "body": "{\"probability_ppm\":1000000,\"routes\":[{\"amount_msat\":100000000,\"final_cltv\":34,\"path\":[{\"amount_in_msat\":100202101,\"amount_out_msat\":100101000,\"cltv_in\":148,\"cltv_out\":68,\"node_id_in\":\"038f46d8dc70879ff815d1174f0db91ea353c77e96ed33e54620856e87036c11a3\",\"node_id_out\":\"03a60500aae6a25f91f092531be4f5c961fb6fe49987fe254eb1a4738189b5c54a\",\"short_channel_id_dir\":\"108x3x0/0\"},{\"amount_in_msat\":100101000,\"amount_out_msat\":100000000,\"cltv_in\":68,\"cltv_out\":34,\"node_id_in\":\"03a60500aae6a25f91f092531be4f5c961fb6fe49987fe254eb1a4738189b5c54a\",\"node_id_out\":\"023f19f78eb4984ec2f908994a73060bb661d94d0220ba3236e35f76431d7dcd0a\",\"short_channel_id_dir\":\"108x1x0/1\"}],\"probability_ppm\":1000000}]}"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "fluxwarden",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Policy-bound liquidity controller for LND and Core Lightning.",
   "homepage": "https://github.com/ZilverZtream/fluxwarden#readme",
   "bugs": {
@@ -31,13 +31,15 @@
     "test:harness": "vitest run --project harness-docs",
     "test:related": "vitest related --run",
     "lint": "eslint .",
-    "build": "tsc -p tsconfig.json",
-    "test:lab": "node scripts/later.mjs",
-    "test:chaos": "node scripts/later.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/build-info.mjs",
+    "prepack": "node scripts/prepack.mjs",
+    "release:smoke": "node scripts/release-smoke.mjs",
+    "test:lab": "vitest run --config vitest.lab.config.ts",
+    "test:chaos": "vitest run --config vitest.chaos.config.ts",
     "test:full": "node scripts/later.mjs",
-    "lab:up": "node scripts/later.mjs",
-    "lab:down": "node scripts/later.mjs",
-    "fixtures:record": "node scripts/later.mjs"
+    "lab:up": "node labs/docker/lab.mjs up",
+    "lab:down": "node labs/docker/lab.mjs down",
+    "fixtures:record": "node scripts/make-fixtures.mjs"
   },
   "devDependencies": {
     "typescript": "6.0.3",

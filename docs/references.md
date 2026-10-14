@@ -1,6 +1,20 @@
 # References
 
-Placeholder for the external facts FluxWarden's design relies on, each with its source, version and check date. References will be added as the implementation uses them.
+The implementation targets LND 0.21.4-beta and Core Lightning 26.06.9. Use the pinned source and schema for protocol expectations rather than an unversioned example. Links below identify primary sources used for transport, routing, payment outcome and runtime behaviour.
+
+- LND Lightning RPC definitions, including channels, payment records, route fields and invoice state: https://github.com/lightningnetwork/lnd/blob/v0.21.4-beta/lnrpc/lightning.proto
+- LND router RPC definitions, including SendToRouteV2 and tracking: https://github.com/lightningnetwork/lnd/blob/v0.21.4-beta/lnrpc/routerrpc/router.proto
+- Core Lightning 26.06.9 source and RPC schemas: https://github.com/ElementsProject/lightning/tree/v26.06.9/doc/schemas
+- Core Lightning HTLC send height and outgoing CLTV handling: https://github.com/ElementsProject/lightning/blob/v26.06.9/lightningd/pay.c
+- Core Lightning route finding and explicit single-part constraints: https://docs.corelightning.org/reference/getroutes
+- Core Lightning rune restrictions and alternative restriction semantics: https://docs.corelightning.org/reference/createrune
+- Node.js SQLite statement integer handling and transactions: https://nodejs.org/docs/latest-v24.x/api/sqlite.html
+- Node.js cryptography and Ed25519 signing: https://nodejs.org/docs/latest-v24.x/api/crypto.html
+- SQLite transactions and lock acquisition: https://www.sqlite.org/lang_transaction.html
+- npm package files allow-list and implicit included files: https://docs.npmjs.com/cli/v11/configuring-npm/package-json
+- Toxiproxy 2.12.0 implemented fault injections: https://github.com/Shopify/toxiproxy/tree/v2.12.0
+
+The [failure catalogue](references/failure-catalogue.md) records upstream edge cases and their operational consequences. A source link establishes the reported mechanism, not a claim that every hosted validation has run.
 
 ## Positioning
 

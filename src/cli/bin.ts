@@ -1,25 +1,43 @@
 #!/usr/bin/env node
 // The `fluxwarden` binary: process-level handlers, signals and the exit code around main().
 import { readFileSync } from 'node:fs';
-import { processOutput } from '../output/index.js';
+import { processOutput, processRenderOutput, type Output } from '../output/index.js';
 import { parseArgs } from './args.js';
 import { ExitCode } from './exit-codes.js';
 import { main } from './main.js';
 import { reportInternal, reportInterrupted } from './report.js';
 
 const argv = process.argv.slice(2);
-const output = processOutput();
+let fallbackExit: NodeJS.Timeout | undefined;
+let queuedWrites = 0;
+let flushBoundary = 0;
+const processStreams = processOutput();
+const output: Output = {
+  write(stream, text, done) {
+    const sequence = ++queuedWrites;
+    processStreams.write(stream, text, () => {
+      // A scheduler pause can leave the watchdog overdue just as an earlier write completes.
+      // Give the report its existing flush window from that observed output progress.
+      if (fallbackExit !== undefined && sequence <= flushBoundary) armFallbackExit();
+      done?.();
+    });
+  },
+  wrote: stream => processStreams.wrote(stream),
+};
 let json = false;
 /** The command's own exit code, once main() has returned. */
-let commandCode: ExitCode = ExitCode.SUCCESS;
+let commandCode: number = ExitCode.SUCCESS;
 let breached = false;
 let interrupted = false;
 /** This file has written its interrupt or internal-error report. */
 let reported = false;
+/** How a long-running command (the daemon) stops at the first signal, once it has registered. */
+let gracefulStop: (() => void) | null = null;
+let stopRequested = false;
 
 // Exit-code precedence: 8 INVARIANT_BREACH over 6 INTERRUPTED over the command's
 // own code. Decided whenever the code is set or the process exits, never captured earlier.
-function currentCode(): ExitCode {
+function currentCode(): number {
   if (breached) return ExitCode.INVARIANT_BREACH;
   if (interrupted) return ExitCode.INTERRUPTED;
   return commandCode;
@@ -53,17 +71,21 @@ function exitAfterPending(): void {
 const REPORT_FLUSH_MS = 75;
 
 /**
- * Bounds the wait for a report's write callback: a write that never completes (a stalled reader)
+ * Bounds each wait without output progress: a write that never completes (a stalled reader)
  * must not keep the process alive. The exit code is decided when the timer fires.
  * The timer is unref'd so it never keeps an otherwise finished process running.
  */
 function armFallbackExit(): void {
-  setTimeout(exitNow, REPORT_FLUSH_MS).unref();
+  // Only writes already queued at the failure can renew this finite grace period.
+  // Output from later command timers cannot keep the process alive.
+  if (fallbackExit === undefined) flushBoundary = queuedWrites;
+  else clearTimeout(fallbackExit);
+  fallbackExit = setTimeout(exitNow, REPORT_FLUSH_MS).unref();
 }
 
 // Any uncaught exception or unhandled rejection: exit 8 with a stage-only report, once
-// (SPEC.md §10.2, ARCHITECTURE.md §9.2 mechanism 4), and promptly: the run never continues after
-// an internal error, whatever output or timers are pending. 8 takes precedence over
+// and promptly: the run never continues after an internal error, whatever output or
+// timers are pending. 8 takes precedence over
 // every other code, so nothing that happens later can change it.
 function onInternal(): void {
   breached = true;
@@ -83,9 +105,22 @@ function onInternal(): void {
 }
 
 // The first SIGINT or SIGTERM stops the run. No command issues a mutating call yet, so the
-// interrupt always comes before one: exit 6 (SPEC.md §10.1 Interrupts), or 8 after a breach.
+// interrupt always comes before one: exit 6, or 8 after a breach.
 // A second signal ends the process at once with the code chosen so far and no second report.
+// A command with a graceful stop (the daemon, SPEC.md §10.4 DM6) finishes its current work at the
+// first signal and exits with its own code; a second signal then exits at once with 6.
 function onSignal(): void {
+  if (gracefulStop !== null && !interrupted) {
+    if (!stopRequested) {
+      stopRequested = true;
+      gracefulStop();
+      return;
+    }
+    interrupted = true;
+    process.exitCode = currentCode();
+    exitNow();
+    return;
+  }
   if (interrupted) {
     exitNow();
     return;
@@ -116,10 +151,20 @@ process.on('unhandledRejection', onInternal);
 process.on('SIGINT', onSignal);
 process.on('SIGTERM', onSignal);
 
-try {
-  json = parseArgs(argv).json;
-  commandCode = main(argv, { output, version: readVersion });
+function settle(code: number): void {
+  commandCode = code;
   process.exitCode = currentCode();
+}
+
+try {
+  const parsed = parseArgs(argv);
+  json = parsed.kind === 'command' ? parsed.command.json : parsed.json;
+  const result = main(argv, {
+    output, version: readVersion, env: process.env, execArgv: process.execArgv, nodeVersion: process.versions.node,
+    onGracefulStop: stop => { gracefulStop = stop; }, daemonOutput: () => processRenderOutput(),
+  });
+  if (typeof result === 'number') settle(result);
+  else result.then(settle, onInternal);
 } catch {
   onInternal();
 }

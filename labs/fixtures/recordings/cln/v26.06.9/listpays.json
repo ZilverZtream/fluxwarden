@@ -1,0 +1,17 @@
+{
+  "id": "listpays",
+  "impl": "cln",
+  "version": "v26.06.9",
+  "node": "cln-m",
+  "request": {
+    "method": "POST",
+    "path": "/v1/listpays",
+    "body": {
+      "payment_hash": "64435dae7e9c9f075a74edadfc5d1c8cde6eec8ec1ec2a276e432e790dd60587"
+    }
+  },
+  "response": {
+    "status": 201,
+    "body": "{\"pays\":[{\"amount_msat\":50000000,\"amount_sent_msat\":50051000,\"completed_at\":1791861312,\"created_at\":1791861310,\"created_index\":3,\"destination\":\"0301bc3656591e2c556f1b8f132922bdad4abb5fb6f5ba6a050a25c0407f94c994\",\"payment_hash\":\"64435dae7e9c9f075a74edadfc5d1c8cde6eec8ec1ec2a276e432e790dd60587\",\"preimage\":\"fp:64435dae7e9c9f07\",\"status\":\"complete\",\"updated_index\":3}]}"
+  }
+}

@@ -3,12 +3,14 @@
 // Internal failures take precedence over interrupts and the command exit code.
 import { randomBytes } from 'node:crypto';
 import { expect, it } from 'vitest';
-import { asRecord, binPath, runCli, singleJsonDocument, stackFrame, type CliResult } from '../helpers/cli.js';
+import { asRecord, binPath, readJson, runCli, singleJsonDocument, stackFrame, type CliResult } from '../helpers/cli.js';
 
 const SUCCESS = 0;
 const INVALID_INPUT = 2;
 const INTERRUPTED = 6;
 const INVARIANT_BREACH = 8;
+const packageVersion = asRecord(readJson('package.json'), 'package.json')['version'];
+if (typeof packageVersion !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(packageVersion)) throw new Error('package.json has no valid version');
 
 /** Keep-alive timer in the child for the "the run ends" cases; a run that does not end itself lasts this long. */
 const KEEP_ALIVE_MS = 8000;
@@ -186,9 +188,9 @@ function expectBreachReport(r: CliResult, json: boolean, label: string, secrets:
 }
 
 // Bug caught: version read from the wrong place, printed without newline, or on stderr.
-it('CP-001/B1 --version prints exactly 0.0.0 and a newline on stdout and exits 0', async () => {
+it('CP-001/B1 --version prints exactly the package version and a newline on stdout and exits 0', async () => {
   const r = await runCli(['--version']);
-  expect(r).toEqual({ status: SUCCESS, signal: null, stdout: '0.0.0\n', stderr: '' });
+  expect(r).toEqual({ status: SUCCESS, signal: null, stdout: `${packageVersion}\n`, stderr: '' });
 });
 
 // Bug caught: help printed on stderr or treated as a usage error (exit 2).
@@ -232,7 +234,7 @@ it('CP-001/B5 --json alone prints exactly one envelope with command null and err
 });
 
 // Bug caught: --json ignored by --help or --version (plain text on stdout), or a second document.
-it('CP-001/B5 --json --help and --json --version each print exactly one ok:true envelope and exit 0', async () => {
+it('CP-001/B5 --json --help and --json --version print exactly one ok:true envelope with the package version and exit 0', async () => {
   const help = await runCli(['--json', '--help']);
   expect(help.status).toBe(SUCCESS);
   expect(help.stderr).toBe('');
@@ -241,7 +243,7 @@ it('CP-001/B5 --json --help and --json --version each print exactly one ok:true 
   const version = await runCli(['--json', '--version']);
   expect(version.status).toBe(SUCCESS);
   expect(version.stderr).toBe('');
-  expect(singleJsonDocument(version.stdout)).toMatchObject({ schema: 1, ok: true, warnings: [], result: { version: '0.0.0' }, error: null });
+  expect(singleJsonDocument(version.stdout)).toMatchObject({ schema: 1, ok: true, warnings: [], result: { version: packageVersion }, error: null });
 });
 
 // Bug caught: --help/--version winning over a stray token (exit 0 hides a typo), or a "--" after "--"
@@ -454,8 +456,8 @@ it('CP-001/B8 an internal error after a signal and a signal after an internal er
 
 // Bug caught: a late signal or failure appending a second JSON document or leaving the process
 // alive until the keep-alive timer. Pipe and file output both preserve exactly one document.
-it('CP-001/B8 after the --json document is written, a late signal ends the run promptly with exit 6 and a late failure ends it promptly with exit 8; one document on a pipe and in a file', async () => {
-  const versionDoc = { schema: 1, command: null, ok: true, warnings: [], result: { version: '0.0.0' }, error: null };
+it('CP-001/B8 after the package version JSON document is written, a late signal ends the run promptly with exit 6 and a late failure ends it promptly with exit 8; one document on a pipe and in a file', async () => {
+  const versionDoc = { schema: 1, command: null, ok: true, warnings: [], result: { version: packageVersion }, error: null };
   const m = marker();
   const cases = [
     // Each must end the run itself: the keep-alive timer would otherwise hold the process open

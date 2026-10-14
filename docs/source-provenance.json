@@ -1,5 +1,118 @@
 {
-  "status": "stub",
-  "description": "Placeholder for provenance of source code adapted from other open-source projects: repository, commit, file, SHA-256 and treatment.",
-  "entries": []
+  "schema": 1,
+  "description": "Source provenance of code reused under the MIT license.",
+  "upstream": {
+    "name": "macwarden",
+    "url": "https://github.com/ZilverZtream/macwarden",
+    "commit": "25bbfa4",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 macwarden contributors",
+    "licenseSha256": "a0230b4c00986df0e67e146e974e6b05d6ad4ff52821fdfec540f5f1f33bb714"
+  },
+  "files": [
+    {
+      "upstreamPath": "examples/payment-lab/src/lnd/json.ts",
+      "path": "src/core/json.ts",
+      "changes": "Canonical integer termination and zero, shared reader import, and CLN msat suffix support.",
+      "upstreamSha256": "b9ba482ae6dc5cb878ad1b57f76aeab615ea61cf4b1e6e77823a5760f955db07",
+      "importedSha256": "d6136d83c3af6c0a0a26a0de6d5c31fbdff286d3eb0fc445f23665213613df65",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/lnd/errors.ts",
+      "path": "src/core/errors.ts",
+      "changes": "Source attribution, explicit number formatting for strict lint, TLS, authentication and CLN error classes, and a shared transport failure classifier.",
+      "upstreamSha256": "c8835fd77e2dcbe89bfa6ec880a760597c8d78ed8e0339827d7fff7fd0d3f5a7",
+      "importedSha256": "31dd82c73fafeb10b92c68310996c14dcd26202171a01cb60f39d3661a1ef9e2",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/util/bolt11.ts",
+      "path": "src/core/bolt11.ts",
+      "changes": "Source attribution and Array.from iteration for strict lint.",
+      "upstreamSha256": "5657f1eb2e8fa89d629fc3111131011bcca3b9d12989103ec6d1f2137f296982",
+      "importedSha256": "d8c564c0fce9c65b814fe77bd562164bcc2dd3a6d4e8ddf858e1cf0cbeb2aef4",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/util/encoding.ts",
+      "path": "src/core/encoding.ts",
+      "changes": "none",
+      "upstreamSha256": "7f063151eab11592c113ed947a8fd718ffd40554ecc8c7d25432d142f57239a4",
+      "importedSha256": "7f063151eab11592c113ed947a8fd718ffd40554ecc8c7d25432d142f57239a4",
+      "disposition": "copied"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/util/money.ts",
+      "path": "src/core/money.ts",
+      "changes": "Branded amounts, canonical parsing, exact fee arithmetic, and source attribution.",
+      "upstreamSha256": "093ea852dc31a668abf7c3afb9d08a47664b63bacdd9e610e8c3ae0c5ce7cf2b",
+      "importedSha256": "2a2948fd324b5dbe2d722afc8b3bfd65eca611583f479c2d0c68184f8725505b",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "scripts/leak-check.mjs",
+      "path": "scripts/leak-check.mjs",
+      "changes": "Generic sentinel scanning, bounded matching, artifact validation, and monotonic five-second busy retries.",
+      "upstreamSha256": "521c444539273c084354a34f84b9e0a6d6030b639ebd32885b0f77b0141cddae",
+      "importedSha256": "0190586f0f82d51a1eee02cdd574782636ce097b88964c074e0f80c0f7545ffb",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "scripts/private-scratch.mjs",
+      "path": "scripts/private-scratch.mjs",
+      "changes": "Source attribution and batched owner-only directory verification.",
+      "upstreamSha256": "3773b0da7b00d0ba0ef1ea38f2d51fdc3c835a12c74346f6f981186a0bb8919a",
+      "importedSha256": "4c0e933364060caaa6f383c5485f8219fd0e905e82593de08680880dced05793",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/lnd/rest.ts",
+      "path": "src/node-lnd/rest.ts",
+      "changes": "Credential kept in a Secret with redacted peer text, bounded descriptor reads, TLS and request phases, a mandatory stream deadline and stream end outcomes; envelope and line parsing moved to src/node-lnd/stream.ts, and the unary transport mirrored in src/node-cln/rest.ts, both attributed in their headers; an optional callback once a unary request is written.",
+      "upstreamSha256": "af0b78f1ab56466f1e33681081496b815a0a326f66c93fca053fe4225ec3af76",
+      "importedSha256": "6f341e3d9cc617df4b78e14db6d3ff2d3c19e3fc9cd6416d47717cadc32260f1",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/ledger/accounts.ts",
+      "path": "src/ledger/accounts.ts",
+      "changes": "Structure and net-debit convention kept; new chart of channel, clearing, equity, expense and reconciliation accounts.",
+      "upstreamSha256": "ec1f87be54b4ed35233e157977379a22ca632d59abd542d0caf60d5cb88f3409",
+      "importedSha256": "64384a9d3a7bfb62f310cd9c3a96e393aadc7ce96dc9df33909cd9bda38d5f2f",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/ledger/postings.ts",
+      "path": "src/ledger/postings.ts",
+      "changes": "One builder per event kept; new rebalance send, settle, reversal and opening postings with debit and credit columns.",
+      "upstreamSha256": "2fd954c299d5c2cd4e31e71be051b136f142551d3afb1633c0166b5986a0f91c",
+      "importedSha256": "a934237bfe6cb8f1a27c39248eca2e034d19ffc9a05cc4b9b4073f281f053863",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/ledger/journal.ts",
+      "path": "src/ledger/post.ts",
+      "changes": "post() validation kept; writes go through a transaction port, error codes added, amounts limited to 1 to 2^63 - 1.",
+      "upstreamSha256": "de930797cfb7458e5a95a1e920c991eb7a635ebe3ef56fef22dd27ceebcc9cee",
+      "importedSha256": "3de63533a8e97365d02bc607bb0a8cda73e053b703872c80fe82fb12be7578df",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/ledger/verify.ts",
+      "path": "src/ledger/verify.ts",
+      "changes": "Steps 1 and 2 only (balanced journals, stored balances), as a pure function over the stored book.",
+      "upstreamSha256": "85e07ef6792f2165c8f0dfb27c7623300acf19fecbb7f8b3964ee0768250c554",
+      "importedSha256": "5233c6a883fbc5c8ab5646ebe5b63b1ff666b105b10b5c1b38b70a4b2e7e9478",
+      "disposition": "adapted"
+    },
+    {
+      "upstreamPath": "examples/payment-lab/src/outbox/effects.ts",
+      "path": "src/output/effects.ts",
+      "changes": "HMAC signing, canonical text, file naming and bounded reading kept; leases and leftover cleanup dropped, regular files only, publication returns exists instead of comparing fields.",
+      "upstreamSha256": "474c405c23af2f5f84da8b7c8ad328ce59d5bd65949412f2903579256de47a68",
+      "importedSha256": "845c8fae39b29baed0b7387b8e54145b7346cec9ffa2f863be441d2b62ace931",
+      "disposition": "adapted"
+    }
+  ]
 }

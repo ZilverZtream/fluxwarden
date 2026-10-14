@@ -1,0 +1,47 @@
+{
+  "reference": "SPEC 11.5-11.6, SECURITY INV-02/03/04/05/06/08/11/13/15/16/17",
+  "fakeFiles": ["test/chaos/t01-t12.test.ts", "test/chaos/t13-t25.test.ts", "test/chaos/matrix-wire.test.ts"],
+  "existingFakeTestCount": 59,
+  "fakeRows": ["T-01", "T-02", "T-03", "T-04", "T-05", "T-06", "T-07", "T-08", "T-09", "T-10", "T-11", "T-12", "T-13", "T-14", "T-15", "T-16", "T-17", "T-18", "T-19", "T-20", "T-21", "T-22", "T-23", "T-24", "T-25"],
+  "fakeSubvariants": {
+    "T-01": ["configured mainnet/testnet4/signet", "observed mainnet/testnet4/signet"],
+    "T-02": ["snapshot over 60 seconds"], "T-03": ["absolute fee over cap"], "T-04": ["CLTV over cap"],
+    "T-05": ["reset after write; hash recovery; one send; one journal pair"],
+    "T-06": ["claim race", "stale fence no node calls"], "T-07": ["claim death reclaim", "real child death"],
+    "T-08": ["macaroon", "rune", "preimage", "TLS private key", "approval private key"],
+    "T-09": ["unequal debits and credits atomic rollback"], "T-10": ["multipart"],
+    "T-11": ["LND SUCCEEDED/TIMEOUT", "CLN 209/complete preimage", "normalized success"],
+    "T-12": ["failed/pending/complete wire swing", "normalized swing"],
+    "T-13": ["LND FAILED/inflight wire", "normalized unresolved then success"], "T-14": ["already paid without preimage"],
+    "T-15": ["racing dispatch", "global unique hash"], "T-16": ["startup terminal sweep", "stuck every pass and held reservation"],
+    "T-17": ["repeated channel", "same peer"], "T-18": ["last hop receivable", "first hop P plus fee"],
+    "T-19": ["base fee and ppm rounding", "actual fee mismatch and journal"], "T-20": ["LND padding", "final CLTV"],
+    "T-21": ["multiple settled HTLCs and actual movement"],
+    "T-22": ["uint64 maximum", "msat strings", "split frames", "direct error", "nested error", "legacy error", "base64url hash path"],
+    "T-23": ["LND 0.20", "CLN 26.04", "custom version", "real custom-version handshake"],
+    "T-24": ["success", "refusal", "pending fee", "interrupt", "askrene refusal cleanup", "askrene transport cleanup"],
+    "T-25": ["chain unsynced", "local failure cooldown"]
+  },
+  "requiredLiveRows": ["T-01", "T-03", "T-05", "T-06", "T-07", "T-16", "T-18", "T-25"],
+  "liveSubvariants": {
+    "T-01": ["configured mainnet", "configured testnet4", "configured signet", "daemon refusal", "node-reported mainnet/testnet4/signet GAP: pinned regtest nodes cannot report those networks without replacing the reference boundary"],
+    "T-03": ["real quote over reduced scratch fee cap; planner NO_ACTION; payment and invoice inventory unchanged"],
+    "T-05": ["LND SendToRouteV2 sent response cut", "CLN waitsendpay response cut", "one stored hash", "LND matching ListPayments record has exactly one HTLC attempt before and after reconcile", "CLN matching listsendpays entry count one", "reconcile terminal outcome", "one journal pair", "LND original zero tolerance retains exit9/MISMATCH for independently observed nonzero source residual below native1000msat quantum; target residual0; CLN unchanged exit0"],
+    "T-06": ["two CLI processes same fresh approval", "one winner", "loser claimed-elsewhere", "stale fence no node calls"],
+    "T-07": ["owned PID kill after claim before submit", "zero dead-worker invoice or payment", "higher fence reclaim", "approval-expiry cancellation"],
+    "T-16": ["restart with IN_FLIGHT", "node terminal while worker down", "startup sweep by hash", "stuck beyond configured escalate_after", "alert every pass", "held reservation", "reconcile exit7"],
+    "T-18": ["last-hop receivable below principal despite graph capacity: actual CLN public CLI proof", "first-hop reserve floor: actual LND public CLI proof, separate from V8", "FIRST_HOP_SPENDABLE: public validator against actual native observations; unchanged actual approved route, fresh native-derived snapshot, same block, no invoice/send; full CLI reaches earlier P3 rather than V8"],
+    "T-25": ["bitcoind pause invalid prerequisite: native GetInfo unavailable", "persistent owned LND restart: genuine native synced_to_chain=false observed", "chain-sync exit5 GAP: native startup false recovered before actual CLI handshake", "local too-many-HTLCs GAP", "dust exposure GAP", "missing bandwidth hint GAP", "local classification GAP", "cooldown GAP", "1-to-15-second retry backoff GAP"]
+  },
+  "retainedProofMapping": [
+    {"row":"T-01","status":"PARTIAL","proof":"three configured off-network public execute refusals5 before missing credentials; daemon DM1 known off-network config refusal2","gap":"native node-reported off-network identity and daemon DM2 cannot be replaced by a regtest config refusal"},
+    {"row":"T-03","status":"PASS","proof":"actual CLN quote over reduced owned fee cap; NO_ACTION; native invoice/payment inventory unchanged"},
+    {"row":"T-05","status":"PASS","proof":"actual CLN and LND sent-response cuts, UNKNOWN7 to terminal by same hash; LND exactly1 HTLC attempt, CLN exactly1 listsendpays entry; one journal pair; native zero-tolerance LND residual oracle explicit"},
+    {"row":"T-06","status":"PARTIAL","proof":"two live CLI processes overlap one fresh approval; one winner, one claimed-elsewhere5; one payment/pair","gap":"resumed stale worker fencing has F proof only"},
+    {"row":"T-07","status":"PASS","proof":"owned child killed after real PREFLIGHT; no invoice/send; natural database-clock lease expires; fresh claimant higher fence and one node payment","alternativeNotRun":"approval expiry cancellation is the SPEC alternative to higher-fence reclaim"},
+    {"row":"T-16","status":"PASS","proof":"real CLN pending payment survives worker death; natural lease expiry; daemon startup sweep; one idempotent stuck alert and repeated public reconcile7 with HELD; node settles while daemon down; next startup same-hash terminal and one pair"},
+    {"row":"T-18","status":"PASS_PUBLIC_NATIVE_REFERENCE","proof":"actual CLI LAST_HOP_RECEIVABLE and earlier RESERVE_FLOOR; existing public validateRoute returns FIRST_HOP_SPENDABLE/V8 for unchanged actual approved native route and same-block fresh native-derived snapshot with no invoice/send","scope":"public validator against actual native observations; does not claim the full CLI reaches V8; initial narrower CLI-only gap and failed prerequisites retained"},
+    {"row":"T-25","status":"GAP","proof":"genuine native startup synced_to_chain=false observation only","gap":"CLI guard false window not held; local HTLC/dust/bandwidth, cooldown and retry backoff variants unavailable"}
+  ],
+  "unavailableProofRule": "A required live stimulus that is unavailable is a named GAP, never PASS. Fake evidence is never promoted to live. Each scenario cleans owned toxics and pauses in finally, then observes pinned node state."
+}

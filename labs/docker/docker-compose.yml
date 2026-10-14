@@ -1,0 +1,135 @@
+# Disposable regtest only. RPC cookies stay in the project volume.
+services:
+  bitcoind:
+    image: lightninglabs/bitcoin-core:31.1@sha256:86e15e4348869a86343aacbbd1aff38e96cffddd87b61644694b1e1358d737cd
+    entrypoint: ["bitcoind"]
+    command: ["-regtest","-server","-datadir=/root/.bitcoin","-rpcbind=0.0.0.0","-rpcallowip=172.16.0.0/12","-rpcallowip=192.168.0.0/16","-rpcallowip=10.0.0.0/8","-txindex=1","-fallbackfee=0.0002","-zmqpubrawblock=tcp://0.0.0.0:28332","-zmqpubrawtx=tcp://0.0.0.0:28333"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    # Cover the image-declared datadir with the owned volume as well.
+    volumes: ["bitcoin:/root/.bitcoin","bitcoin:/home/bitcoin/.bitcoin"]
+    healthcheck:
+      test: ["CMD","bitcoin-cli","-regtest","getblockchaininfo"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+  lnd-p:
+    image: lightninglabs/lnd:v0.21.4-beta@sha256:04d06edcc0f6e99a5e797ea34959f330add222226f840cd86afbc31f8f29627d
+    entrypoint: ["lnd"]
+    command: ["--bitcoin.active","--bitcoin.regtest","--bitcoin.node=bitcoind","--noseedbackup","--trickledelay=1000","--maxpendingchannels=10","--tlsextradomain=lnd-p","--bitcoind.rpchost=bitcoind:18443","--bitcoind.rpccookie=/bitcoin/regtest/.cookie","--bitcoind.zmqpubrawblock=tcp://bitcoind:28332","--bitcoind.zmqpubrawtx=tcp://bitcoind:28333","--listen=0.0.0.0:9735","--rpclisten=0.0.0.0:10009","--restlisten=0.0.0.0:8080","--tlsextraip=127.0.0.1","--alias=lnd-p"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes: ["lnd-p:/root/.lnd","bitcoin:/bitcoin:ro"]
+    healthcheck:
+      test: ["CMD-SHELL","lncli --network=regtest state | grep -Eq '\"(RPC_ACTIVE|SERVER_ACTIVE)\"'"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+  lnd-r:
+    image: lightninglabs/lnd:v0.21.4-beta@sha256:04d06edcc0f6e99a5e797ea34959f330add222226f840cd86afbc31f8f29627d
+    entrypoint: ["lnd"]
+    command: ["--bitcoin.active","--bitcoin.regtest","--bitcoin.node=bitcoind","--noseedbackup","--trickledelay=1000","--maxpendingchannels=10","--tlsextradomain=lnd-r","--bitcoind.rpchost=bitcoind:18443","--bitcoind.rpccookie=/bitcoin/regtest/.cookie","--bitcoind.zmqpubrawblock=tcp://bitcoind:28332","--bitcoind.zmqpubrawtx=tcp://bitcoind:28333","--listen=0.0.0.0:9735","--rpclisten=0.0.0.0:10009","--restlisten=0.0.0.0:8080","--tlsextraip=127.0.0.1","--alias=lnd-r"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes: ["lnd-r:/root/.lnd","bitcoin:/bitcoin:ro"]
+    healthcheck:
+      test: ["CMD-SHELL","lncli --network=regtest state | grep -Eq '\"(RPC_ACTIVE|SERVER_ACTIVE)\"'"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+  cln-p:
+    image: elementsproject/lightningd:v26.06.9@sha256:de74289ddcccb68cd60543b08b2b8594002d819125d200492e17a95166d56577
+    entrypoint: ["lightningd"]
+    command: ["--network=regtest","--developer","--dev-fast-gossip","--dev-bitcoind-poll=1","--bitcoin-datadir=/bitcoin","--bitcoin-rpcconnect=bitcoind","--bitcoin-rpcport=18443","--addr=0.0.0.0:9735","--cltv-delta=34","--fee-base=1000","--fee-per-satoshi=1000","--alias=cln-p","--clnrest-host=0.0.0.0","--clnrest-port=3010"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes: ["cln-p:/root/.lightning","bitcoin:/bitcoin:ro"]
+    healthcheck:
+      test: ["CMD","lightning-cli","--network=regtest","getinfo"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+  cln-r:
+    image: elementsproject/lightningd:v26.06.9@sha256:de74289ddcccb68cd60543b08b2b8594002d819125d200492e17a95166d56577
+    entrypoint: ["lightningd"]
+    command: ["--network=regtest","--developer","--dev-fast-gossip","--dev-bitcoind-poll=1","--bitcoin-datadir=/bitcoin","--bitcoin-rpcconnect=bitcoind","--bitcoin-rpcport=18443","--addr=0.0.0.0:9735","--cltv-delta=34","--fee-base=1000","--fee-per-satoshi=1000","--alias=cln-r","--clnrest-host=0.0.0.0","--clnrest-port=3010"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes: ["cln-r:/root/.lightning","bitcoin:/bitcoin:ro"]
+    healthcheck:
+      test: ["CMD","lightning-cli","--network=regtest","getinfo"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+  cln-m:
+    image: elementsproject/lightningd:v26.06.9@sha256:de74289ddcccb68cd60543b08b2b8594002d819125d200492e17a95166d56577
+    entrypoint: ["lightningd"]
+    command: ["--network=regtest","--developer","--dev-fast-gossip","--dev-bitcoind-poll=1","--bitcoin-datadir=/bitcoin","--bitcoin-rpcconnect=bitcoind","--bitcoin-rpcport=18443","--addr=0.0.0.0:9735","--cltv-delta=34","--fee-base=1000","--fee-per-satoshi=1000","--alias=cln-m","--clnrest-host=0.0.0.0","--clnrest-port=3010"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes: ["cln-m:/root/.lightning","bitcoin:/bitcoin:ro"]
+    healthcheck:
+      test: ["CMD","lightning-cli","--network=regtest","getinfo"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    entrypoint: ["/toxiproxy"]
+    command: ["-host=0.0.0.0","-config","/etc/toxiproxy.json"]
+    cpus: 0.5
+    mem_limit: 536870912
+    pids_limit: 128
+    networks: [regtest]
+    ports: ["127.0.0.1:${FLUXWARDEN_TOXIPROXY_PORT:-0}:8474","127.0.0.1:${FLUXWARDEN_LND_REST_PORT:-0}:18080","127.0.0.1:${FLUXWARDEN_CLN_REST_PORT:-0}:13010"]
+    volumes: ["./toxiproxy.json:/etc/toxiproxy.json:ro"]
+    healthcheck:
+      test: ["CMD","/toxiproxy-cli","-h","http://127.0.0.1:8474","list"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+networks:
+  regtest:
+    # Docker needs a normal bridge to realize the loopback port bindings.
+    driver: bridge
+volumes:
+  bitcoin: {}
+  lnd-p: {}
+  lnd-r: {}
+  cln-p: {}
+  cln-r: {}
+  cln-m: {}

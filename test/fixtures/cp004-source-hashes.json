@@ -1,0 +1,9 @@
+{
+  "examples/payment-lab/src/lnd/json.ts": { "path": "src/core/json.ts", "sha256": "b9ba482ae6dc5cb878ad1b57f76aeab615ea61cf4b1e6e77823a5760f955db07" },
+  "examples/payment-lab/src/lnd/errors.ts": { "path": "src/core/errors.ts", "sha256": "c8835fd77e2dcbe89bfa6ec880a760597c8d78ed8e0339827d7fff7fd0d3f5a7" },
+  "examples/payment-lab/src/util/bolt11.ts": { "path": "src/core/bolt11.ts", "sha256": "5657f1eb2e8fa89d629fc3111131011bcca3b9d12989103ec6d1f2137f296982" },
+  "examples/payment-lab/src/util/encoding.ts": { "path": "src/core/encoding.ts", "sha256": "7f063151eab11592c113ed947a8fd718ffd40554ecc8c7d25432d142f57239a4" },
+  "examples/payment-lab/src/util/money.ts": { "path": "src/core/money.ts", "sha256": "093ea852dc31a668abf7c3afb9d08a47664b63bacdd9e610e8c3ae0c5ce7cf2b" },
+  "scripts/leak-check.mjs": { "path": "scripts/leak-check.mjs", "sha256": "521c444539273c084354a34f84b9e0a6d6030b639ebd32885b0f77b0141cddae" },
+  "scripts/private-scratch.mjs": { "path": "scripts/private-scratch.mjs", "sha256": "3773b0da7b00d0ba0ef1ea38f2d51fdc3c835a12c74346f6f981186a0bb8919a" }
+}

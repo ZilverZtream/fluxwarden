@@ -1,0 +1,10 @@
+{
+  "channels": [
+    { "id": "1", "from": "lnd-p", "to": "lnd-r", "capacity_msat": "5000000000", "push_msat": "1000000000" },
+    { "id": "2", "from": "lnd-r", "to": "cln-m", "capacity_msat": "5000000000", "push_msat": "1250000000" },
+    { "id": "3", "from": "lnd-r", "to": "cln-r", "capacity_msat": "5000000000", "push_msat": "2500000000" },
+    { "id": "4", "from": "cln-p", "to": "cln-r", "capacity_msat": "5000000000", "push_msat": "1000000000" },
+    { "id": "5", "from": "cln-r", "to": "cln-m", "capacity_msat": "5000000000", "push_msat": "1250000000" }
+  ],
+  "policies": { "base_fee_msat": "1000", "fee_rate_ppm": "1000", "lnd_cltv_delta": "80", "cln_cltv_delta": "34" }
+}

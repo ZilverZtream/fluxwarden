@@ -1,0 +1,7 @@
+[
+  "test/sentinels/preimage.bin",
+  "test/sentinels/macaroon.bin",
+  "test/sentinels/rune.txt",
+  "test/sentinels/tls-key.pem",
+  "test/sentinels/ed25519-key.pem"
+]

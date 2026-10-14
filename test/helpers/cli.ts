@@ -3,9 +3,9 @@
 // named in package.json, the files in the repository), never through src/ internals.
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { testRoot } from './env.js';
 
 export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -36,10 +36,9 @@ export function binPath(): string {
   return resolve(repoRoot, entry);
 }
 
-/** Scratch directory under $FLUXWARDEN_TEST_TMP when set, else under os.tmpdir(). */
+/** Scratch directory under the test scratch root, which is removed after each test file when self-provisioned. */
 export function scratchDir(prefix: string): string {
-  const base = process.env['FLUXWARDEN_TEST_TMP'] ?? tmpdir();
-  return mkdtempSync(join(base, `fw-cp001-${prefix}-`));
+  return mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), `fw-cp001-${prefix}-`));
 }
 
 /** Environment for the child: the parent's, minus variables that change Node's own output. */
@@ -87,12 +86,14 @@ export function runCli(args: readonly string[], options: RunOptions = {}): Promi
       windowsHide: true,
     });
     if (fd !== undefined) closeSync(fd);
+    const stderrPipe = child.stderr;
+    if (stderrPipe === null) throw new Error('child stderr pipe is unavailable');
     let stdout = '';
     let stderr = '';
     if (options.closeStdout === true) child.stdout?.destroy();
     else child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
-    if (options.closeStderr === true) child.stderr.destroy();
-    else child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+    if (options.closeStderr === true) stderrPipe.destroy();
+    else stderrPipe.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`fluxwarden did not exit within ${String(options.timeoutMs ?? 10000)} ms`));

@@ -1,0 +1,14 @@
+[
+  {
+    "name": "lnd-r-rest",
+    "listen": "0.0.0.0:18080",
+    "upstream": "lnd-r:8080",
+    "enabled": true
+  },
+  {
+    "name": "cln-m-rest",
+    "listen": "0.0.0.0:13010",
+    "upstream": "cln-m:3010",
+    "enabled": true
+  }
+]

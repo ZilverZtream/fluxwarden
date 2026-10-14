@@ -21,9 +21,12 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         node: ['22.23.2', '22.x', '24.18.1', '24.x']
+        shard: [core]
         include:
-          - { os: windows-latest, node: '22.23.2' }
-          - { os: windows-latest, node: '24.x' }
+          - { os: windows-latest, node: '22.23.2', shard: core }
+          - { os: windows-latest, node: '22.23.2', shard: native }
+          - { os: windows-latest, node: '24.x', shard: core }
+          - { os: windows-latest, node: '24.x', shard: native }
     defaults:
       run:
         shell: bash
@@ -34,13 +37,164 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: ${{ matrix.node }}
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFile } from 'node:fs/promises';
+          import { win32 } from 'node:path';
+          import { createPrivateDirectory, assertPrivateDirectories, realDirectory } from './scripts/private-scratch.mjs';
+          let parent = process.env.FLUXWARDEN_CI_TMP_PARENT;
+          if (process.platform === 'win32') {
+            // Hosted temp drives and runner profiles can have mutable or foreign-owned ancestors.
+            // Avoid both: restrict only a unique directory we create directly on the OS drive.
+            const systemRoot = process.env.SystemRoot;
+            if (!systemRoot || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) throw new Error('a Windows system directory on an absolute drive is required');
+            const drive = win32.parse(systemRoot).root;
+            await realDirectory(systemRoot);
+            await realDirectory(drive);
+            parent = await createPrivateDirectory(drive, 'fluxwarden-ci-');
+          }
+          const roots = [];
+          for (const [name, prefix] of [['FLUXWARDEN_TEST_TMP', 'ci-tests-'], ['FLUXWARDEN_SENTINEL_DIR', 'ci-sentinels-'], ['FLUXWARDEN_EVIDENCE_DIR', 'ci-evidence-']]) {
+            roots.push([name, await createPrivateDirectory(parent, prefix)]);
+          }
+          await assertPrivateDirectories([...(process.platform === 'win32' ? [parent] : []), ...roots.map(([, directory]) => directory)]);
+          await appendFile(process.env.GITHUB_ENV, [
+            ...(process.platform === 'win32' ? [['FLUXWARDEN_CI_OWNED_ROOT', parent]] : []), ...roots,
+          ].map(([name, directory]) => `${name}=${directory}\n`).join(''));
+          NODE
       - run: npm ci --ignore-scripts
       - run: npm run lint
       - run: npm run build
-      - run: npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
-      - run: npm run test:harness -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-harness.json"
+      - name: Verify private database path
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { rm } from 'node:fs/promises';
+          import { basename, dirname, join, parse, relative, resolve } from 'node:path';
+          import { createPrivateDirectory, assertPrivateDirectories } from './scripts/private-scratch.mjs';
+          import { openDatabase } from './dist/persistence/index.js';
+          import { currentUserSid, readSecurityDescriptors, restrictToOwner } from './dist/platform/owner-only.js';
+          const parent = resolve(process.env.FLUXWARDEN_TEST_TMP);
+          const privateDirectories = [];
+          function diagnose(stage) {
+            if (process.platform !== 'win32') return;
+            const paths = [parse(parent).root, ...privateDirectories];
+            const descriptors = readSecurityDescriptors(paths);
+            console.log(JSON.stringify({ stage, identity: currentUserSid(), directories: descriptors.map((descriptor, index) => ({
+              path: paths[index], owner: descriptor.ownerSid, dacl: descriptor.sddl.slice(0, 2048),
+              daclTruncated: descriptor.sddl.length > 2048,
+              daclSha256: createHash('sha256').update(descriptor.sddl).digest('hex'),
+            })) }));
+          }
+          if (process.platform === 'win32') {
+            const ownedRoot = process.env.FLUXWARDEN_CI_OWNED_ROOT;
+            if (!ownedRoot || !/^fluxwarden-ci-[A-Za-z0-9]{6}$/.test(basename(ownedRoot))) throw new Error('the newly created CI root is required');
+            privateDirectories.push(resolve(ownedRoot), parent, resolve(process.env.FLUXWARDEN_SENTINEL_DIR), resolve(process.env.FLUXWARDEN_EVIDENCE_DIR));
+            if (privateDirectories.slice(1).some(path => dirname(path) !== privateDirectories[0])) throw new Error('private CI children escaped their newly created root');
+            diagnose('private CI ownership before restriction');
+            await assertPrivateDirectories(privateDirectories);
+            try {
+              for (const directory of privateDirectories) restrictToOwner(directory, 'directory', {});
+            } catch (error) {
+              diagnose('private CI ownership restriction failed');
+              throw error;
+            }
+            diagnose('private CI ownership after restriction');
+            await assertPrivateDirectories(privateDirectories);
+          }
+          const scratch = await createPrivateDirectory(parent, 'ci-database-smoke-');
+          const child = relative(parent, scratch);
+          if (!child || child.startsWith('..') || resolve(parent, child) !== scratch) throw new Error('database smoke scratch escaped its parent');
+          try {
+            const path = join(scratch, 'state', 'fluxwarden.sqlite');
+            const writer = openDatabase(path, { readOnly: false });
+            try {
+              const pragmas = writer.pragmas();
+              if (pragmas.journalMode !== 'wal' || pragmas.synchronous !== 2) throw new Error('database smoke durability check failed');
+            } finally { writer.close(); }
+            const reader = openDatabase(path, { readOnly: true });
+            try { reader.nodes.list(); } finally { reader.close(); }
+            console.log('Private database path smoke passed');
+          } catch (error) {
+            diagnose('private database path smoke failed');
+            throw error;
+          } finally {
+            await assertPrivateDirectories([scratch]);
+            await rm(scratch, { recursive: true, force: true });
+          }
+          NODE
+      # The hosted Linux runners have two CPUs; four workers contend in timing-bound proofs.
+      - name: Test Linux product
+        if: matrix.os == 'ubuntu-latest' && matrix.shard == 'core'
+        run: npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
+      # Separate Windows VMs keep native process and owner-lifecycle proofs from competing with core tests.
+      - name: Configure Windows core exclusions
+        if: matrix.os == 'windows-latest' && matrix.shard == 'core'
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, writeFileSync } from 'node:fs';
+          import { join, resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          // Vitest's CLI excludes do not propagate to inline projects; extend the product project itself.
+          const excluded = [
+            'test/labs/cp006-cp008-owner-lifecycle.test.ts',
+            'test/persistence/cp015-concurrency.test.ts',
+            'test/chaos/t01-t12.test.ts',
+            'test/cli/cp038-reconcile-evidence.test.ts',
+            'test/commands/cp043-driver.test.ts',
+            'test/executor/cp029-preflight.test.ts',
+            'test/output/cp003-output.test.ts',
+            'test/persistence/cp015-command-data-readonly.test.ts',
+            'test/persistence/cp015-persistence.test.ts',
+            'test/daemon/cp041-daemon.test.ts',
+            'test/ledger/cp037-ledger.test.ts',
+            'test/commands/cp043-t05-repository.test.ts',
+          ];
+          const config = join(process.env.RUNNER_TEMP, 'vitest-windows-core.config.mjs');
+          const base = pathToFileURL(resolve('vitest.config.ts')).href;
+          writeFileSync(config, `import base from ${JSON.stringify(base)};
+          const excluded = ${JSON.stringify(excluded)};
+          export default { ...base, test: { ...base.test, projects: base.test.projects.map(project =>
+            project.test?.name === 'product' ? { ...project, test: { ...project.test, exclude: [...project.test.exclude, ...excluded] } } : project
+          ) } };
+          `);
+          appendFileSync(process.env.GITHUB_ENV, `FLUXWARDEN_CI_CORE_CONFIG=${config}\n`);
+          NODE
+      - name: Test Windows core product
+        if: matrix.os == 'windows-latest' && matrix.shard == 'core'
+        run: >-
+          npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=2
+          --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
+      - name: Test Windows native product
+        if: matrix.os == 'windows-latest' && matrix.shard == 'native'
+        run: >-
+          npm test -- --maxWorkers=1 --fileParallelism=false
+          test/labs/cp006-cp008-owner-lifecycle.test.ts
+          test/persistence/cp015-concurrency.test.ts
+          test/chaos/t01-t12.test.ts
+          test/cli/cp038-reconcile-evidence.test.ts
+          test/commands/cp043-driver.test.ts
+          test/executor/cp029-preflight.test.ts
+          test/output/cp003-output.test.ts
+          test/persistence/cp015-command-data-readonly.test.ts
+          test/persistence/cp015-persistence.test.ts
+          test/daemon/cp041-daemon.test.ts
+          test/ledger/cp037-ledger.test.ts
+          test/commands/cp043-t05-repository.test.ts
+          --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
+      - name: Test harness
+        if: matrix.shard == 'core'
+        run: npm run test:harness -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-harness.json"
       # Vitest exits 0 with skipped tests; every test must have run and passed.
-      - run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json" "$RUNNER_TEMP/vitest-harness.json"
+      - name: Require all core tests passed
+        if: matrix.shard == 'core'
+        run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json" "$RUNNER_TEMP/vitest-harness.json"
+      - name: Require all native tests passed
+        if: matrix.os == 'windows-latest' && matrix.shard == 'native'
+        run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json"
   # The regtest lab and chaos runs: Linux only, started by hand, never a test loop.
   lab:
     if: github.event_name == 'workflow_dispatch'
@@ -53,6 +207,14 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: '22.23.2'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_TEST_TMP: ${{ runner.temp }}/lab-tests
+          FLUXWARDEN_SENTINEL_DIR: ${{ runner.temp }}/lab-sentinels
+          FLUXWARDEN_EVIDENCE_DIR: ${{ runner.temp }}/lab-evidence
+        run: |
+          mkdir -m 700 "$FLUXWARDEN_TEST_TMP" "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
+          printf '%s\n' "FLUXWARDEN_TEST_TMP=$FLUXWARDEN_TEST_TMP" "FLUXWARDEN_SENTINEL_DIR=$FLUXWARDEN_SENTINEL_DIR" "FLUXWARDEN_EVIDENCE_DIR=$FLUXWARDEN_EVIDENCE_DIR" >> "$GITHUB_ENV"
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm run test:lab
@@ -60,6 +222,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -69,4 +233,23 @@ jobs:
           node-version: '22.23.2'
       - run: npm ci --ignore-scripts
       - run: npm run build
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_TEST_TMP: ${{ runner.temp }}/chaos-tests
+          FLUXWARDEN_SENTINEL_DIR: ${{ runner.temp }}/chaos-sentinels
+          FLUXWARDEN_EVIDENCE_DIR: ${{ runner.temp }}/chaos-evidence
+        run: |
+          mkdir -m 700 "$FLUXWARDEN_TEST_TMP" "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
+          printf '%s\n' "FLUXWARDEN_TEST_TMP=$FLUXWARDEN_TEST_TMP" "FLUXWARDEN_SENTINEL_DIR=$FLUXWARDEN_SENTINEL_DIR" "FLUXWARDEN_EVIDENCE_DIR=$FLUXWARDEN_EVIDENCE_DIR" >> "$GITHUB_ENV"
       - run: npm run test:chaos
+      - name: Scan chaos evidence
+        if: always()
+        id: evidence-scan
+        run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "${{ runner.temp }}/chaos-evidence"
+      - name: Upload scanned evidence
+        if: always() && steps.evidence-scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chaos-evidence
+          path: ${{ runner.temp }}/chaos-evidence
+          if-no-files-found: error

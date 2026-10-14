@@ -1,0 +1,356 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "file": "recordings/lnd/0.21.4-beta/getinfo.json",
+      "id": "getinfo",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "2032da6f80d6eba256a7836ee772cab3eb0838a8315381989b1b1d32a56252aa",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v1/getinfo",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/getinfo.json",
+      "id": "getinfo",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "6bff0ad785349477608ce9982da08ed9db33ea981503b6e0ba65abdfaf4eca02",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/getinfo",
+        "body": {}
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/listchannels.json",
+      "id": "listchannels",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "808af12fcf69ec798f4bf31ff534f334195b38f9aed0d34c7ba286837492d86a",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v1/channels",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/pendingchannels.json",
+      "id": "pendingchannels",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "0dabe7bad535ec962e8104cc3959d7c19de13024f1016380d9b874e6b54fd87e",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v1/channels/pending",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/queryroutes.json",
+      "id": "queryroutes",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "c75e9f2d242a587ce1ce84112c6ffc8397fb7841ea235611df7591e1b9020df3",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "POST",
+        "path": "/v1/graph/routes/038f46d8dc70879ff815d1174f0db91ea353c77e96ed33e54620856e87036c11a3/0",
+        "body": {
+          "amt_msat": "100000000",
+          "outgoing_chan_ids": [
+            "118747256127488"
+          ],
+          "last_hop_pubkey": "A6YFAKrmol+R8JJTG+T1yWH7b+SZh/4lTrGkc4GJtcVK",
+          "fee_limit": {
+            "fixed_msat": "10000000"
+          },
+          "use_mission_control": true
+        }
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/error-code-message.json",
+      "id": "error-code-message",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "077eaa8def5da4a27928a4fe49b59046b4b260e6dfcccfc2e7c8d6b58ccb61f5",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v1/invoice/0000000000000000000000000000000000000000000000000000000000000000",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/error-envelope.json",
+      "id": "error-envelope",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "789804bdc627b17d7db489df4a10fc0146f08bf2e01116a03c73231eb8ad5731",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v2/router/track/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/listpeerchannels.json",
+      "id": "listpeerchannels",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "caa78a8b6204bbe69b573fccad1d2ab20cb2929f4914c0b97c7582a27cd76b6d",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/listpeerchannels",
+        "body": {}
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/listchannels.json",
+      "id": "listchannels",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "4e6762ef50495bbdbd9b360f1a174f729bd11387299e1023391ace4ea4bd549c",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/listchannels",
+        "body": {}
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/bkpr-listaccountevents.json",
+      "id": "bkpr-listaccountevents",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "70f2f81285552bc3a584e8fc89204988abe279c550556e2e76b2074c9749eec6",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/bkpr-listaccountevents",
+        "body": {}
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/getroutes.json",
+      "id": "getroutes",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "25669d8d25ba4a29bfaaa8d945944ac0f138f0902433340c0ee5a595a7d64f48",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/getroutes",
+        "body": {
+          "source": "038f46d8dc70879ff815d1174f0db91ea353c77e96ed33e54620856e87036c11a3",
+          "destination": "023f19f78eb4984ec2f908994a73060bb661d94d0220ba3236e35f76431d7dcd0a",
+          "amount_msat": 100000000,
+          "layers": [
+            "auto.localchans"
+          ],
+          "maxfee_msat": 10000000,
+          "final_cltv": 34,
+          "maxparts": 1
+        }
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/track-succeeded.json",
+      "id": "track-succeeded",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "c5cc1a7230fd81bc3b38e85b12abf4763ab7827616ea06f0e1d71770f5851da4",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v2/router/track/DphB39MsRW7ID8jqNdGLxYoEDGyWtaLUI9X1ZmIvPhs=",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.21.4-beta/track-failed.json",
+      "id": "track-failed",
+      "impl": "lnd",
+      "version": "0.21.4-beta",
+      "sha256": "aa3da2e37515b3abb58781c0b8279f07c385b9ad4842679a3af68d4d4c9b31d3",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v2/router/track/Qa_--kHTFcXXG3HNcmqq2Q4y8KoEv8xAnB30OJ3AsEU=",
+        "body": null
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/waitsendpay-200.json",
+      "id": "waitsendpay-200",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "9ab1be96a7cf88415e1c7a799b623a67025120b78ca9fbe35bcd31479855a15f",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/waitsendpay",
+        "body": {
+          "payment_hash": "64435dae7e9c9f075a74edadfc5d1c8cde6eec8ec1ec2a276e432e790dd60587",
+          "timeout": 1
+        }
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/listsendpays.json",
+      "id": "listsendpays",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "8d3c3b34b87f99dc0d77f2bdcf42649b01e75dbbf436b99d1d3e14a77c065d01",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/listsendpays",
+        "body": {
+          "payment_hash": "64435dae7e9c9f075a74edadfc5d1c8cde6eec8ec1ec2a276e432e790dd60587"
+        }
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/cln/v26.06.9/listpays.json",
+      "id": "listpays",
+      "impl": "cln",
+      "version": "v26.06.9",
+      "sha256": "00c0c199821a9f9dba854a4d40af3dab182da5cd5b7956f96e95f2afab642535",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/listpays",
+        "body": {
+          "payment_hash": "64435dae7e9c9f075a74edadfc5d1c8cde6eec8ec1ec2a276e432e790dd60587"
+        }
+      },
+      "source": "lab"
+    },
+    {
+      "file": "recordings/lnd/0.20.1-beta/getinfo.json",
+      "id": "getinfo",
+      "impl": "lnd",
+      "version": "0.20.1-beta",
+      "sha256": "480d8bb06dbd9efa3f3674662c05a84dd2dcb53835e06e16250e787f538f96db",
+      "command": {
+        "transport": "lnd-rest",
+        "method": "GET",
+        "path": "/v1/getinfo",
+        "body": null
+      },
+      "source": "lab",
+      "provenance": {
+        "release": "https://github.com/lightningnetwork/lnd/releases/tag/v0.20.1-beta",
+        "sourceCommit": "848b72ce96eb68fa90fd4336523ca4c59bddcd4c",
+        "image": "lightninglabs/lnd:v0.20.1-beta@sha256:f0a2bdc4b8bc89cb3b31b6e12d6b16ac5145defd916d8152cf0c1c07d8697cff",
+        "imageId": "sha256:f0a2bdc4b8bc89cb3b31b6e12d6b16ac5145defd916d8152cf0c1c07d8697cff",
+        "binarySha256": "c532d7f2a5722c266ae58a74cedbd628144626043730f020a6c96476529ab6d6",
+        "cliBinarySha256": "49d8a3037419753cfc6e91919eac0a2587bcc098ed42a6e452483efebcf9e259",
+        "oracle": "lncli --network=regtest getinfo",
+        "oracleSha256": "af84829d1f61d7842f23ce1beed2e6c9a98287dc169ec62b814a180959108055",
+        "capture": [
+          "curl",
+          "--silent",
+          "--show-error",
+          "--fail-with-body",
+          "--max-time",
+          "15",
+          "--cacert",
+          "/root/.lnd/tls.cert",
+          "--header",
+          "@/tmp/lnd-header",
+          "--write-out",
+          "\n%{http_code}",
+          "https://localhost:8080/v1/getinfo"
+        ],
+        "observedNetwork": "regtest",
+        "observedVersion": "0.20.1-beta commit=v0.20.1-beta",
+        "capturedAt": "2026-10-13T06:36:33.938Z",
+        "credentials": {
+          "macaroon": "fp:19a9b3e162a4bf75",
+          "rune": "fp:4ebe4ca217828e25"
+        }
+      }
+    },
+    {
+      "file": "recordings/cln/v26.04.2/getinfo.json",
+      "id": "getinfo",
+      "impl": "cln",
+      "version": "v26.04.2",
+      "sha256": "606bd9ffcd423f4741576489d0a8a9f4c340e0e48ec18f7210f5711de60e1147",
+      "command": {
+        "transport": "clnrest",
+        "method": "POST",
+        "path": "/v1/getinfo",
+        "body": {}
+      },
+      "source": "lab",
+      "provenance": {
+        "release": "https://github.com/ElementsProject/lightning/releases/tag/v26.04.2",
+        "sourceCommit": "ee6d4c4553d8989a289ca8848022197757ff98f5",
+        "image": "elementsproject/lightningd:v26.04.2@sha256:bed87dd031f087d368a4594cd243b8a3771a92dc9cb7d40be57c8d6d85cd54e8",
+        "imageId": "sha256:bed87dd031f087d368a4594cd243b8a3771a92dc9cb7d40be57c8d6d85cd54e8",
+        "binarySha256": "620a80ad7db6f366c5b4df74d4520453919032c6ae186871d9ba66b065b595cd",
+        "cliBinarySha256": "0382a6e57ebc3d8342e6743b11c89ea855665d1734e90308e936705bf69568af",
+        "oracle": "lightning-cli --network=regtest getinfo",
+        "oracleSha256": "06f330d7b41bd91b655d7cf5180558bf2b7eee6bf049f9244b8a8780ddedd499",
+        "capture": [
+          "curl",
+          "--silent",
+          "--show-error",
+          "--fail-with-body",
+          "--max-time",
+          "15",
+          "--cacert",
+          "/tmp/cln-ca.pem",
+          "--header",
+          "@/tmp/cln-header",
+          "--connect-to",
+          "localhost:3010:cln:3010",
+          "--request",
+          "POST",
+          "--header",
+          "Content-Type: application/json",
+          "--data",
+          "{}",
+          "--write-out",
+          "\n%{http_code}",
+          "https://localhost:3010/v1/getinfo"
+        ],
+        "observedNetwork": "regtest",
+        "observedVersion": "v26.04.2",
+        "capturedAt": "2026-10-13T06:36:40.365Z",
+        "credentials": {
+          "macaroon": "fp:19a9b3e162a4bf75",
+          "rune": "fp:4ebe4ca217828e25"
+        }
+      }
+    }
+  ]
+}

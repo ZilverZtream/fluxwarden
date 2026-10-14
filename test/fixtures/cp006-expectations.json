@@ -1,0 +1,64 @@
+{
+  "sources": ["SPEC 11.1-11.3", "ARCHITECTURE 10.1, 10.3-10.5", "SECURITY 4.4-6.1"],
+  "services": ["bitcoind", "lnd-p", "lnd-r", "cln-p", "cln-r", "cln-m", "toxiproxy"],
+  "lightningNodes": ["lnd-p", "lnd-r", "cln-p", "cln-r", "cln-m"],
+  "network": "regtest",
+  "forbiddenNetworks": ["mainnet", "testnet", "testnet4", "signet", "simnet", "bitcoin", "liquid", "liquid-regtest", "unknown", ""],
+  "versions": {"bitcoind": "31.1", "lnd": "0.21.4-beta", "cln": "v26.06.9", "toxiproxy": "2.12.0"},
+  "imagePins": {
+    "bitcoind": "lightninglabs/bitcoin-core:31.1@sha256:86e15e4348869a86343aacbbd1aff38e96cffddd87b61644694b1e1358d737cd",
+    "lnd": "lightninglabs/lnd:v0.21.4-beta@sha256:04d06edcc0f6e99a5e797ea34959f330add222226f840cd86afbc31f8f29627d",
+    "cln": "elementsproject/lightningd:v26.06.9@sha256:de74289ddcccb68cd60543b08b2b8594002d819125d200492e17a95166d56577",
+    "toxiproxy": "ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e"
+  },
+  "channels": [
+    {"id": "1", "from": "lnd-p", "to": "lnd-r", "capacity_msat": "5000000000", "push_msat": "1000000000"},
+    {"id": "2", "from": "lnd-r", "to": "cln-m", "capacity_msat": "5000000000", "push_msat": "1250000000"},
+    {"id": "3", "from": "lnd-r", "to": "cln-r", "capacity_msat": "5000000000", "push_msat": "2500000000"},
+    {"id": "4", "from": "cln-p", "to": "cln-r", "capacity_msat": "5000000000", "push_msat": "1000000000"},
+    {"id": "5", "from": "cln-r", "to": "cln-m", "capacity_msat": "5000000000", "push_msat": "1250000000"}
+  ],
+  "activeChannelCounts": {"lnd-p": 1, "lnd-r": 3, "cln-p": 1, "cln-r": 3, "cln-m": 2},
+  "setup": [
+    {"stage": "inventory", "beforeOwnership": true},
+    {"stage": "up", "args": ["up", "-d", "--wait"]},
+    {"stage": "identity", "beforeMoney": true},
+    {"stage": "mine-maturity", "blocks": 101},
+    {"stage": "wait-chain"},
+    {"stage": "fund-wallets"},
+    {"stage": "mine-wallets", "blocks": 6},
+    {"stage": "wait-confirmed"},
+    {"stage": "connect-peers"},
+    {"stage": "wait-peers"},
+    {"stage": "open-channels", "count": 5},
+    {"stage": "wait-mempool"},
+    {"stage": "mine-channels", "blocks": 6},
+    {"stage": "wait-active"},
+    {"stage": "set-policies"},
+    {"stage": "wait-full-graph", "edgesPerViewer": 5, "directionsPerEdge": 2},
+    {"stage": "wait-cleared-layers"},
+    {"stage": "manifest"}
+  ],
+  "cleanup": {
+    "args": ["down", "--volumes", "--remove-orphans"],
+    "outcomes": ["child-failure", "timeout", "invalid", "exception", "SIGINT", "SIGTERM"],
+    "remove": ["owned-containers", "owned-volumes", "temporary-secret-state"],
+    "retain": ["safe-evidence"],
+    "successUpKeepsOwnerUntilExplicitDown": true,
+    "refusalBeforeOwnershipRemovesNothing": true
+  },
+  "readiness": {
+    "minimumChainHeight": 113,
+    "lndHealthStates": ["RPC_ACTIVE", "SERVER_ACTIVE"],
+    "requireChainSync": true,
+    "requireLndGraphSync": true,
+    "requireClnNoSyncWarning": true,
+    "requireAllFiveEdgesOnEveryViewer": true,
+    "requireBothPolicies": true,
+    "requireNoSetupLayers": true,
+    "activeAloneIsInsufficient": true
+  },
+  "policies": {"base_fee_msat": "1000", "fee_rate_ppm": "1000", "lnd_cltv_delta": "80", "cln_cltv_delta": "34"},
+  "allocation": {"owners": 2, "workers": 2, "ownerWorkers": 1, "cpus": 8, "memoryBytes": 8589934592, "pids": 2048, "ownerCpus": 4, "ownerMemoryBytes": 4294967296, "ownerPids": 1024},
+  "unresolved": ["live oracle evidence"]
+}

@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "network": "regtest",
+  "nominalDurationSeconds": 420,
+  "phaseDeadlineSeconds": 180,
+  "demoPolicy": {
+    "cooldown_after_success": "1s",
+    "establishedBeforeAnyPlan": true,
+    "max_principal_msat": "100000000",
+    "max_fee_msat": "300000",
+    "max_fee_ppm": 2500,
+    "beforeChaosPlan": "observe eligibility after cooldown; never override or clear history"
+  },
+  "preparation": {
+    "helper": "labs/scenarios/demo/prepare.mjs#prepareStarvation",
+    "beforePhases": ["starvation", "chaos"],
+    "payer": "lnd-p",
+    "channels": [1, 2],
+    "channel2ReceivableTargetMsat": "5000000",
+    "maxInvoiceMsat": "100000000",
+    "maxPayments": 50,
+    "channel5MustRemainUnchanged": true,
+    "inboundTargetRule": "observed channel 2 receivable plus 100000000 msat"
+  },
+  "phases": [
+    { "id": "lab", "commands": [["lab", "up"], ["channels", "--node", "cln-m", "--sort", "inbound-deficit"]] },
+    { "id": "starvation", "commands": [["lab", "workload", "--type", "checkout"]] },
+    { "id": "plan", "commands": [["liquidity", "diagnose"], ["liquidity", "plan", "--refresh"], ["liquidity", "explain", "$proposal"]] },
+    { "id": "execute", "commands": [["liquidity", "approve", "$proposal", "--key", "$key", "--max-fee-msat", "300000", "--max-cltv-delta", "144"], ["actions", "execute", "$proposal", "--require-regtest"]] },
+    { "id": "verify", "commands": [["channels", "--node", "cln-m"], ["reconcile", "--node", "cln-m"], ["lab", "workload", "--type", "checkout"]] },
+    { "id": "chaos", "commands": [["liquidity", "diagnose"], ["liquidity", "plan", "--refresh"], ["liquidity", "explain", "$chaosProposal"], ["liquidity", "approve", "$chaosProposal", "--key", "$key", "--max-fee-msat", "300000", "--max-cltv-delta", "144"], ["lab", "chaos", "--case", "T-05"], ["reconcile"], ["evidence", "export", "--run-id", "$run", "--out", "$out"]] }
+  ],
+  "expected": {
+    "sourceChannel": 2,
+    "targetChannel": 5,
+    "principalMsat": "100000000",
+    "feeMsat": "202101",
+    "feePpm": "2022",
+    "cltvDelta": 132,
+    "cltvCap": 144,
+    "sourceLocalDeltaMsat": "-100202101",
+    "targetLocalDeltaMsat": "100000000",
+    "chaosStatus": "UNKNOWN",
+    "chaosExit": 7,
+    "sendsForUnknownHash": 1
+  },
+  "bundleFiles": ["manifest.json", "topology-before.json", "topology-after.json", "proposals.json", "execution-trace.ndjson", "ledger-audit.json", "reconciliation.json", "chaos-results.json", "checksums.sha256"]
+}

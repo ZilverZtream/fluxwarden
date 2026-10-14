@@ -1,0 +1,25 @@
+{
+  "id": "queryroutes",
+  "impl": "lnd",
+  "version": "0.21.4-beta",
+  "node": "lnd-r",
+  "request": {
+    "method": "POST",
+    "path": "/v1/graph/routes/038f46d8dc70879ff815d1174f0db91ea353c77e96ed33e54620856e87036c11a3/0",
+    "body": {
+      "amt_msat": "100000000",
+      "outgoing_chan_ids": [
+        "118747256127488"
+      ],
+      "last_hop_pubkey": "A6YFAKrmol+R8JJTG+T1yWH7b+SZh/4lTrGkc4GJtcVK",
+      "fee_limit": {
+        "fixed_msat": "10000000"
+      },
+      "use_mission_control": true
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "{\"routes\":[{\"total_time_lock\":261,\"total_fees\":\"202\",\"total_amt\":\"100202\",\"hops\":[{\"chan_id\":\"118747256127488\",\"chan_capacity\":\"100202\",\"amt_to_forward\":\"100101\",\"fee\":\"101\",\"expiry\":227,\"amt_to_forward_msat\":\"100101000\",\"fee_msat\":\"101101\",\"pub_key\":\"023f19f78eb4984ec2f908994a73060bb661d94d0220ba3236e35f76431d7dcd0a\",\"tlv_payload\":true,\"mpp_record\":null,\"amp_record\":null,\"custom_records\":{},\"metadata\":\"\",\"blinding_point\":\"\",\"encrypted_data\":\"\",\"total_amt_msat\":\"0\"},{\"chan_id\":\"118747255865344\",\"chan_capacity\":\"100101\",\"amt_to_forward\":\"100000\",\"fee\":\"101\",\"expiry\":193,\"amt_to_forward_msat\":\"100000000\",\"fee_msat\":\"101000\",\"pub_key\":\"03a60500aae6a25f91f092531be4f5c961fb6fe49987fe254eb1a4738189b5c54a\",\"tlv_payload\":true,\"mpp_record\":null,\"amp_record\":null,\"custom_records\":{},\"metadata\":\"\",\"blinding_point\":\"\",\"encrypted_data\":\"\",\"total_amt_msat\":\"0\"},{\"chan_id\":\"118747255996416\",\"chan_capacity\":\"100000\",\"amt_to_forward\":\"100000\",\"fee\":\"0\",\"expiry\":193,\"amt_to_forward_msat\":\"100000000\",\"fee_msat\":\"0\",\"pub_key\":\"038f46d8dc70879ff815d1174f0db91ea353c77e96ed33e54620856e87036c11a3\",\"tlv_payload\":true,\"mpp_record\":null,\"amp_record\":null,\"custom_records\":{},\"metadata\":\"\",\"blinding_point\":\"\",\"encrypted_data\":\"\",\"total_amt_msat\":\"0\"}],\"total_fees_msat\":\"202101\",\"total_amt_msat\":\"100202101\",\"first_hop_amount_msat\":\"0\",\"custom_channel_data\":\"\"}],\"success_prob\":0.34199999999999997}"
+  }
+}

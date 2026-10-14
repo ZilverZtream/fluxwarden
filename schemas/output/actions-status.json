@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ZilverZtream/fluxwarden/schemas/output/actions-status.json",
+  "title": "fluxwarden actions status --json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "command", "ok", "warnings", "result", "error"],
+  "properties": {
+    "schema": { "const": 1 },
+    "command": { "const": "actions status" },
+    "ok": { "type": "boolean" },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "result": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/result" }] },
+    "error": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/error" }] }
+  },
+  "oneOf": [
+    { "properties": { "ok": { "const": true }, "result": { "$ref": "#/$defs/result" }, "error": { "type": "null" } } },
+    { "properties": { "ok": { "const": false }, "result": { "type": "null" }, "error": { "$ref": "#/$defs/error" } } }
+  ],
+  "$defs": {
+    "msat": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "nullableMsat": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/msat" }] },
+    "status": { "enum": ["CLAIMED", "PREFLIGHT", "SUBMITTING", "IN_FLIGHT", "VERIFIED_SUCCESS", "VERIFIED_FAILURE", "UNKNOWN", "CANCELLED"] },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "step", "message"],
+      "properties": {
+        "code": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "step": { "type": ["string", "null"] },
+        "message": { "type": "string" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "at"],
+      "properties": {
+        "from": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/status" }] },
+        "to": { "$ref": "#/$defs/status" },
+        "at": { "type": "integer" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execution_id", "status", "fence_epoch", "lease_expires_at", "payment_hash", "route", "planned_fee_msat", "actual_fee_msat", "delta_status", "error_code", "events"],
+      "properties": {
+        "execution_id": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "fence_epoch": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+        "lease_expires_at": { "type": ["integer", "null"] },
+        "payment_hash": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }] },
+        "route": { "type": ["object", "null"] },
+        "planned_fee_msat": { "$ref": "#/$defs/nullableMsat" },
+        "actual_fee_msat": { "$ref": "#/$defs/nullableMsat" },
+        "delta_status": { "enum": [null, "MATCH", "MISMATCH", "PENDING"] },
+        "error_code": { "type": ["string", "null"] },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/event" } }
+      }
+    }
+  }
+}

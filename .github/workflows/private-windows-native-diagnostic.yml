@@ -1,0 +1,50 @@
+name: Private Windows native diagnostic
+# Collect fresh D71 timing evidence with the unchanged original race and diagnostic execution.
+on:
+  push:
+    branches: [ratchet/final-ci-20261013]
+    paths:
+      - .github/workflows/private-windows-native-diagnostic.yml
+      - scripts/private-native-diagnostic/**
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Original unchanged create-race, with private numeric process timing
+        required: true
+        default: original-create-race
+        type: choice
+        options: [original-create-race]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.23.2', '24.18.1']
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Trace original race (evidence only)
+        env:
+          FLUXWARDEN_NATIVE_DIAGNOSTIC_CASE: ${{ github.event_name == 'push' && 'original-create-race' || inputs.case }}
+        run: node scripts/private-native-diagnostic/run-native-diagnostic.mjs
+      - name: Scan private diagnostic evidence
+        if: always() && env.FLUXWARDEN_NATIVE_ARTIFACTS != ''
+        id: evidence-scan
+        run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$env:FLUXWARDEN_SENTINEL_DIR" "$env:FLUXWARDEN_NATIVE_ARTIFACTS"
+      - name: Upload scanned private diagnostic evidence
+        if: always() && steps.evidence-scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-diagnostic-node-${{ matrix.node }}
+          path: ${{ env.FLUXWARDEN_NATIVE_ARTIFACTS }}
+          if-no-files-found: error

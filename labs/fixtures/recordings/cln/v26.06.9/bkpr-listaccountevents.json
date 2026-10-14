@@ -1,0 +1,15 @@
+{
+  "id": "bkpr-listaccountevents",
+  "impl": "cln",
+  "version": "v26.06.9",
+  "node": "cln-m",
+  "request": {
+    "method": "POST",
+    "path": "/v1/bkpr-listaccountevents",
+    "body": {}
+  },
+  "response": {
+    "status": 201,
+    "body": "{\"events\":[{\"account\":\"wallet\",\"blockheight\":102,\"credit_msat\":100000000000,\"currency\":\"bcrt\",\"debit_msat\":0,\"outpoint\":\"78a753dbb4d9593c665d7e33bd621ba405b3941adc6c352f2d0a3b29ac7ac93a:0\",\"tag\":\"deposit\",\"timestamp\":1791861146,\"type\":\"chain\"},{\"account\":\"3707d3b2f2f171406afa467b339b251151298ffd3bedf1b1f133e593b3674685\",\"blockheight\":108,\"credit_msat\":0,\"currency\":\"bcrt\",\"debit_msat\":0,\"outpoint\":\"854667b393e533f1b1f1ed3bfd8f295111259b337b46fa6a4071f1f2b2d30737:0\",\"tag\":\"channel_open\",\"timestamp\":1791861171,\"type\":\"chain\"},{\"account\":\"3707d3b2f2f171406afa467b339b251151298ffd3bedf1b1f133e593b3674685\",\"credit_msat\":1250000000,\"currency\":\"bcrt\",\"debit_msat\":0,\"is_rebalance\":false,\"tag\":\"pushed\",\"timestamp\":1791861171,\"type\":\"channel\"},{\"account\":\"442b683144303796f823fbbac7a0bb74d2f2354f52a3e0c4e9dca7ee055d54a5\",\"blockheight\":108,\"credit_msat\":0,\"currency\":\"bcrt\",\"debit_msat\":0,\"outpoint\":\"a5545d05eea7dce9c4e0a3524f35f2d274bba0c7bafb23f89637304431682b44:0\",\"tag\":\"channel_open\",\"timestamp\":1791861172,\"type\":\"chain\"},{\"account\":\"442b683144303796f823fbbac7a0bb74d2f2354f52a3e0c4e9dca7ee055d54a5\",\"credit_msat\":1250000000,\"currency\":\"bcrt\",\"debit_msat\":0,\"is_rebalance\":false,\"tag\":\"pushed\",\"timestamp\":1791861172,\"type\":\"channel\"}]}"
+  }
+}

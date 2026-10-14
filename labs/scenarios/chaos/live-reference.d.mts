@@ -1,0 +1,25 @@
+import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from 'node:child_process';
+export type Row = Record<string, unknown>;
+export interface Result { exit:number|null; body:{ result:Row; error:Row|null }; signal:string|null; stderr:string }
+export function setRunner(value:(file:string,args:string[],options:SpawnSyncOptionsWithStringEncoding)=>SpawnSyncReturns<string>):void;
+export function input(): { key:string; tmp:string; evidence:string; config:string; database:string; policy:string; sentinels:string; ownerPath:string; owner:{ project:string;ports:{toxiproxy:number} }; manifest:Row };
+export function initializeRegistry():void;
+export function preflight(name:string):Promise<Row>;
+export function history():Record<string,Row[]>;
+export function unchangedOld(before:Record<string,Row[]>,after:Record<string,Row[]>):void;
+export function cli(args:string[],name:string,config?:string):Result;
+export function rows(sql:string,...params:unknown[]):Row[];
+export function oracle(node:string,method:string,parameters?:string[]):Row;
+export function retain(name:string,value:unknown):void;
+export function register(path:string,name:string):void;
+export function networkConfig(network:string):string;
+export function clean():Promise<void>;
+export function proxies():Promise<Record<string,{enabled:boolean;toxics:unknown[]}>>;
+export function nodeControl(node:string,operation:'pause'|'unpause'):void;
+export function enable(proxy:string,enabled:boolean):Promise<void>;
+export function query(database:string,sql:string,...params:unknown[]):Row[];
+export function lndConfig(reverse?:boolean):{config:string;policy:string;database:string};
+export function feeConfig():{config:string;policy:string;database:string};
+export function latency(proxy:string,name:string,milliseconds:number):Promise<void>;
+export function clnConfig(caseId:string,reverse?:boolean):{config:string;policy:string;database:string};
+export function readConfig(config:string):string;

@@ -1,0 +1,43 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: github.repository == 'ZilverZtream/fluxwarden'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+          registry-url: https://registry.npmjs.org
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_TEST_TMP: ${{ runner.temp }}/release-tests
+          FLUXWARDEN_SENTINEL_DIR: ${{ runner.temp }}/release-sentinels
+          FLUXWARDEN_EVIDENCE_DIR: ${{ runner.temp }}/release-evidence
+        run: |
+          mkdir -m 700 "$FLUXWARDEN_TEST_TMP" "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
+          printf '%s\n' "FLUXWARDEN_TEST_TMP=$FLUXWARDEN_TEST_TMP" "FLUXWARDEN_SENTINEL_DIR=$FLUXWARDEN_SENTINEL_DIR" "FLUXWARDEN_EVIDENCE_DIR=$FLUXWARDEN_EVIDENCE_DIR" >> "$GITHUB_ENV"
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:harness
+      - name: Verify release tag
+        run: node --input-type=module -e 'import fs from "node:fs"; const p=JSON.parse(fs.readFileSync("package.json")); if(process.env.GITHUB_REF_NAME !== `v${p.version}` || !/^[1-9][0-9]*\.[0-9]+\.[0-9]+$/.test(p.version)) process.exit(1); fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_VERSION=${p.version}\n`)'
+      - run: npm pack --pack-destination "$RUNNER_TEMP"
+      - run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz"
+      - run: node scripts/release-smoke.mjs "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz"
+      - name: Publish validated tarball
+        run: npm publish "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz" --provenance --access public

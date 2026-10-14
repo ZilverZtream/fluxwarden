@@ -1,0 +1,483 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ZilverZtream/fluxwarden/schemas/output/liquidity-explain.json",
+  "title": "fluxwarden liquidity explain --json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "command",
+    "ok",
+    "warnings",
+    "result",
+    "error"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "command": {
+      "const": "liquidity explain"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "result": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/proposal"
+        }
+      ]
+    },
+    "error": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/error"
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "result": {
+          "$ref": "#/$defs/proposal"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "result": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "msat": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "nullableMsat": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/msat"
+        }
+      ]
+    },
+    "channelKey": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pubkey": {
+      "type": "string",
+      "pattern": "^0[23][0-9a-f]{64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "refusalCode": {
+      "enum": [
+        "NO_FEASIBLE_ROUTE",
+        "FEE_CEILING_EXCEEDED",
+        "PPM_CEILING_EXCEEDED",
+        "CLTV_DELTA_UNSAFE",
+        "RESERVE_FLOOR",
+        "BUDGET_EXHAUSTED",
+        "COOLDOWN_ACTIVE",
+        "STALE_SNAPSHOT",
+        "INSUFFICIENT_HISTORY",
+        "CAPABILITY_UNSUPPORTED",
+        "SINGLE_PATH_UNAVAILABLE",
+        "REPEATED_CHANNEL",
+        "SAME_PEER",
+        "FIRST_HOP_SPENDABLE",
+        "LAST_HOP_RECEIVABLE"
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "step",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9
+        },
+        "step": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_fee_msat",
+        "max_fee_ppm",
+        "exempt_fee_msat",
+        "max_cltv_delta"
+      ],
+      "properties": {
+        "max_fee_msat": {
+          "$ref": "#/$defs/msat"
+        },
+        "max_fee_ppm": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exempt_fee_msat": {
+          "$ref": "#/$defs/msat"
+        },
+        "max_cltv_delta": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2016
+        }
+      }
+    },
+    "hop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel",
+        "node_out",
+        "amount_msat",
+        "cltv"
+      ],
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/channelKey"
+        },
+        "node_out": {
+          "$ref": "#/$defs/pubkey"
+        },
+        "amount_msat": {
+          "$ref": "#/$defs/msat"
+        },
+        "cltv": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hops",
+        "fee_msat",
+        "fee_ppm",
+        "cltv_delta",
+        "padding"
+      ],
+      "properties": {
+        "hops": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/hop"
+          }
+        },
+        "fee_msat": {
+          "$ref": "#/$defs/msat"
+        },
+        "fee_ppm": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cltv_delta": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "padding": {
+          "enum": [
+            1,
+            3
+          ]
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel",
+        "confidence",
+        "caveat",
+        "snapshot_age_ms",
+        "spendable_msat",
+        "receivable_msat"
+      ],
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/channelKey"
+        },
+        "confidence": {
+          "enum": [
+            "NODE_REPORTED",
+            "DERIVED_ESTIMATE"
+          ]
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshot_age_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "spendable_msat": {
+          "$ref": "#/$defs/msat"
+        },
+        "receivable_msat": {
+          "$ref": "#/$defs/msat"
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_channel",
+        "target_channel",
+        "principal_msat",
+        "code",
+        "detail",
+        "chosen"
+      ],
+      "properties": {
+        "source_channel": {
+          "$ref": "#/$defs/channelKey"
+        },
+        "target_channel": {
+          "$ref": "#/$defs/channelKey"
+        },
+        "principal_msat": {
+          "$ref": "#/$defs/nullableMsat"
+        },
+        "code": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/refusalCode"
+            }
+          ]
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chosen": {
+          "type": "boolean"
+        }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proposal_id",
+        "node",
+        "action",
+        "status",
+        "demand_source",
+        "source_channel",
+        "target_channel",
+        "principal_msat",
+        "caps",
+        "route",
+        "policy_sha256",
+        "digest",
+        "created_at",
+        "expires_at",
+        "inputs",
+        "candidates",
+        "approvals"
+      ],
+      "properties": {
+        "proposal_id": {
+          "type": "string",
+          "pattern": "^prop_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "node": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "enum": [
+            "CIRCULAR_REBALANCE",
+            "NO_ACTION"
+          ]
+        },
+        "status": {
+          "enum": [
+            "PROPOSED",
+            "APPROVED",
+            "REJECTED",
+            "EXPIRED"
+          ]
+        },
+        "demand_source": {
+          "enum": [
+            "TARGETS",
+            "EWMA"
+          ]
+        },
+        "source_channel": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/channelKey"
+            }
+          ]
+        },
+        "target_channel": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/channelKey"
+            }
+          ]
+        },
+        "principal_msat": {
+          "$ref": "#/$defs/nullableMsat"
+        },
+        "caps": {
+          "$ref": "#/$defs/caps"
+        },
+        "route": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/route"
+            }
+          ]
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "created_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/input"
+          }
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/candidate"
+          }
+        },
+        "approvals": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "action": {
+              "const": "CIRCULAR_REBALANCE"
+            },
+            "source_channel": {
+              "$ref": "#/$defs/channelKey"
+            },
+            "target_channel": {
+              "$ref": "#/$defs/channelKey"
+            },
+            "principal_msat": {
+              "$ref": "#/$defs/msat"
+            },
+            "route": {
+              "$ref": "#/$defs/route"
+            }
+          }
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "NO_ACTION"
+            },
+            "source_channel": {
+              "type": "null"
+            },
+            "target_channel": {
+              "type": "null"
+            },
+            "principal_msat": {
+              "type": "null"
+            },
+            "route": {
+              "type": "null"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

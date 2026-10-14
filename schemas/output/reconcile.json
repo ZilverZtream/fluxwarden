@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ZilverZtream/fluxwarden/schemas/output/reconcile.json",
+  "title": "fluxwarden reconcile --json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "command",
+    "ok",
+    "warnings",
+    "result",
+    "error"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "command": {
+      "const": "reconcile"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "result": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/result"
+        }
+      ]
+    },
+    "error": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/error"
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "result": {
+          "$ref": "#/$defs/result"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "result": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        }
+      }
+    },
+    {
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "result": {
+          "$ref": "#/$defs/result"
+        },
+        "error": {
+          "$ref": "#/$defs/reportError"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "msat": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$"
+    },
+    "signedMsat": {
+      "type": "string",
+      "pattern": "^(0|-?[1-9][0-9]*)$"
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "step",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9
+        },
+        "step": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "since",
+        "nodes",
+        "executions",
+        "differences",
+        "steps"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "pattern": "^run_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "since": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "result"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "result": {
+                "$ref": "#/$defs/stepResult"
+              }
+            }
+          }
+        },
+        "executions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "execution_id",
+              "from",
+              "to"
+            ],
+            "properties": {
+              "execution_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "from": {
+                "$ref": "#/$defs/status"
+              },
+              "to": {
+                "$ref": "#/$defs/status"
+              }
+            }
+          }
+        },
+        "differences": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "node",
+              "execution_id",
+              "item",
+              "ledger_msat",
+              "node_msat",
+              "journal_id"
+            ],
+            "properties": {
+              "node": {
+                "type": "string"
+              },
+              "execution_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "item": {
+                "type": "string",
+                "minLength": 1
+              },
+              "ledger_msat": {
+                "$ref": "#/$defs/signedMsat"
+              },
+              "node_msat": {
+                "$ref": "#/$defs/signedMsat"
+              },
+              "journal_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        }
+      }
+    },
+    "stepResult": {
+      "enum": [
+        "compared",
+        "pending",
+        "not-requested",
+        "unavailable",
+        "incomplete"
+      ]
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "result"
+      ],
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "result": {
+          "$ref": "#/$defs/stepResult"
+        }
+      }
+    },
+    "status": {
+      "enum": [
+        "CLAIMED",
+        "PREFLIGHT",
+        "SUBMITTING",
+        "IN_FLIGHT",
+        "VERIFIED_SUCCESS",
+        "VERIFIED_FAILURE",
+        "UNKNOWN",
+        "CANCELLED"
+      ]
+    },
+    "reportError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "step",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            7,
+            9
+          ]
+        },
+        "step": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "description": "A run that wrote its report and exits 7 (executions left unresolved) or 9 (differences) carries both the report in result and the error."
+}

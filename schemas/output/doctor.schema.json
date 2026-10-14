@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ZilverZtream/fluxwarden/schemas/output/doctor.schema.json",
+  "title": "fluxwarden doctor --json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "command", "ok", "warnings", "result", "error"],
+  "properties": {
+    "schema": { "const": 1 },
+    "command": { "const": "doctor" },
+    "ok": { "type": "boolean" },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "result": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/result" }] },
+    "error": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/error" }] }
+  },
+  "oneOf": [
+    { "properties": { "ok": { "const": true }, "result": { "$ref": "#/$defs/result" }, "error": { "type": "null" } } },
+    { "properties": { "ok": { "const": false }, "result": { "type": "null" }, "error": { "$ref": "#/$defs/error" } } }
+  ],
+  "$defs": {
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["CHANNEL_READ", "PAYMENT_READ", "PAYMENT_TRACK", "INVOICE_CREATE", "INVOICE_CANCEL", "FORWARDING_READ", "BOOKKEEPER_READ", "EXPLICIT_ROUTE_CONTROL", "ASKRENE_LAYER_ROUTING"]
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "step", "message"],
+      "properties": {
+        "code": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "step": { "type": ["string", "null"] },
+        "message": { "type": "string" }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "implementation", "pubkey", "network", "version", "synced", "block_height", "capabilities"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "implementation": { "enum": ["lnd", "cln"] },
+        "pubkey": { "type": "string", "pattern": "^0[23][0-9a-f]{64}$" },
+        "network": { "enum": ["regtest", "signet", "testnet", "testnet4", "mainnet"] },
+        "version": { "type": "string" },
+        "synced": { "type": "boolean" },
+        "block_height": { "type": "integer", "minimum": 0 },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_version", "engine_supported", "sqlite", "database", "nodes"],
+      "properties": {
+        "node_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+        "engine_supported": { "type": "boolean" },
+        "sqlite": { "const": true },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "schema_version"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "schema_version": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } }
+      }
+    }
+  }
+}

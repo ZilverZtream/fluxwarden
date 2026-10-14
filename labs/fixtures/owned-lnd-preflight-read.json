@@ -1,0 +1,317 @@
+{
+    "provenance":  "Owned pinned 0.21.4-beta t05-lnd-before native lncli getinfo/listchannels. REST uint64 chan_id restored from lncli scid per cmd/commands/commands.go replaceAndAppendScid (also test/lab/cp011-reference.live.test.ts); no other value changed.",
+    "invoice_reference": {
+        "provenance": "D60 owned pinned v0.21.4-beta native AddInvoice controls: lnd-invoice-diagnostic.json rejects 18; lnd-native-min-cltv.json rejects 23 and accepts 24, then cancels by hash; lnd-min-cltv-24-lookup.json records cltv_expiry 24. GetInfo and ListChannels observations below are unchanged.",
+        "source": "https://github.com/lightningnetwork/lnd/blob/v0.21.4-beta/routing/router.go#L35",
+        "min_final_cltv_delta": 24,
+        "rejected_final_cltv_deltas": [18, 23],
+        "accepted_invoice_cltv_expiry": "24",
+        "accepted_invoice_cleanup": "CANCELLED"
+    },
+    "route_reference": {
+        "provenance": "Owned pinned v0.21.4-beta public REST lnd-native-queryroutes24.json records QueryRoutes final_cltv_delta 24, cltv_limit 141 and fee_limit.fixed_msat 250000 at native height 114. Native total_time_lock 206 and hop expiries 172,138,138 are observed, not reconstructed. The normalized delta and complete bound below are independently calculated from those observations; the separate padding of 3 is the existing SPEC 5.3 LND safety margin.",
+        "source_sha256": "b82912818d0faa8858cb37e2d499ff2f2f16405f59bd7b063f788b8d1d09dd5b",
+        "block_height": 114,
+        "final_cltv_delta": 24,
+        "total_time_lock": 206,
+        "hop_expiries": [172, 138, 138],
+        "total_fees_msat": "202101",
+        "total_amt_msat": "100202101",
+        "native_cltv_delta": 92,
+        "padding": 3,
+        "complete_cltv_delta": 95,
+        "arithmetic": "206 - 114 = 92 = 34 + 34 + 24; 92 + 3 = 95 <= 144. The observed native route does not include the separate 3-block safety margin."
+    },
+    "info":  {
+                 "version":  "0.21.4-beta commit=v0.21.4-beta",
+                 "commit_hash":  "390b2d2b7bdcc335c183962e483f5daeceb8f0e7",
+                 "identity_pubkey":  "02ef20a508a650f1a6188700c680e3075a1071ea2c2343b780b50646da1533c5c3",
+                 "alias":  "lnd-r",
+                 "color":  "#3399ff",
+                 "num_pending_channels":  0,
+                 "num_active_channels":  3,
+                 "num_inactive_channels":  0,
+                 "num_peers":  3,
+                 "block_height":  114,
+                 "block_hash":  "75d136e96894397020890875d08a60af8ae6a44ca70fbeb48bdf6173ea8c1d1a",
+                 "best_header_timestamp":  "1791929587",
+                 "synced_to_chain":  true,
+                 "synced_to_graph":  true,
+                 "testnet":  false,
+                 "chains":  [
+                                {
+                                    "chain":  "bitcoin",
+                                    "network":  "regtest"
+                                }
+                            ],
+                 "uris":  [
+
+                          ],
+                 "features":  {
+                                  "0":  {
+                                            "name":  "data-loss-protect",
+                                            "is_required":  true,
+                                            "is_known":  true
+                                        },
+                                  "5":  {
+                                            "name":  "upfront-shutdown-script",
+                                            "is_required":  false,
+                                            "is_known":  true
+                                        },
+                                  "7":  {
+                                            "name":  "gossip-queries",
+                                            "is_required":  false,
+                                            "is_known":  true
+                                        },
+                                  "8":  {
+                                            "name":  "tlv-onion",
+                                            "is_required":  true,
+                                            "is_known":  true
+                                        },
+                                  "12":  {
+                                             "name":  "static-remote-key",
+                                             "is_required":  true,
+                                             "is_known":  true
+                                         },
+                                  "14":  {
+                                             "name":  "payment-addr",
+                                             "is_required":  true,
+                                             "is_known":  true
+                                         },
+                                  "17":  {
+                                             "name":  "multi-path-payments",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "23":  {
+                                             "name":  "anchors-zero-fee-htlc-tx",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "25":  {
+                                             "name":  "route-blinding",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "27":  {
+                                             "name":  "shutdown-any-segwit",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "30":  {
+                                             "name":  "amp",
+                                             "is_required":  true,
+                                             "is_known":  true
+                                         },
+                                  "31":  {
+                                             "name":  "amp",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "35":  {
+                                             "name":  "quiescence",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "39":  {
+                                             "name":  "onion-messages",
+                                             "is_required":  false,
+                                             "is_known":  true
+                                         },
+                                  "44":  {
+                                             "name":  "explicit-commitment-type",
+                                             "is_required":  true,
+                                             "is_known":  true
+                                         },
+                                  "261":  {
+                                              "name":  "accountable-x",
+                                              "is_required":  false,
+                                              "is_known":  true
+                                          },
+                                  "2023":  {
+                                               "name":  "script-enforced-lease",
+                                               "is_required":  false,
+                                               "is_known":  true
+                                           }
+                              },
+                 "require_htlc_interceptor":  false,
+                 "store_final_htlc_resolutions":  false,
+                 "wallet_synced":  true,
+                 "graph_cache_status":  "GRAPH_CACHE_STATUS_LOADED"
+             },
+    "channels":  {
+                     "channels":  [
+                                      {
+                                          "active":  true,
+                                          "remote_pubkey":  "024d0117773b3f6ac3f12b2c08e249aa498dbe0047145e33691cd9cb0060b474f7",
+                                          "channel_point":  "15f6ae3142e3e256a3df50166517a81b366d615716512f657c07f0d955cabcb8:0",
+                                          "chan_id":  "118747256127488",
+                                          "capacity":  "5000000",
+                                          "local_balance":  "2096126",
+                                          "remote_balance":  "2900404",
+                                          "commit_fee":  "2810",
+                                          "commit_weight":  "1116",
+                                          "fee_per_kw":  "2500",
+                                          "unsettled_balance":  "0",
+                                          "total_satoshis_sent":  "400404",
+                                          "total_satoshis_received":  "0",
+                                          "num_updates":  "8",
+                                          "pending_htlcs":  [
+
+                                                            ],
+                                          "csv_delay":  6,
+                                          "private":  false,
+                                          "initiator":  true,
+                                          "chan_status_flags":  "ChanStatusDefault",
+                                          "local_chan_reserve_sat":  "50000",
+                                          "remote_chan_reserve_sat":  "50000",
+                                          "static_remote_key":  false,
+                                          "commitment_type":  "ANCHORS",
+                                          "lifetime":  "12118",
+                                          "uptime":  "12118",
+                                          "close_address":  "",
+                                          "push_amount_sat":  "2500000",
+                                          "thaw_height":  0,
+                                          "local_constraints":  {
+                                                                    "csv_delay":  6,
+                                                                    "chan_reserve_sat":  "50000",
+                                                                    "dust_limit_sat":  "354",
+                                                                    "max_pending_amt_msat":  "18446744073709551615",
+                                                                    "min_htlc_msat":  "0",
+                                                                    "max_accepted_htlcs":  483
+                                                                },
+                                          "remote_constraints":  {
+                                                                     "csv_delay":  600,
+                                                                     "chan_reserve_sat":  "50000",
+                                                                     "dust_limit_sat":  "546",
+                                                                     "max_pending_amt_msat":  "4950000000",
+                                                                     "min_htlc_msat":  "1",
+                                                                     "max_accepted_htlcs":  483
+                                                                 },
+                                          "alias_scids":  [
+
+                                                          ],
+                                          "zero_conf":  false,
+                                          "zero_conf_confirmed_scid":  "0",
+                                          "peer_alias":  "cln-r",
+                                          "peer_scid_alias":  "0",
+                                          "memo":  "",
+                                          "custom_channel_data":  ""
+                                      },
+                                      {
+                                          "active":  true,
+                                          "remote_pubkey":  "025644dfd25dd92e8cda3f7dbb52cff7462fd40b99791dffbb42106a3d6c153e2d",
+                                          "channel_point":  "2076533a86cadace93f69b15230ecf7e75dac2458c6eaf4284910435f956e60f:0",
+                                          "chan_id":  "118747255996416",
+                                          "capacity":  "5000000",
+                                          "local_balance":  "359970",
+                                          "remote_balance":  "4636559",
+                                          "commit_fee":  "2811",
+                                          "commit_weight":  "1116",
+                                          "fee_per_kw":  "2500",
+                                          "unsettled_balance":  "0",
+                                          "total_satoshis_sent":  "3787368",
+                                          "total_satoshis_received":  "400808",
+                                          "num_updates":  "94",
+                                          "pending_htlcs":  [
+
+                                                            ],
+                                          "csv_delay":  6,
+                                          "private":  false,
+                                          "initiator":  true,
+                                          "chan_status_flags":  "ChanStatusDefault",
+                                          "local_chan_reserve_sat":  "50000",
+                                          "remote_chan_reserve_sat":  "50000",
+                                          "static_remote_key":  false,
+                                          "commitment_type":  "ANCHORS",
+                                          "lifetime":  "12118",
+                                          "uptime":  "12118",
+                                          "close_address":  "",
+                                          "push_amount_sat":  "1250000",
+                                          "thaw_height":  0,
+                                          "local_constraints":  {
+                                                                    "csv_delay":  6,
+                                                                    "chan_reserve_sat":  "50000",
+                                                                    "dust_limit_sat":  "354",
+                                                                    "max_pending_amt_msat":  "18446744073709551615",
+                                                                    "min_htlc_msat":  "0",
+                                                                    "max_accepted_htlcs":  483
+                                                                },
+                                          "remote_constraints":  {
+                                                                     "csv_delay":  600,
+                                                                     "chan_reserve_sat":  "50000",
+                                                                     "dust_limit_sat":  "546",
+                                                                     "max_pending_amt_msat":  "4950000000",
+                                                                     "min_htlc_msat":  "1",
+                                                                     "max_accepted_htlcs":  483
+                                                                 },
+                                          "alias_scids":  [
+
+                                                          ],
+                                          "zero_conf":  false,
+                                          "zero_conf_confirmed_scid":  "0",
+                                          "peer_alias":  "cln-m",
+                                          "peer_scid_alias":  "0",
+                                          "memo":  "",
+                                          "custom_channel_data":  ""
+                                      },
+                                      {
+                                          "active":  true,
+                                          "remote_pubkey":  "02ba3bda60ebd038399896f2c96ba01905b4258565178175800c891a9cbe523f78",
+                                          "channel_point":  "b07951f71c513528dc4494ebffb4c31dbae69643eecd246d95a645424a822a8e:0",
+                                          "chan_id":  "118747256061952",
+                                          "capacity":  "5000000",
+                                          "local_balance":  "4791198",
+                                          "remote_balance":  "205331",
+                                          "commit_fee":  "2811",
+                                          "commit_weight":  "1116",
+                                          "fee_per_kw":  "2500",
+                                          "unsettled_balance":  "0",
+                                          "total_satoshis_sent":  "100000",
+                                          "total_satoshis_received":  "3891198",
+                                          "num_updates":  "108",
+                                          "pending_htlcs":  [
+
+                                                            ],
+                                          "csv_delay":  600,
+                                          "private":  false,
+                                          "initiator":  false,
+                                          "chan_status_flags":  "ChanStatusDefault",
+                                          "local_chan_reserve_sat":  "50000",
+                                          "remote_chan_reserve_sat":  "50000",
+                                          "static_remote_key":  false,
+                                          "commitment_type":  "ANCHORS",
+                                          "lifetime":  "12118",
+                                          "uptime":  "12118",
+                                          "close_address":  "",
+                                          "push_amount_sat":  "1000000",
+                                          "thaw_height":  0,
+                                          "local_constraints":  {
+                                                                    "csv_delay":  600,
+                                                                    "chan_reserve_sat":  "50000",
+                                                                    "dust_limit_sat":  "354",
+                                                                    "max_pending_amt_msat":  "4950000000",
+                                                                    "min_htlc_msat":  "1",
+                                                                    "max_accepted_htlcs":  483
+                                                                },
+                                          "remote_constraints":  {
+                                                                     "csv_delay":  600,
+                                                                     "chan_reserve_sat":  "50000",
+                                                                     "dust_limit_sat":  "354",
+                                                                     "max_pending_amt_msat":  "4950000000",
+                                                                     "min_htlc_msat":  "1",
+                                                                     "max_accepted_htlcs":  483
+                                                                 },
+                                          "alias_scids":  [
+
+                                                          ],
+                                          "zero_conf":  false,
+                                          "zero_conf_confirmed_scid":  "0",
+                                          "peer_alias":  "lnd-p",
+                                          "peer_scid_alias":  "0",
+                                          "memo":  "",
+                                          "custom_channel_data":  ""
+                                      }
+                                  ]
+                 }
+}

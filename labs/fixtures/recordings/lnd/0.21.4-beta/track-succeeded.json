@@ -1,0 +1,18 @@
+{
+  "id": "track-succeeded",
+  "impl": "lnd",
+  "version": "0.21.4-beta",
+  "node": "lnd-r",
+  "request": {
+    "method": "GET",
+    "path": "/v2/router/track/DphB39MsRW7ID8jqNdGLxYoEDGyWtaLUI9X1ZmIvPhs=",
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "lines": [
+      "{\"result\":{\"payment_hash\":\"0e9841dfd32c456ec80fc8ea35d18bc58a040c6c96b5a2d423d5f566622f3e1b\",\"value\":\"50000\",\"creation_date\":\"1791861307\",\"fee\":\"0\",\"payment_preimage\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"value_sat\":\"50000\",\"value_msat\":\"50000000\",\"payment_request\":\"\",\"status\":\"IN_FLIGHT\",\"fee_sat\":\"0\",\"fee_msat\":\"0\",\"creation_time_ns\":\"1791861307393199872\",\"htlcs\":[{\"attempt_id\":\"2\",\"status\":\"IN_FLIGHT\",\"route\":{\"total_time_lock\":213,\"total_fees\":\"0\",\"total_amt\":\"50000\",\"hops\":[{\"chan_id\":\"118747256061952\",\"chan_capacity\":\"50000\",\"amt_to_forward\":\"50000\",\"fee\":\"0\",\"expiry\":213,\"amt_to_forward_msat\":\"50000000\",\"fee_msat\":\"0\",\"pub_key\":\"0301bc3656591e2c556f1b8f132922bdad4abb5fb6f5ba6a050a25c0407f94c994\",\"tlv_payload\":true,\"mpp_record\":{\"payment_addr\":\"lnMncnl4xP8Z8hTPgGzOtOANFRdPz0HICuH6sEhAlcI=\",\"total_amt_msat\":\"50000000\"},\"amp_record\":null,\"custom_records\":{},\"metadata\":\"\",\"blinding_point\":\"\",\"encrypted_data\":\"\",\"total_amt_msat\":\"0\"}],\"total_fees_msat\":\"0\",\"total_amt_msat\":\"50000000\",\"first_hop_amount_msat\":\"50000000\",\"custom_channel_data\":\"\"},\"attempt_time_ns\":\"1791861307395355323\",\"resolve_time_ns\":\"0\",\"failure\":null,\"preimage\":\"\"}],\"payment_index\":\"2\",\"failure_reason\":\"FAILURE_REASON_NONE\",\"first_hop_custom_records\":{}}}",
+      "{\"result\":{\"payment_hash\":\"0e9841dfd32c456ec80fc8ea35d18bc58a040c6c96b5a2d423d5f566622f3e1b\",\"value\":\"50000\",\"creation_date\":\"1791861307\",\"fee\":\"0\",\"payment_preimage\":\"fp:0e9841dfd32c456e\",\"value_sat\":\"50000\",\"value_msat\":\"50000000\",\"payment_request\":\"\",\"status\":\"SUCCEEDED\",\"fee_sat\":\"0\",\"fee_msat\":\"0\",\"creation_time_ns\":\"1791861307393199872\",\"htlcs\":[{\"attempt_id\":\"2\",\"status\":\"SUCCEEDED\",\"route\":{\"total_time_lock\":213,\"total_fees\":\"0\",\"total_amt\":\"50000\",\"hops\":[{\"chan_id\":\"118747256061952\",\"chan_capacity\":\"50000\",\"amt_to_forward\":\"50000\",\"fee\":\"0\",\"expiry\":213,\"amt_to_forward_msat\":\"50000000\",\"fee_msat\":\"0\",\"pub_key\":\"0301bc3656591e2c556f1b8f132922bdad4abb5fb6f5ba6a050a25c0407f94c994\",\"tlv_payload\":true,\"mpp_record\":{\"payment_addr\":\"lnMncnl4xP8Z8hTPgGzOtOANFRdPz0HICuH6sEhAlcI=\",\"total_amt_msat\":\"50000000\"},\"amp_record\":null,\"custom_records\":{},\"metadata\":\"\",\"blinding_point\":\"\",\"encrypted_data\":\"\",\"total_amt_msat\":\"0\"}],\"total_fees_msat\":\"0\",\"total_amt_msat\":\"50000000\",\"first_hop_amount_msat\":\"50000000\",\"custom_channel_data\":\"\"},\"attempt_time_ns\":\"1791861307395355323\",\"resolve_time_ns\":\"1791861308211538185\",\"failure\":null,\"preimage\":\"fp:0e9841dfd32c456e\"}],\"payment_index\":\"2\",\"failure_reason\":\"FAILURE_REASON_NONE\",\"first_hop_custom_records\":{}}}"
+    ]
+  }
+}

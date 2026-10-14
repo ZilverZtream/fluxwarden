@@ -1,0 +1,15 @@
+{
+  "id": "error-code-message",
+  "impl": "lnd",
+  "version": "0.21.4-beta",
+  "node": "lnd-r",
+  "request": {
+    "method": "GET",
+    "path": "/v1/invoice/0000000000000000000000000000000000000000000000000000000000000000",
+    "body": null
+  },
+  "response": {
+    "status": 404,
+    "body": "{\"code\":5,\"message\":\"unable to locate invoice\",\"details\":[]}"
+  }
+}

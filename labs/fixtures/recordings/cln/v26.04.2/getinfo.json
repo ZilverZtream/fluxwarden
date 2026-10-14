@@ -1,0 +1,15 @@
+{
+  "id": "getinfo",
+  "impl": "cln",
+  "version": "v26.04.2",
+  "node": "cln-m",
+  "request": {
+    "method": "POST",
+    "path": "/v1/getinfo",
+    "body": {}
+  },
+  "response": {
+    "status": 201,
+    "body": "{\"address\":[],\"alias\":\"historical-cln\",\"binding\":[{\"address\":\"::\",\"port\":19846,\"type\":\"ipv6\"},{\"address\":\"0.0.0.0\",\"port\":19846,\"type\":\"ipv4\"}],\"blockheight\":0,\"color\":\"03cc65\",\"fees_collected_msat\":0,\"id\":\"03cc6503318c8741c00ef24c2eab7ff22b26e496406e2b504c59c2099a29302308\",\"lightning-dir\":\"/root/.lightning/regtest\",\"network\":\"regtest\",\"num_active_channels\":0,\"num_inactive_channels\":0,\"num_peers\":0,\"num_pending_channels\":0,\"our_features\":{\"channel\":\"\",\"init\":\"800898880a8a59a1\",\"invoice\":\"02000002024100\",\"node\":\"808898880a8a59a1\"},\"version\":\"v26.04.2\",\"warning_bitcoind_sync\":\"Bitcoind is not up-to-date with network.\"}"
+  }
+}

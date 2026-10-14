@@ -31,7 +31,11 @@ Run the CLI you built with `node dist/cli/bin.js --help`.
 | `npm run lint` | ESLint |
 | `npm run build` | The strict TypeScript build into `dist/` |
 
-The regtest lab, chaos and full-validation scripts (`test:lab`, `test:chaos`, `test:full`, `lab:up`, `lab:down`, `fixtures:record`) are not yet available. Each prints `fluxwarden: this capability is not yet available` on stderr, writes no stdout and exits 1.
+`npm run test:lab` runs Docker-free lab tests and selects live reference tests when FLUXWARDEN_LAB_PLAN supplies the required disposable lab plan. `npm run test:chaos` owns fault scenarios and live chaos references; selected live cases require their lab inputs and fail closed without them. Neither belongs in ordinary product validation. `test:full` currently refuses with exit 1. `lab:up`, `lab:down` and `fixtures:record` use the disposable lab tooling and require their documented inputs. Run lab commands from the built source checkout with `node dist/cli/bin.js lab <command>`; lab drivers are absent from the npm tarball.
+
+Use a fresh private scratch directory beneath a trusted owned parent for FLUXWARDEN_TEST_TMP, FLUXWARDEN_SENTINEL_DIR and FLUXWARDEN_EVIDENCE_DIR. Tests create private directories and refuse unsafe existing objects. Never alter permissions on another user's state to make a test pass.
+
+`npm pack` cleans and rebuilds dist. `npm run release:smoke -- <tarball>` verifies the package allow-list, scans the decompressed tarball and offline installed package against registered test sentinels, and runs installed commands. CI defines Windows and Linux checks; a configured job is not evidence that a hosted run passed.
 
 Pull requests need `npm run lint`, `npm run build`, `npm test` and `npm run test:harness` to pass, with no skipped tests.
 

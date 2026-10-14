@@ -1,10 +1,11 @@
 // Repository configuration and documentation, checked through public files and commands.
 // Expected values follow the public package identity, toolchain, documentation and reporting policy.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { copyFileSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
-import { asRecord, binPath, childEnv, isRecord, readJson, readText, repoRoot, runNpmScript } from '../helpers/cli.js';
+import { asRecord, binPath, childEnv, isRecord, readJson, readText, repoRoot, runNpmScript, scratchDir } from '../helpers/cli.js';
 import { parseYaml, type Yaml } from '../helpers/yaml.js';
 
 // Toolchain versions recorded from the reference package on 2026-10-11.
@@ -111,7 +112,8 @@ it('CP-001/B10 .gitattributes exists, .gitignore lists the four paths and LICENS
 });
 
 // Bug caught: write permissions, an unpinned or tag-pinned action, persisted checkout credentials,
-// a missing Windows or floor job, tests before build, a no-pending step not reading both reports,
+// a missing Windows shard or floor job, tests before build, incomplete or overlapping Windows coverage,
+// a no-pending step not reading the active shard's reports,
 // a step allowed to fail, or lab jobs running on every push.
 it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned actions, step order and dispatch-only lab jobs', () => {
   const wf = map(parseYaml(readText('.github/workflows/ci.yml')), 'workflow');
@@ -164,9 +166,9 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   const nodeVersionExpr = String(map(setupNode?.['with'], 'setup-node.with')['node-version']);
   const subst = (expr: string, c: Record<string, string>): string => expr.replace(/\$\{\{\s*matrix\.([\w-]+)\s*\}\}/g, (_m, k: string) => c[k] ?? '<unset>');
   const runsOn = String(test['runs-on']);
-  expect(combos.map(c => `${subst(runsOn, c)} ${subst(nodeVersionExpr, c)}`).sort()).toEqual([
-    'ubuntu-latest 22.23.2', 'ubuntu-latest 22.x', 'ubuntu-latest 24.18.1', 'ubuntu-latest 24.x',
-    'windows-latest 22.23.2', 'windows-latest 24.x',
+  expect(combos.map(c => `${subst(runsOn, c)} ${subst(nodeVersionExpr, c)} ${c['shard'] ?? '<unset>'}`).sort()).toEqual([
+    'ubuntu-latest 22.23.2 core', 'ubuntu-latest 22.x core', 'ubuntu-latest 24.18.1 core', 'ubuntu-latest 24.x core',
+    'windows-latest 22.23.2 core', 'windows-latest 22.23.2 native', 'windows-latest 24.x core', 'windows-latest 24.x native',
   ]);
 
   // CI step order: checkout, setup-node, npm ci, lint, build, product, harness, no-pending.
@@ -183,22 +185,106 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     if (/^node scripts\//.test(run)) return 'no-pending';
     return null;
   };
-  const ordered = steps.filter(s => kind(s) !== null);
-  expect(ordered.map(kind)).toEqual(['checkout', 'setup-node', 'npm ci', 'lint', 'build', 'product', 'harness', 'no-pending']);
-  for (const s of ordered) {
-    expect(s['if'], `${String(kind(s))} must not be conditional`).toBeUndefined();
+  const active = (step: { [key: string]: Yaml }, combo: Record<string, string>): boolean => {
+    if (step['if'] === undefined) return true;
+    const condition = String(step['if']).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+    return condition.split(/\s*&&\s*/).every(term => {
+      const match = /^matrix\.(os|shard) == '([^']+)'$/.exec(term);
+      if (!match) throw new Error(`unsupported CI shard condition: ${condition}`);
+      return combo[match[1] ?? ''] === match[2];
+    });
+  };
+  for (const s of steps.filter(s => kind(s) !== null)) {
+    if (['checkout', 'setup-node', 'npm ci', 'lint', 'build'].includes(kind(s) ?? '')) {
+      expect(s['if'], `${String(kind(s))} must not be conditional`).toBeUndefined();
+    }
     expect(s['continue-on-error'], `${String(kind(s))} must not be allowed to fail`).toBeUndefined();
   }
-  const reportOf = (k: string): string => {
+  const reportOf = (ordered: { [key: string]: Yaml }[], k: string): string => {
     const run = String(ordered.find(s => kind(s) === k)?.['run']);
     expect(run, `${k} uses a JSON reporter`).toMatch(/--reporter[= ]json\b/);
     const file = /--outputFile(?:\.json)?[= ](\S+)/.exec(run)?.[1];
     if (file === undefined) throw new Error(`${k} names no JSON output file`);
     return file.replace(/^["']|["']$/g, '');
   };
-  const noPending = String(ordered.find(s => kind(s) === 'no-pending')?.['run']);
-  expect(noPending).toContain(reportOf('product'));
-  expect(noPending).toContain(reportOf('harness'));
+  for (const combo of combos) {
+    const ordered = steps.filter(s => kind(s) !== null && active(s, combo));
+    const core = combo['shard'] === 'core';
+    expect(ordered.map(kind), JSON.stringify(combo)).toEqual([
+      'checkout', 'setup-node', 'npm ci', 'lint', 'build', 'product', ...(core ? ['harness'] : []), 'no-pending',
+    ]);
+    const productRun = String(ordered.find(s => kind(s) === 'product')?.['run']);
+    expect(productRun, 'no title or additional subset filtering').not.toMatch(/--(?:testNamePattern|exclude|include|dir|project|shard|changed|related)\b|(?:^|\s)-t(?:\s|$)/);
+    if (combo['os'] !== 'windows-latest' || !core) expect(productRun).not.toMatch(/--config\b/);
+    const noPending = String(ordered.find(s => kind(s) === 'no-pending')?.['run']);
+    expect(noPending).toMatch(/^node scripts\/no-pending\.mjs\s/);
+    expect(noPending).toContain(reportOf(ordered, 'product'));
+    if (core) expect(noPending).toContain(reportOf(ordered, 'harness'));
+  }
+
+  // Approved Windows split: the native commands and the generated core configuration must partition
+  // the complete product file inventory. Use Vitest's public listing command, without running product tests.
+  const nativeFiles = [
+    'test/labs/cp006-cp008-owner-lifecycle.test.ts',
+    'test/persistence/cp015-concurrency.test.ts',
+    'test/chaos/t01-t12.test.ts',
+    'test/cli/cp038-reconcile-evidence.test.ts',
+    'test/commands/cp043-driver.test.ts',
+    'test/executor/cp029-preflight.test.ts',
+    'test/output/cp003-output.test.ts',
+    'test/persistence/cp015-command-data-readonly.test.ts',
+    'test/persistence/cp015-persistence.test.ts',
+    'test/daemon/cp041-daemon.test.ts',
+    'test/ledger/cp037-ledger.test.ts',
+    'test/commands/cp043-t05-repository.test.ts',
+  ];
+  const coreCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'core');
+  const nativeCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'native');
+  if (!coreCombo || !nativeCombo) throw new Error('both Windows shards are required');
+  const coreProduct = steps.find(s => kind(s) === 'product' && active(s, coreCombo));
+  const nativeProduct = steps.find(s => kind(s) === 'product' && active(s, nativeCombo));
+  const nativeArgs = String(nativeProduct?.['run']).match(/\btest\/[\w./-]+\.test\.ts\b/g) ?? [];
+  expect(nativeArgs).toEqual(nativeFiles);
+  const configuration = steps.filter(s => active(s, coreCombo)).find(s => typeof s['run'] === 'string' && s['run'].includes('FLUXWARDEN_CI_CORE_CONFIG='));
+  expect(configuration).toBeDefined();
+  if (configuration === undefined || coreProduct === undefined) throw new Error('core configuration and product steps are required');
+  expect(configuration['continue-on-error']).toBeUndefined();
+  expect(steps.indexOf(configuration), 'configure core before running it').toBeLessThan(steps.indexOf(coreProduct));
+  const configurationSource = /<<'NODE'\s*\n([^]*?)\nNODE\s*$/.exec(String(configuration['run']))?.[1];
+  if (configurationSource === undefined) throw new Error('core configuration preparation is missing');
+  const scratch = scratchDir('ci-shard-config'), githubEnv = join(scratch, 'github-env');
+  const configured = spawnSync(process.execPath, ['--input-type=module'], {
+    cwd: repoRoot, env: { ...childEnv(), RUNNER_TEMP: scratch, GITHUB_ENV: githubEnv }, input: configurationSource,
+    encoding: 'utf8', windowsHide: true, timeout: 10000,
+  });
+  expect(configured.error).toBeUndefined();
+  expect(configured.status, configured.stderr).toBe(0);
+  const coreConfig = /^FLUXWARDEN_CI_CORE_CONFIG=(.+)$/m.exec(readFileSync(githubEnv, 'utf8'))?.[1];
+  if (coreConfig === undefined) throw new Error('core configuration path was not published');
+  expect(dirname(coreConfig)).toBe(scratch);
+  expect(String(coreProduct['run'])).toContain('--config="$FLUXWARDEN_CI_CORE_CONFIG"');
+  const productFiles = (args: readonly string[] = []): string[] => {
+    const outputFile = join(scratchDir('ci-product-files'), 'inventory.json');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs'),
+      'list', '--project', 'product', '--filesOnly', ...args, `--json=${outputFile}`], {
+      cwd: repoRoot, env: childEnv(), encoding: 'utf8', windowsHide: true, timeout: 10000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const files: unknown = JSON.parse(readFileSync(outputFile, 'utf8'));
+    if (!Array.isArray(files)) throw new Error('product file inventory is not a list');
+    return files.map(value => {
+      const file = asRecord(value, 'product file');
+      expect(file['projectName']).toBe('product');
+      if (typeof file['file'] !== 'string') throw new Error('product file path is missing');
+      return relative(repoRoot, file['file']).replace(/\\/g, '/');
+    }).sort();
+  };
+  const complete = productFiles(), coreFiles = productFiles(['--config', coreConfig]), native = productFiles(nativeArgs);
+  expect(complete.length).toBeGreaterThan(nativeFiles.length);
+  expect(native).toEqual([...nativeFiles].sort());
+  expect(coreFiles.filter(file => native.includes(file)), 'Windows shards are disjoint').toEqual([]);
+  expect([...coreFiles, ...native].sort(), 'Windows shards cover the complete product inventory').toEqual(complete);
 
   for (const [name, script] of [['lab', 'test:lab'], ['chaos', 'test:chaos']] as const) {
     const job = map(jobs[name], name);
@@ -297,7 +383,8 @@ it('CP-001/B11 scripts/no-pending.mjs exits 1 for a skipped, todo or failed test
   for (const [name, reports] of rejected) expect(noPending(reports), name).toBe(1);
 });
 
-const LATER = ['test:lab', 'test:chaos', 'lab:up', 'lab:down', 'fixtures:record', 'test:full'];
+// Decision D40: lab availability advances at CP-006; later capabilities keep their exact refusal.
+const LATER = ['test:full'];
 // Bug caught: an unavailable script exiting 0, writing stdout, or printing an inconsistent message.
 it.each(LATER)('CP-001/B13 npm run %s exits 1 with the exact unavailable-capability stderr line and no stdout', script => {
   const r = runNpmScript(script);
@@ -307,6 +394,52 @@ it.each(LATER)('CP-001/B13 npm run %s exits 1 with the exact unavailable-capabil
   expect(lines).toHaveLength(1);
   expect(lines[0]).toBe('fluxwarden: this capability is not yet available');
 }, 60000);
+
+// D40 public CLI contract: missing owner is refused before Docker, with a safe owner diagnostic.
+// Bug caught: leaving the unavailable stub in place, accepting no owner, or contacting Docker first.
+it.each(['lab:up', 'lab:down'])('CP-006/B6 npm run %s without an owner refuses before any Docker invocation', async script => {
+  const base = process.env['FLUXWARDEN_TEST_TMP'];
+  const npmCli = process.env['npm_execpath'];
+  if (!base || !npmCli || !/npm-cli\.js$/.test(npmCli)) throw new Error('private temporary root and npm CLI are required');
+  const scratch = await import(pathToFileURL(join(repoRoot, 'scripts/private-scratch.mjs')).href) as {
+    createPrivateDirectory(parent: string, prefix: string): Promise<string>;
+  };
+  const root = await scratch.createPrivateDirectory(base, 'docker-guard-');
+  const marker = join(root, 'invoked.txt');
+  const guard = join(root, 'guard.cjs');
+  const executable = join(root, process.platform === 'win32' ? 'docker.exe' : 'docker');
+  const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(childEnv()).filter(([key]) => key.toLowerCase() !== 'path'));
+  // A real controlled executable replaces Docker on PATH; its preload only acts when that
+  // executable runs. No production imports or child-process calls are mocked.
+  if (process.platform === 'win32') {
+    copyFileSync(process.execPath, executable);
+    writeFileSync(guard, `if (require('node:path').basename(process.execPath).toLowerCase() === 'docker.exe') { require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'invoked'); process.exit(97); }\n`);
+    env['NODE_OPTIONS'] = `--require ${JSON.stringify(guard)}`;
+  } else {
+    writeFileSync(executable, `#!${process.execPath}\nimport { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'invoked'); process.exit(97);\n`, { mode: 0o700 });
+  }
+  env['PATH'] = [root, dirname(process.execPath), ...(process.platform === 'win32' ? [join(process.env['SystemRoot'] ?? 'C:\\Windows', 'System32')] : ['/bin', '/usr/bin'])].join(process.platform === 'win32' ? ';' : ':');
+  try {
+    const control = spawnSync(executable, ['compose', 'version'], { env, encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    expect(control.error).toBeUndefined();
+    expect(control.status, 'the controlled Docker executable must detect an invocation').toBe(97);
+    expect(existsSync(marker)).toBe(true);
+    unlinkSync(marker);
+    const result = spawnSync(process.execPath, [npmCli, 'run', '--silent', script], {
+      cwd: repoRoot, env, encoding: 'utf8', windowsHide: true, timeout: 10000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(existsSync(marker), 'no Docker invocation without an owner').toBe(false);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/\bowner\b/i);
+    expect(result.stderr).toMatch(/\brequir(?:e|ed|es|ement)\b|\bmissing\b|\bneeded\b|--owner|\bmust\b|\bprovide\b/i);
+    expect(result.stderr).not.toMatch(/^\s+at\s/m);
+  } finally {
+    // Remove only this fixture's executable copy before artifact scanning.
+    unlinkSync(executable);
+  }
+});
 
 // Bug caught: repository-only files left in the checkout or shipped in the package, an empty
 // package, or a package containing the executable while omitting its compiled runtime modules.
@@ -340,3 +473,10 @@ it('CP-001/B14 the package includes the complete built runtime and essential pub
   }
   expect(existsSync(join(repoRoot, 'tools', 'validation', 'schemas')), 'repository excludes local validation schema copies').toBe(false);
 }, 60000);
+
+it('CP-009/B4 npm run fixtures:record without an owner is a usage refusal, not the unavailable stub', () => {
+  const r = runNpmScript('fixtures:record');
+  expect(r.status).toBe(2);
+  expect(r.stdout).toBe('');
+  expect(r.stderr).not.toContain('this capability is not yet available');
+});

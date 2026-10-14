@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ZilverZtream/fluxwarden/schemas/output/liquidity-diagnose.json",
+  "title": "fluxwarden liquidity diagnose --json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "command", "ok", "warnings", "result", "error"],
+  "properties": {
+    "schema": { "const": 1 },
+    "command": { "const": "liquidity diagnose" },
+    "ok": { "type": "boolean" },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "result": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/result" }] },
+    "error": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/error" }] }
+  },
+  "oneOf": [
+    { "properties": { "ok": { "const": true }, "result": { "$ref": "#/$defs/result" }, "error": { "type": "null" } } },
+    { "properties": { "ok": { "const": false }, "result": { "type": "null" }, "error": { "$ref": "#/$defs/error" } } }
+  ],
+  "$defs": {
+    "msat": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "nullableMsat": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/msat" }] },
+    "channelKey": { "type": "string", "minLength": 1 },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "step", "message"],
+      "properties": {
+        "code": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "step": { "type": ["string", "null"] },
+        "message": { "type": "string" }
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel", "state", "capacity_msat", "spendable_msat", "receivable_msat", "confidence", "caveat",
+        "observed_at", "snapshot_age_ms", "block_height",
+        "inbound_target_msat", "inbound_deficit_msat", "inbound_surplus_msat",
+        "outbound_target_msat", "outbound_deficit_msat", "outbound_surplus_msat"
+      ],
+      "properties": {
+        "channel": { "$ref": "#/$defs/channelKey" },
+        "state": { "enum": ["ACTIVE", "INACTIVE", "PENDING", "CLOSING", "UNKNOWN"] },
+        "capacity_msat": { "$ref": "#/$defs/msat" },
+        "spendable_msat": { "$ref": "#/$defs/msat" },
+        "receivable_msat": { "$ref": "#/$defs/msat" },
+        "confidence": { "enum": ["NODE_REPORTED", "DERIVED_ESTIMATE"] },
+        "caveat": { "type": ["string", "null"] },
+        "observed_at": { "type": "integer", "minimum": 0 },
+        "snapshot_age_ms": { "type": "integer" },
+        "block_height": { "type": "integer", "minimum": 0 },
+        "inbound_target_msat": { "$ref": "#/$defs/nullableMsat" },
+        "inbound_deficit_msat": { "$ref": "#/$defs/msat" },
+        "inbound_surplus_msat": { "$ref": "#/$defs/msat" },
+        "outbound_target_msat": { "$ref": "#/$defs/nullableMsat" },
+        "outbound_deficit_msat": { "$ref": "#/$defs/msat" },
+        "outbound_surplus_msat": { "$ref": "#/$defs/msat" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "reason", "node", "demand_source", "horizon_seconds", "evaluated_at", "channels", "starved", "donors"],
+      "properties": {
+        "action": { "enum": ["DEFICIT", "NO_ACTION"] },
+        "reason": { "enum": [null, "BALANCED_OR_INSUFFICIENT_SURPLUS", "INSUFFICIENT_HISTORY"] },
+        "node": { "type": "string", "minLength": 1 },
+        "demand_source": { "enum": [null, "TARGETS"] },
+        "horizon_seconds": { "type": "integer", "minimum": 0 },
+        "evaluated_at": { "type": "integer", "minimum": 0 },
+        "channels": { "type": "array", "items": { "$ref": "#/$defs/channel" } },
+        "starved": { "type": "array", "items": { "$ref": "#/$defs/channelKey" } },
+        "donors": { "type": "array", "items": { "$ref": "#/$defs/channelKey" } }
+      },
+      "oneOf": [
+        { "properties": { "action": { "const": "DEFICIT" }, "reason": { "type": "null" }, "demand_source": { "const": "TARGETS" } } },
+        { "properties": { "action": { "const": "NO_ACTION" }, "reason": { "const": "BALANCED_OR_INSUFFICIENT_SURPLUS" }, "demand_source": { "const": "TARGETS" } } },
+        { "properties": { "action": { "const": "NO_ACTION" }, "reason": { "const": "INSUFFICIENT_HISTORY" }, "demand_source": { "type": "null" }, "channels": { "type": "array", "maxItems": 0 } } }
+      ]
+    }
+  }
+}

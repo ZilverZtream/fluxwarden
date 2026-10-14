@@ -1,0 +1,181 @@
+{
+  "requiredOwner": {
+    "declarationEnvironment": "FLUXWARDEN_LAB_ORACLE_OWNER",
+    "requiredFields": [
+      "authorized",
+      "disposable",
+      "network",
+      "project",
+      "composeFile",
+      "imagePins",
+      "pubkeys"
+    ],
+    "network": "regtest",
+    "projectPrefix": "fluxwarden-lab-",
+    "source": "SPEC 11.1-11.3; ARCHITECTURE 10.1-10.5; SECURITY 6.1",
+    "oracleCommandsBypassProxies": true
+  },
+  "resourceAndCleanup": {
+    "title": "CP-006/R5 independent owned labs retain observed disjoint allocations and remove resources on every outcome",
+    "requires": [
+      "two explicitly authorized disposable owners",
+      "independently measured image pins",
+      "declared aggregate CPU/memory budget",
+      "effective worker cap",
+      "controlled lifecycle interleaving"
+    ],
+    "observations": [
+      "docker inspect HostConfig NanoCpus/Memory/PidsLimit",
+      "published HostIp and HostPort",
+      "compose project labels",
+      "absolute runtime/tmp/sentinel/evidence roots",
+      "actual worker/container counts",
+      "actual CLI worker PID existence before/after exit",
+      "fresh direct original Docker and CLI outputs"
+    ],
+    "outcomes": [
+      "explicit successful down",
+      "failed child",
+      "invalid readiness",
+      "timeout",
+      "exception",
+      "SIGINT",
+      "SIGTERM"
+    ],
+    "assertions": [
+      "owners share no project/port/root",
+      "aggregate use is within declared budget",
+      "shared-project mutations are serial",
+      "independent owners may overlap only within budget",
+      "newly owned containers and volumes absent after cleanup",
+      "temporary credentials absent after cleanup",
+      "safe evidence retained",
+      "pre-existing/unrelated inventories unchanged"
+    ],
+    "source": "ARCHITECTURE 10.4-10.5; SECURITY 6.1",
+    "liveInput": {
+      "environment": "FLUXWARDEN_LAB_RESOURCE_PLAN",
+      "authorized": true,
+      "disposable": true,
+      "network": "regtest",
+      "owners": [
+        {
+          "declaration": "absolute owner JSON path",
+          "scenarios": [
+            {
+              "outcome": "child-failure|INVALID|timeout|exception|SIGINT|SIGTERM",
+              "failurePattern": "independently pinned public failure regex",
+              "trigger": {
+                "kind": "docker|SIGINT|SIGTERM",
+                "service": "explicit owned service when kind=docker"
+              }
+            }
+          ]
+        }
+      ],
+      "rootSuppliesConcretePlanAtOfficialLiveExecution": true,
+      "retainedReportsAreNotTrustedOracles": true
+    },
+    "preconditions": [
+      "exactly two authorized disposable owners",
+      "absent containers and volumes before acquisition",
+      "root-supplied concrete triggers with source-grounded public failure patterns",
+      "graceful real POSIX signals require supported live host"
+    ],
+    "limitations": [
+      "no live execution or resources proven during preparation",
+      "AbortSignal controls do not prove OS signals",
+      "R5 concrete scenario timing and each-stage injection remains official live-plan work"
+    ]
+  },
+  "inventoryAndTiming": {
+    "title": "CP-006/R6 independent nonempty selected inventory is executed exactly once with complete phase measurements",
+    "inputs": [
+      "fresh independent selected-case inventory",
+      "prior measured durations",
+      "current original command reports",
+      "actual subprocess exits"
+    ],
+    "assertions": [
+      "selected union is nonempty",
+      "every identity appears exactly once",
+      "no missing/duplicate/skipped/pending/invalid result",
+      "failed subprocess cannot pass",
+      "build is reused once",
+      "setup/run/teardown/leak/total measured",
+      "longest shard and critical path measured"
+    ],
+    "negativeControls": [
+      "empty inventory",
+      "missing identity",
+      "duplicate identity",
+      "skipped identity",
+      "pending identity",
+      "mismatched summary",
+      "nonzero child",
+      "stale report"
+    ],
+    "source": "validation completeness and isolated-owner requirements",
+    "liveInput": {
+      "environment": "FLUXWARDEN_LAB_VALIDATION_PLAN",
+      "version": 1,
+      "authorized": true,
+      "evidenceRoot": "absolute canonical owned root containing this plan and every original observation artifact",
+      "sourceRoot": "absolute original checkout root used only to normalize selected test identities",
+      "current": {
+        "invocation": "independently assigned identity of the immediately completed validation",
+        "sourceSha256": "independently frozen lowercase SHA256 of its source identity manifest",
+        "startedAt": "original validation start in epoch milliseconds",
+        "finishedAt": "original validation completion in epoch milliseconds"
+      },
+      "inventory": "{file: relative artifact path, sha256: original lowercase SHA256}; artifact has invocation, sourceSha256, collectedAt and cases:[{file,fullName}]",
+      "observations": "{file: relative artifact path, sha256: original lowercase SHA256}; artifact has invocation, sourceSha256, startedAt, finishedAt, phases, commands and measurements",
+      "reports": "one {file: relative artifact path, sha256: original lowercase SHA256} per original shard; unmodified generic Vitest JSON reports",
+      "phases": "build/setup/run/teardown/leak each {startedAt,finishedAt}; ordered measured intervals inside the original invocation",
+      "commands": "every actual subprocess {phase,argv,startedAt,finishedAt,exitCode,signal}; each run also references its report path; exactly one build",
+      "measurements": "buildMs/setupMs/runMs/teardownMs/leakMs/totalMs/longestShardMs/criticalPathMs, all original integer milliseconds checked against observed intervals",
+      "criticalPath": "full elapsed span from the one original build through setup, overlapping shards, teardown and final leak check, including inter-phase waits",
+      "longestShard": "maximum original run-command elapsed interval; runMs spans earliest shard start through latest shard completion",
+      "completeness": "expected identities come only from the independent inventory collected before execution; original report fullName plus file must reproduce them exactly once",
+      "qualification": "root preserves original artifacts and hashes; supplied passing booleans cannot replace individual results, summaries, successful actual exits or measured intervals",
+      "circularity": "completed selection must exclude the currently executing CP-006/R6 reference",
+      "safety": "no commands launched; bounded ordinary artifact files inside declared canonical owned root; no unrelated file reads"
+    }
+  },
+  "leak": {
+    "title": "CP-006/Rleak original output and all retained artifacts are scanned with independent nonempty sentinels",
+    "sentinelKinds": [
+      "preimage",
+      "macaroon",
+      "rune",
+      "TLS private key",
+      "approval private key"
+    ],
+    "encodings": [
+      "raw UTF-8",
+      "raw latin1",
+      "lowercase hex",
+      "uppercase hex",
+      "padded base64",
+      "unpadded base64",
+      "padded base64url",
+      "unpadded base64url"
+    ],
+    "locations": [
+      "original output",
+      "scratch",
+      "databases",
+      "recordings",
+      "retained evidence"
+    ],
+    "exclusions": "exact declared-out.txt files only",
+    "negativeControls": [
+      "planted leak in every encoding/location",
+      "missing sentinel directory",
+      "zero nonempty sentinels",
+      "stale scan receipt",
+      "broad recording exclusion"
+    ],
+    "source": "SECURITY 2 INV-11 and 6.1; validation leak requirements"
+  }
+}

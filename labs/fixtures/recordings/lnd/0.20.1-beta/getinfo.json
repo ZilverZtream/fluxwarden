@@ -1,0 +1,15 @@
+{
+  "id": "getinfo",
+  "impl": "lnd",
+  "version": "0.20.1-beta",
+  "node": "lnd-r",
+  "request": {
+    "method": "GET",
+    "path": "/v1/getinfo",
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "body": "{\"version\":\"0.20.1-beta commit=v0.20.1-beta\", \"commit_hash\":\"848b72ce96eb68fa90fd4336523ca4c59bddcd4c\", \"identity_pubkey\":\"034dbfacf6305efa99cdd40362f0ad8952e61cdbc4a6d9fcd48862168c765a763e\", \"alias\":\"historical-lnd\", \"color\":\"#3399ff\", \"num_pending_channels\":0, \"num_active_channels\":0, \"num_inactive_channels\":0, \"num_peers\":0, \"block_height\":0, \"block_hash\":\"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206\", \"best_header_timestamp\":\"1296688602\", \"synced_to_chain\":false, \"synced_to_graph\":false, \"testnet\":false, \"chains\":[{\"chain\":\"bitcoin\", \"network\":\"regtest\"}], \"uris\":[], \"features\":{\"0\":{\"name\":\"data-loss-protect\", \"is_required\":true, \"is_known\":true}, \"5\":{\"name\":\"upfront-shutdown-script\", \"is_required\":false, \"is_known\":true}, \"7\":{\"name\":\"gossip-queries\", \"is_required\":false, \"is_known\":true}, \"8\":{\"name\":\"tlv-onion\", \"is_required\":true, \"is_known\":true}, \"12\":{\"name\":\"static-remote-key\", \"is_required\":true, \"is_known\":true}, \"14\":{\"name\":\"payment-addr\", \"is_required\":true, \"is_known\":true}, \"17\":{\"name\":\"multi-path-payments\", \"is_required\":false, \"is_known\":true}, \"23\":{\"name\":\"anchors-zero-fee-htlc-tx\", \"is_required\":false, \"is_known\":true}, \"25\":{\"name\":\"route-blinding\", \"is_required\":false, \"is_known\":true}, \"27\":{\"name\":\"shutdown-any-segwit\", \"is_required\":false, \"is_known\":true}, \"30\":{\"name\":\"amp\", \"is_required\":true, \"is_known\":true}, \"31\":{\"name\":\"amp\", \"is_required\":false, \"is_known\":true}, \"35\":{\"name\":\"quiescence\", \"is_required\":false, \"is_known\":true}, \"45\":{\"name\":\"explicit-commitment-type\", \"is_required\":false, \"is_known\":true}, \"261\":{\"name\":\"endorsement-x\", \"is_required\":false, \"is_known\":true}, \"2023\":{\"name\":\"script-enforced-lease\", \"is_required\":false, \"is_known\":true}}, \"require_htlc_interceptor\":false, \"store_final_htlc_resolutions\":false}"
+  }
+}
