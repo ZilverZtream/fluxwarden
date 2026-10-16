@@ -6,9 +6,10 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterEach, beforeAll, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { repoRoot } from '../helpers/cli.js';
-import { approve, demo as createDemo, documentOf, plan, prepareDemoFixtures, resultOf, rows, type DemoFixtures, type DemoOptions } from '../helpers/cpw-cli.js';
+import { spawnCli, type Spawned } from '../helpers/cp016-cli.js';
+import { approve, demo as createDemo, documentOf, plan, prepareDemoFixtures, resultOf, rows, type Demo, type DemoFixtures, type DemoOptions } from '../helpers/cpw-cli.js';
 import { S, T } from '../fakes/cln/rebalance-node.js';
 import type { FakeServer } from '../fakes/https.js';
 
@@ -39,30 +40,61 @@ it('CP-043/B3 observed proposal fee 202101 is accepted and fee 202102 alone is r
   expect(() => { m.verifyDemoProposal(wrong, String(observed['policy_sha256']), { channel2: S, channel5: T }); }).toThrow();
 });
 
-it('CP-043/B3 an ordinary raw ULID success receipt matches the persisted execution and continues ledger verification reconciliation and export', async () => {
-  const d = await demo(open), proposal = await plan(d), id = String(proposal['proposal_id']);
-  await approve(d, id);
-  const executed = await d.run(['--json', 'actions', 'execute', id, '--require-regtest']);
-  expect(executed.status).toBe(0);
-  const receipt = resultOf(documentOf(executed, 'actions-execute'));
-  const executionId = String(receipt['execution_id']);
-  expect(executionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-  expect(receipt).toMatchObject({ status: 'VERIFIED_SUCCESS', principal_msat: '100000000', actual_fee_msat: '202101',
-    source_delta_msat: '-100202101', target_delta_msat: '100000000', delta_status: 'MATCH' });
-  expect(rows(d.database, 'SELECT id, status, actual_fee_msat FROM executions WHERE id = ?', executionId)).toEqual([
-    { id: executionId, status: 'VERIFIED_SUCCESS', actual_fee_msat: 202101 },
-  ]);
-  const m = await driver();
-  expect(() => m.verifyDemoExecution(d.config, executionId, { channel2: S, channel5: T })).not.toThrow();
-  expect((await d.run(['--json', 'ledger', 'verify'])).status).toBe(0);
-  const reconciled = await d.run(['--json', 'reconcile', '--node', 'cln-m', '--since', '1h']);
-  expect(reconciled.status).toBe(0);
-  const runId = String(resultOf(documentOf(reconciled, 'reconcile'))['run_id']);
-  expect(runId).toMatch(/^run_[0-9A-HJKMNP-TV-Z]{26}$/);
-  const out = join(d.dir, 'verified-bundle');
-  const exported = await d.run(['--json', 'evidence', 'export', '--run-id', runId, '--out', out]);
-  expect(exported.status).toBe(0);
-  for (const name of ['manifest.json', 'ledger-audit.json', 'reconciliation.json', 'checksums.sha256']) expect(fs.existsSync(join(out, name)), name).toBe(true);
+describe('successful demo execution', () => {
+  const servers: FakeServer[] = [];
+  const running = new Set<Spawned>();
+  let accepting = true;
+  let d: Demo;
+  let id: string;
+  beforeAll(async () => {
+    const prepared = await demo(servers);
+    d = { ...prepared, run: async (args, options) => {
+      if (!accepting) throw new Error('demo execution fixture has closed');
+      const command = spawnCli([...args, '--config', prepared.config], options);
+      running.add(command);
+      try { return await command.done; }
+      finally { running.delete(command); }
+    } };
+    const proposal = await plan(d);
+    id = String(proposal['proposal_id']);
+    await approve(d, id);
+  });
+  afterAll(async () => {
+    accepting = false;
+    const pending = [...running];
+    await Promise.all(pending.map(async command => {
+      if (command.child.exitCode !== null || command.child.signalCode !== null) return;
+      const closed = new Promise<void>(resolve => { command.child.once('close', () => { resolve(); }); });
+      command.child.kill('SIGKILL');
+      await closed;
+    }));
+    await Promise.allSettled(pending.map(command => command.done));
+    await Promise.all(servers.splice(0).map(server => server.close()));
+  });
+
+  it('CP-043/B3 an ordinary raw ULID success receipt matches the persisted execution and continues ledger verification reconciliation and export', async () => {
+    const executed = await d.run(['--json', 'actions', 'execute', id, '--require-regtest']);
+    expect(executed.status).toBe(0);
+    const receipt = resultOf(documentOf(executed, 'actions-execute'));
+    const executionId = String(receipt['execution_id']);
+    expect(executionId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(receipt).toMatchObject({ status: 'VERIFIED_SUCCESS', principal_msat: '100000000', actual_fee_msat: '202101',
+      source_delta_msat: '-100202101', target_delta_msat: '100000000', delta_status: 'MATCH' });
+    expect(rows(d.database, 'SELECT id, status, actual_fee_msat FROM executions WHERE id = ?', executionId)).toEqual([
+      { id: executionId, status: 'VERIFIED_SUCCESS', actual_fee_msat: 202101 },
+    ]);
+    const m = await driver();
+    expect(() => m.verifyDemoExecution(d.config, executionId, { channel2: S, channel5: T })).not.toThrow();
+    expect((await d.run(['--json', 'ledger', 'verify'])).status).toBe(0);
+    const reconciled = await d.run(['--json', 'reconcile', '--node', 'cln-m', '--since', '1h']);
+    expect(reconciled.status).toBe(0);
+    const runId = String(resultOf(documentOf(reconciled, 'reconcile'))['run_id']);
+    expect(runId).toMatch(/^run_[0-9A-HJKMNP-TV-Z]{26}$/);
+    const out = join(d.dir, 'verified-bundle');
+    const exported = await d.run(['--json', 'evidence', 'export', '--run-id', runId, '--out', out]);
+    expect(exported.status).toBe(0);
+    for (const name of ['manifest.json', 'ledger-audit.json', 'reconciliation.json', 'checksums.sha256']) expect(fs.existsSync(join(out, name)), name).toBe(true);
+  });
 });
 
 it('CP-043/B3 policy contents changed on the opened descriptor after asynchronous drain refuse without overwriting the change', async () => {
