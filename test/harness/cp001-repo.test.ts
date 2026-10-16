@@ -142,6 +142,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
 
   // Matrix, expanded as GitHub does: the product of the keys, then `include` entries.
   const test = map(jobs['test'], 'jobs.test');
+  expect(test['timeout-minutes']).toBe('30');
   const strategy = map(test['strategy'], 'strategy');
   expect(strategy['fail-fast']).toBe(false);
   const matrix = map(strategy['matrix'], 'matrix');
@@ -166,9 +167,10 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   const nodeVersionExpr = String(map(setupNode?.['with'], 'setup-node.with')['node-version']);
   const subst = (expr: string, c: Record<string, string>): string => expr.replace(/\$\{\{\s*matrix\.([\w-]+)\s*\}\}/g, (_m, k: string) => c[k] ?? '<unset>');
   const runsOn = String(test['runs-on']);
-  expect(combos.map(c => `${subst(runsOn, c)} ${subst(nodeVersionExpr, c)} ${c['shard'] ?? '<unset>'}`).sort()).toEqual([
-    'ubuntu-latest 22.23.2 core', 'ubuntu-latest 22.x core', 'ubuntu-latest 24.18.1 core', 'ubuntu-latest 24.x core',
-    'windows-latest 22.23.2 core', 'windows-latest 22.23.2 native', 'windows-latest 24.x core', 'windows-latest 24.x native',
+  expect(combos.map(c => `${subst(runsOn, c)} ${subst(nodeVersionExpr, c)} ${c['shard'] ?? '<unset>'} ${c['coreShard'] ?? '<unset>'}`).sort()).toEqual([
+    'ubuntu-latest 22.23.2 core <unset>', 'ubuntu-latest 22.x core <unset>', 'ubuntu-latest 24.18.1 core <unset>', 'ubuntu-latest 24.x core <unset>',
+    'windows-latest 22.23.2 core-1 1/2', 'windows-latest 22.23.2 core-2 2/2', 'windows-latest 22.23.2 native <unset>',
+    'windows-latest 24.x core-1 1/2', 'windows-latest 24.x core-2 2/2', 'windows-latest 24.x native <unset>',
   ]);
 
   // CI step order: checkout, setup-node, npm ci, lint, build, product, harness, no-pending.
@@ -188,11 +190,13 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   const active = (step: { [key: string]: Yaml }, combo: Record<string, string>): boolean => {
     if (step['if'] === undefined) return true;
     const condition = String(step['if']).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
-    return condition.split(/\s*&&\s*/).every(term => {
-      const match = /^matrix\.(os|shard) == '([^']+)'$/.exec(term);
-      if (!match) throw new Error(`unsupported CI shard condition: ${condition}`);
-      return combo[match[1] ?? ''] === match[2];
-    });
+    return condition.split(/\s*\|\|\s*/).some(alternative => alternative.split(/\s*&&\s*/).every(term => {
+      const equal = /^matrix\.(os|shard) == '([^']+)'$/.exec(term);
+      if (equal) return combo[equal[1] ?? ''] === equal[2];
+      const prefix = /^startsWith\(matrix\.(os|shard), '([^']+)'\)$/.exec(term);
+      if (prefix) return (combo[prefix[1] ?? ''] ?? '').startsWith(prefix[2] ?? '');
+      throw new Error(`unsupported CI shard condition: ${condition}`);
+    }));
   };
   for (const s of steps.filter(s => kind(s) !== null)) {
     if (['checkout', 'setup-node', 'npm ci', 'lint', 'build'].includes(kind(s) ?? '')) {
@@ -209,17 +213,29 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   };
   for (const combo of combos) {
     const ordered = steps.filter(s => kind(s) !== null && active(s, combo));
-    const core = combo['shard'] === 'core';
+    const windows = combo['os'] === 'windows-latest';
+    const core = combo['shard'] === 'core' || combo['shard'] === 'core-1' || combo['shard'] === 'core-2';
+    const harness = combo['shard'] === 'core' || combo['shard'] === 'core-1';
     expect(ordered.map(kind), JSON.stringify(combo)).toEqual([
-      'checkout', 'setup-node', 'npm ci', 'lint', 'build', 'product', ...(core ? ['harness'] : []), 'no-pending',
+      'checkout', 'setup-node', 'npm ci', 'lint', 'build', 'product', ...(harness ? ['harness'] : []), 'no-pending',
     ]);
     const productRun = String(ordered.find(s => kind(s) === 'product')?.['run']);
-    expect(productRun, 'no title or additional subset filtering').not.toMatch(/--(?:testNamePattern|exclude|include|dir|project|shard|changed|related)\b|(?:^|\s)-t(?:\s|$)/);
-    if (combo['os'] !== 'windows-latest' || !core) expect(productRun).not.toMatch(/--config\b/);
+    expect(productRun, 'no title or additional subset filtering').not.toMatch(/--(?:testNamePattern|exclude|include|dir|project|changed|related)\b|(?:^|\s)-t(?:\s|$)/);
+    expect(productRun.match(/--maxWorkers(?:=|\s+)\S+/g), 'bounded worker allocation').toEqual([`--maxWorkers=${windows ? '1' : '2'}`]);
+    if (windows) expect(productRun.match(/--fileParallelism(?:=|\s+)\S+/g), 'Windows files run serially').toEqual(['--fileParallelism=false']);
+    if (windows && core) {
+      expect(productRun.match(/--shard\b/g), 'one explicit Windows core shard').toHaveLength(1);
+      expect(productRun).toContain('--shard=${{ matrix.coreShard }}');
+      expect(subst(productRun, combo)).toContain(`--shard=${combo['coreShard'] ?? '<unset>'}`);
+    } else {
+      expect(productRun).not.toMatch(/--shard\b/);
+      expect(productRun).not.toMatch(/--config\b/);
+    }
     const noPending = String(ordered.find(s => kind(s) === 'no-pending')?.['run']);
     expect(noPending).toMatch(/^node scripts\/no-pending\.mjs\s/);
     expect(noPending).toContain(reportOf(ordered, 'product'));
-    if (core) expect(noPending).toContain(reportOf(ordered, 'harness'));
+    if (harness) expect(noPending).toContain(reportOf(ordered, 'harness'));
+    else expect(noPending).not.toContain('vitest-harness.json');
   }
 
   // Approved Windows split: the native commands and the generated core configuration must partition
@@ -238,7 +254,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     'test/ledger/cp037-ledger.test.ts',
     'test/commands/cp043-t05-repository.test.ts',
   ];
-  const coreCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'core');
+  const coreCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'core-1');
   const nativeCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'native');
   if (!coreCombo || !nativeCombo) throw new Error('both Windows shards are required');
   const coreProduct = steps.find(s => kind(s) === 'product' && active(s, coreCombo));
@@ -281,13 +297,40 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     }).sort();
   };
   const complete = productFiles(), coreFiles = productFiles(['--config', coreConfig]), native = productFiles(nativeArgs);
+  // `list --filesOnly` lists eligible files without applying execution sharding.
+  // Exercise the pinned public sequencer over that inventory instead.
+  const partition = spawnSync(process.execPath, ['--input-type=module'], {
+    cwd: repoRoot, env: { ...childEnv(), CI_CORE_FILES: JSON.stringify(coreFiles) },
+    input: `import { BaseSequencer } from 'vitest/node';
+const files = JSON.parse(process.env.CI_CORE_FILES).map(moduleId => ({ moduleId }));
+const groups = await Promise.all([1, 2].map(index => new BaseSequencer({ config: { root: process.cwd(), shard: { index, count: 2 } } }).shard(files)));
+console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second: groups[1].map(file => file.moduleId) }));`,
+    encoding: 'utf8', windowsHide: true, timeout: 10000,
+  });
+  expect(partition.error).toBeUndefined();
+  expect(partition.status, partition.stderr).toBe(0);
+  const partitions = asRecord(JSON.parse(partition.stdout), 'core file partitions');
+  const shardFiles = (key: string): string[] => {
+    const files = partitions[key];
+    if (!Array.isArray(files)) throw new Error('core partition is not a file list');
+    return files.map((file: unknown) => {
+      if (typeof file !== 'string') throw new Error('core partition file is not a path');
+      return file;
+    });
+  };
+  const firstCore = shardFiles('first'), secondCore = shardFiles('second');
   expect(complete.length).toBeGreaterThan(nativeFiles.length);
   expect(native).toEqual([...nativeFiles].sort());
+  expect(firstCore.length).toBeGreaterThan(0);
+  expect(secondCore.length).toBeGreaterThan(0);
+  expect(firstCore.filter(file => secondCore.includes(file)), 'Windows core shards are disjoint').toEqual([]);
+  expect([...firstCore, ...secondCore].sort(), 'Windows core shards cover the complete core inventory').toEqual(coreFiles);
   expect(coreFiles.filter(file => native.includes(file)), 'Windows shards are disjoint').toEqual([]);
   expect([...coreFiles, ...native].sort(), 'Windows shards cover the complete product inventory').toEqual(complete);
 
   for (const [name, script] of [['lab', 'test:lab'], ['chaos', 'test:chaos']] as const) {
     const job = map(jobs[name], name);
+    expect(job['timeout-minutes'], `${name} bounded duration`).toBe('60');
     expect(job['runs-on'], `${name} runs-on`).toBe('ubuntu-latest');
     expect(job['strategy'], `${name} has no matrix`).toBeUndefined();
     expect(String(job['if']).replace(/\s+/g, ' '), `${name} if`).toMatch(/^(\$\{\{ )?github\.event_name == 'workflow_dispatch'( \}\})?$/);
