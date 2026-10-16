@@ -190,7 +190,7 @@ jobs:
           --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
       - name: Test harness
         if: matrix.shard == 'core' || matrix.shard == 'core-1'
-        run: npm run test:harness -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-harness.json"
+        run: npm run test:harness -- --maxWorkers=1 --fileParallelism=false --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-harness.json"
       # Vitest exits 0 with skipped tests; every test must have run and passed.
       - name: Require all core tests passed
         if: matrix.shard == 'core' || matrix.shard == 'core-1'
