@@ -23,10 +23,10 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import type { FakeServer } from '../fakes/https.js';
 import { MUTATING, callsOf, methodsOf } from '../fakes/cln/rebalance-node.js';
-import { leakedForms } from '../helpers/cp016-cli.js';
+import { leakedForms, spawnCli, type Spawned } from '../helpers/cp016-cli.js';
 import {
   approve, count, demo as createDemo, documentOf, errorOf, INVALID_INPUT, list, OUTCOME_UNKNOWN, plan, prepareDemoFixtures, RECONCILIATION_ALERT, rec, resultOf, rows,
   sha256Hex, SUCCESS, type Demo, type DemoFixtures, type DemoOptions, type Doc,
@@ -106,11 +106,38 @@ describe('reconcile', () => {
 });
 
 describe('UNKNOWN and its resolution', () => {
-  it('CP-032/B6 a lost sendpay answer exits 7 with the reconcile message; reconcile resolves it from node evidence without a second send', async () => {
-    const d = await demo(open, { fake: { sendpay: 'lose-answer' } });
+  const servers: FakeServer[] = [];
+  const running = new Set<Spawned>();
+  let accepting = true;
+  let d: Demo;
+  let proposalId: string;
+  beforeAll(async () => {
+    const prepared = await demo(servers, { fake: { sendpay: 'lose-answer' } });
+    d = { ...prepared, run: async (args, options) => {
+      if (!accepting) throw new Error('unknown execution fixture has closed');
+      const command = spawnCli([...args, '--config', prepared.config], options);
+      running.add(command);
+      try { return await command.done; }
+      finally { running.delete(command); }
+    } };
     d.rewrite({ attemptDeadline: '1s' });
-    const proposalId = String((await plan(d))['proposal_id']);
+    proposalId = String((await plan(d))['proposal_id']);
     await approve(d, proposalId);
+  });
+  afterAll(async () => {
+    accepting = false;
+    const pending = [...running];
+    await Promise.all(pending.map(async command => {
+      if (command.child.exitCode !== null || command.child.signalCode !== null) return;
+      const closed = new Promise<void>(resolve => { command.child.once('close', () => { resolve(); }); });
+      command.child.kill('SIGKILL');
+      await closed;
+    }));
+    await Promise.allSettled(pending.map(command => command.done));
+    await Promise.all(servers.splice(0).map(server => server.close()));
+  });
+
+  it('CP-032/B6 a lost sendpay answer exits 7 with the reconcile message; reconcile resolves it from node evidence without a second send', async () => {
     const text = await d.run(['actions', 'execute', proposalId, '--require-regtest'], { timeoutMs: 5_000 });
     expect(text.status).toBe(OUTCOME_UNKNOWN);
     expect(text.stdout + text.stderr).toContain('outcome unknown — run `fluxwarden reconcile`; do not retry');

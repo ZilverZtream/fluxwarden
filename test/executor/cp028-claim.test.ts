@@ -4,7 +4,7 @@ Interface: test/helpers/cp028-executor.ts (claimExecution, Database.executions.t
 Rules under test: SPEC §6.4 (claims and fenced writes), §6.5 (lease expiry), §6.2 (lease times from the database clock),
 SECURITY INV-13 and INV-18.
 */
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { FakePreflightNode } from '../fakes/preflight-node.js';
 import {
   APPROVAL_KEYS, claimed, codeOf, dbNow, eventsOf, execById, execByProposal, force, loadClaim, loadPersistence, loadPreflight, policyFor, reservationsOf,
@@ -222,12 +222,28 @@ it('CP-028/B5 lease length and expiry are computed on the database clock; steppi
 });
 
 for (const variant of ['a failing check', 'a passing preflight'] as const) {
-  it(`CP-028/B3 a fenced write that loses the lease after the worker's last read (${variant}) ends lease-lost and writes nothing over the new holder`, async () => {
-    const { p, path, base, db, policy, claimExecution } = await setup('write-race');
-    const other = p.openDatabase(path, { readOnly: false, busyTimeoutMs: 2_000 });
-    try {
-      const approval = seedProposal(base);
-      const { prepareExecution } = await loadPreflight();
+  describe(`fenced write after last read (${variant})`, () => {
+    let prepared: Awaited<ReturnType<typeof setup>> | undefined;
+    let otherDb: Awaited<ReturnType<typeof setup>>['db'] | undefined;
+    let approval: VerifiedApproval;
+    let prepareExecution: Awaited<ReturnType<typeof loadPreflight>>['prepareExecution'];
+    let running: ReturnType<typeof prepareExecution> | undefined;
+    beforeAll(async () => {
+      prepared = await setup('write-race');
+      otherDb = prepared.p.openDatabase(prepared.path, { readOnly: false, busyTimeoutMs: 2_000 });
+      approval = seedProposal(prepared.base);
+      ({ prepareExecution } = await loadPreflight());
+    });
+    afterAll(async () => {
+      if (running !== undefined) await Promise.allSettled([running]);
+      otherDb?.close();
+      prepared?.db.close();
+    });
+
+    it(`CP-028/B3 a fenced write that loses the lease after the worker's last read (${variant}) ends lease-lost and writes nothing over the new holder`, async () => {
+      const fixture = prepared, other = otherDb;
+      if (fixture === undefined || other === undefined) throw new Error('fenced-write fixture was not prepared');
+      const { path, base, db, policy, claimExecution } = fixture;
       let takenEpoch = 0n;
       // Another process takes the lease between the worker's last read and its next fenced write.
       const racing = racingTransition(db, () => {
@@ -238,7 +254,7 @@ for (const variant of ['a failing check', 'a passing preflight'] as const) {
         ...(variant === 'a failing check' ? { synced: false } : {}),
         during: { [variant === 'a failing check' ? 'handshake' : 'findCircularRoute']: () => { racing.arm(); } },
       });
-      const outcome = await prepareExecution({ db: racing.db, adapter: fake, workerId: 'worker-a', leaseMs: LEASE }, { approval, policy, approvalKeyIds: APPROVAL_KEYS });
+      const outcome = await (running = prepareExecution({ db: racing.db, adapter: fake, workerId: 'worker-a', leaseMs: LEASE }, { approval, policy, approvalKeyIds: APPROVAL_KEYS }));
       const id = execByProposalId(path, approval.proposalId);
       expect(outcome).toEqual({ kind: 'REFUSED', executionId: id, exit: 5, step: 'lease-lost' });
       const row = execById(path, id);
@@ -250,7 +266,7 @@ for (const variant of ['a failing check', 'a passing preflight'] as const) {
       expect(row.route_json).toBeNull();
       expect(reservationsOf(path, id).map(r => r.state)).toEqual(['HELD']);
       expect(fake.mutatingCalls()).toEqual([]);
-    } finally { other.close(); db.close(); }
+    });
   });
 }
 

@@ -1,6 +1,6 @@
 // Interface: existing executor/reconciler ports in test/helpers/cp030-execution.ts.
 // SPEC §11.6 T-01..T-12; SECURITY INV-02..06,08,11,13,15..17.
-import { expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
@@ -149,12 +149,31 @@ it('CP-033/B1 T-10 a multipart candidate is refused before dispatch', async () =
   expect(await w.validate()).toEqual({ ok: false, code: 'SINGLE_PATH_UNAVAILABLE', check: 'V6' });
 });
 
-it('CP-033/B1 T-11 matching preimage evidence settles exactly once despite a reported failure reason', async () => {
-  // The wire case separately injects SUCCEEDED/TIMEOUT. Its normalized evidence crosses this adapter port.
-  const w = await reconciliation('t11', [succeeded(150_000n)], { invoice: 'SETTLED' });
-  await w.run(); await w.run();
-  expect(w.row().status).toBe('VERIFIED_SUCCESS'); expect(w.node.count('cancelUnpaidInvoice')).toBe(0);
-  expect(journalTypes(w.path, w.executionId)).toEqual(['REBALANCE_SENT', 'REBALANCE_SETTLED']);
+describe('matching-preimage reconciliation', () => {
+  const running = new Set<Promise<unknown>>();
+  let accepting = true;
+  let w: Awaited<ReturnType<typeof reconciliation>>;
+  beforeAll(async () => {
+    // The wire case separately injects SUCCEEDED/TIMEOUT. Its normalized evidence crosses this adapter port.
+    const prepared = await reconciliation('t11', [succeeded(150_000n)], { invoice: 'SETTLED' });
+    w = { ...prepared, run: async startup => {
+      if (!accepting) throw new Error('reconciliation fixture has closed');
+      const work = prepared.run(startup);
+      running.add(work);
+      try { return await work; }
+      finally { running.delete(work); }
+    } };
+  });
+  afterAll(async () => {
+    accepting = false;
+    await Promise.allSettled([...running]);
+  });
+
+  it('CP-033/B1 T-11 matching preimage evidence settles exactly once despite a reported failure reason', async () => {
+    await w.run(); await w.run();
+    expect(w.row().status).toBe('VERIFIED_SUCCESS'); expect(w.node.count('cancelUnpaidInvoice')).toBe(0);
+    expect(journalTypes(w.path, w.executionId)).toEqual(['REBALANCE_SENT', 'REBALANCE_SETTLED']);
+  });
 });
 
 it('CP-033/B1 T-12 a failed observation with an in-flight HTLC cannot terminate before later success', async () => {
