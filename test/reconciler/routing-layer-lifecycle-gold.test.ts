@@ -10,7 +10,7 @@
  * Neither a layer name nor a refused create conveys ownership. No storage shape is prescribed.
  * Native answers follow the existing v26.06.9 askrene fake and getroutes response fixtures.
  */
-import { expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { channelDirection, getinfo, getroutesAnswer, pathHop, peerChannel } from '../fakes/cln/responses.js';
 import { loadErrors, loadSource, type ClnRest } from '../helpers/adapter-interfaces.js';
 import {
@@ -240,17 +240,31 @@ it('CP-032/REG-REC008 recovery preserves a proven layer while its execution rema
   f.truth('PREFLIGHT');
 });
 
-it('CP-032/REG-REC008 refused create confers no ownership of a preexisting colliding layer', async () => {
-  const f = await fixture(); f.native.model.collision = true;
-  await f.assess().catch(() => undefined);
-  expect(f.native.acquired).toEqual([]);
-  expect(f.native.collisions).toHaveLength(1);
-  for (const layer of f.native.collisions) expect(f.native.layers.has(layer)).toBe(true);
-  expect(f.native.removals()).toEqual([]);
-  f.cancel(); await f.recover(); await f.recover(true);
-  for (const layer of f.native.collisions) expect(f.native.layers.has(layer)).toBe(true);
-  expect(f.native.removals()).toEqual([]);
-  f.truth('CANCELLED');
+describe('refused routing layer creation fixture', () => {
+  let f: Awaited<ReturnType<typeof fixture>>;
+  let preparedAt: number, prepMs: number;
+  beforeAll(async () => {
+    preparedAt = performance.now();
+    f = await fixture(); f.native.model.collision = true;
+    await loadReconciler();
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  it('CP-032/REG-REC008 refused create confers no ownership of a preexisting colliding layer', async () => {
+    const started = performance.now();
+    try {
+      await f.assess().catch(() => undefined);
+      expect(f.native.acquired).toEqual([]);
+      expect(f.native.collisions).toHaveLength(1);
+      for (const layer of f.native.collisions) expect(f.native.layers.has(layer)).toBe(true);
+      expect(f.native.removals()).toEqual([]);
+      f.cancel(); await f.recover(); await f.recover(true);
+      for (const layer of f.native.collisions) expect(f.native.layers.has(layer)).toBe(true);
+      expect(f.native.removals()).toEqual([]);
+      f.truth('CANCELLED');
+    } finally {
+      console.log(JSON.stringify({ case: 'refused-layer-create', prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+    }
+  });
 });
 
 it('CP-032/REG-REC008 standalone assessment does not grant unrelated execution cleanup authority', async () => {

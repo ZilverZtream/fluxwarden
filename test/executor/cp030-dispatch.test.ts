@@ -190,47 +190,107 @@ it('CP-030/B4 a success whose preimage does not hash to the payment hash stays u
   expect(r.node.count('cancelUnpaidInvoice')).toBe(0);
 });
 
-it('CP-030/B5 a terminal failure cancels the invoice first, then VERIFIED_FAILURE with the node reason, reservation released, exit 5', async () => {
-  let statusAtCancel = '';
-  const r = await prepare('failure', {
-    script: ({ path, executionId }) => ({
-      send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_INCORRECT_PAYMENT_DETAILS')); },
-      cancel: () => { statusAtCancel = rowOf(path, executionId).status; return Promise.resolve('CANCELED'); },
-    }),
+describe('terminal failure dispatch fixture', () => {
+  let r: Awaited<ReturnType<typeof prepare>>;
+  let database: ExecDatabase | undefined;
+  let statusAtCancel: string;
+  let preparedAt: number, prepMs: number;
+  const close = (): void => { const owned = database; database = undefined; owned?.close(); };
+  beforeAll(async () => {
+    preparedAt = performance.now(); statusAtCancel = '';
+    r = await prepare('failure', {
+      script: ({ path, executionId }) => ({
+        send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_INCORRECT_PAYMENT_DETAILS')); },
+        cancel: () => { statusAtCancel = rowOf(path, executionId).status; return Promise.resolve('CANCELED'); },
+      }),
+    });
+    database = r.p.openDatabase(r.path, { readOnly: false });
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  afterAll(close);
+  it('CP-030/B5 a terminal failure cancels the invoice first, then VERIFIED_FAILURE with the node reason, reservation released, exit 5', async () => {
+    const started = performance.now();
+    onTestFinished(close);
+    if (database === undefined) throw new Error('terminal failure fixture is not open');
+    try {
+      const outcome = await r.run(r.node, database);
+      expect(outcome).toEqual({ executionId: r.executionId, exit: 5, step: 'FAILURE_REASON_INCORRECT_PAYMENT_DETAILS' });
+      expect(r.node.named('cancelUnpaidInvoice').map(call => call.args)).toEqual([[HASH, labelOf(r.executionId)]]);
+      expect(statusAtCancel).toBe('IN_FLIGHT');
+      const row = rowOf(r.path, r.executionId);
+      expect(row.status).toBe('VERIFIED_FAILURE');
+      expect(row.error_code).toBe('FAILURE_REASON_INCORRECT_PAYMENT_DETAILS');
+      expect(row.actual_fee_msat).toBeNull();
+      expect(reservationState(r.path, r.executionId).state).toBe('RELEASED');
+      expect(transitionsOf(r.path, r.executionId).at(-1)).toBe('IN_FLIGHT>VERIFIED_FAILURE');
+    } finally {
+      close();
+      console.log(JSON.stringify({ case: 'terminal-failure', prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+    }
   });
-  const outcome = await r.run();
-  expect(outcome).toEqual({ executionId: r.executionId, exit: 5, step: 'FAILURE_REASON_INCORRECT_PAYMENT_DETAILS' });
-  expect(r.node.named('cancelUnpaidInvoice').map(call => call.args)).toEqual([[HASH, labelOf(r.executionId)]]);
-  expect(statusAtCancel).toBe('IN_FLIGHT');
-  const row = rowOf(r.path, r.executionId);
-  expect(row.status).toBe('VERIFIED_FAILURE');
-  expect(row.error_code).toBe('FAILURE_REASON_INCORRECT_PAYMENT_DETAILS');
-  expect(row.actual_fee_msat).toBeNull();
-  expect(reservationState(r.path, r.executionId).state).toBe('RELEASED');
-  expect(transitionsOf(r.path, r.executionId).at(-1)).toBe('IN_FLIGHT>VERIFIED_FAILURE');
 });
 
-it('CP-030/B5 FAILED with an HTLC still in flight is not a failure: UNKNOWN, no invoice cancel, exit 7', async () => {
-  const r = await prepare('failed-inflight', { script: () => ({ send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_TIMEOUT', 1)); } }) });
-  const outcome = await r.run();
-  expect(outcome).toEqual({ executionId: r.executionId, exit: 7, step: 'OUTCOME_UNKNOWN' });
-  expect(rowOf(r.path, r.executionId).status).toBe('UNKNOWN');
-  expect(r.node.count('cancelUnpaidInvoice')).toBe(0);
-  expect(reservationState(r.path, r.executionId).state).toBe('HELD');
+describe('failed payment still in flight fixture', () => {
+  let r: Awaited<ReturnType<typeof prepare>>;
+  let database: ExecDatabase | undefined;
+  let preparedAt: number, prepMs: number;
+  const close = (): void => { const owned = database; database = undefined; owned?.close(); };
+  beforeAll(async () => {
+    preparedAt = performance.now();
+    r = await prepare('failed-inflight', { script: () => ({ send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_TIMEOUT', 1)); } }) });
+    database = r.p.openDatabase(r.path, { readOnly: false });
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  afterAll(close);
+  it('CP-030/B5 FAILED with an HTLC still in flight is not a failure: UNKNOWN, no invoice cancel, exit 7', async () => {
+    const started = performance.now();
+    onTestFinished(close);
+    if (database === undefined) throw new Error('in-flight failure fixture is not open');
+    try {
+      const outcome = await r.run(r.node, database);
+      expect(outcome).toEqual({ executionId: r.executionId, exit: 7, step: 'OUTCOME_UNKNOWN' });
+      expect(rowOf(r.path, r.executionId).status).toBe('UNKNOWN');
+      expect(r.node.count('cancelUnpaidInvoice')).toBe(0);
+      expect(reservationState(r.path, r.executionId).state).toBe('HELD');
+    } finally {
+      close();
+      console.log(JSON.stringify({ case: 'failed-inflight', prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+    }
+  });
 });
 
-it('CP-030/B5 a failure whose invoice turns out paid at cancel time is resolved as a success', async () => {
-  const r = await prepare('already-paid', {
-    script: () => ({
-      send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_TIMEOUT')); },
-      cancel: () => Promise.resolve('ALREADY_PAID'),
-      observe: () => Promise.resolve(succeeded(ROUTE_FEE, 1, true, '246290604752896')),
-    }),
+describe('paid invoice cancellation fixture', () => {
+  let r: Awaited<ReturnType<typeof prepare>>;
+  let database: ExecDatabase | undefined;
+  let preparedAt: number, prepMs: number;
+  const close = (): void => { const owned = database; database = undefined; owned?.close(); };
+  beforeAll(async () => {
+    preparedAt = performance.now();
+    r = await prepare('already-paid', {
+      script: () => ({
+        send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_TIMEOUT')); },
+        cancel: () => Promise.resolve('ALREADY_PAID'),
+        observe: () => Promise.resolve(succeeded(ROUTE_FEE, 1, true, '246290604752896')),
+      }),
+    });
+    database = r.p.openDatabase(r.path, { readOnly: false });
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  afterAll(close);
+  it('CP-030/B5 a failure whose invoice turns out paid at cancel time is resolved as a success', async () => {
+    const started = performance.now();
+    onTestFinished(close);
+    if (database === undefined) throw new Error('paid invoice cancellation fixture is not open');
+    try {
+      const outcome = await r.run(r.node, database);
+      expect(outcome.exit).toBe(0);
+      expect(rowOf(r.path, r.executionId).status).toBe('VERIFIED_SUCCESS');
+      expect(r.node.count('sendOnRoute')).toBe(1);
+    } finally {
+      close();
+      console.log(JSON.stringify({ case: 'already-paid', prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+    }
   });
-  const outcome = await r.run();
-  expect(outcome.exit).toBe(0);
-  expect(rowOf(r.path, r.executionId).status).toBe('VERIFIED_SUCCESS');
-  expect(r.node.count('sendOnRoute')).toBe(1);
 });
 
 for (const [name, sourceAfter, targetAfter, status, exit] of [
@@ -238,15 +298,35 @@ for (const [name, sourceAfter, targetAfter, status, exit] of [
   ['one msat beyond the tolerance', S_BEFORE - PRINCIPAL - ROUTE_FEE + TOLERANCE + 1n, T_BEFORE + PRINCIPAL, 'MISMATCH', 9],
   ['credited to no target balance', S_BEFORE - PRINCIPAL - ROUTE_FEE, T_BEFORE, 'MISMATCH', 9],
 ] as const) {
-  it(`CP-030/B6 channel deltas ${name} give delta_status ${status} (exit ${String(exit)}); the execution stays VERIFIED_SUCCESS`, async () => {
-    const r = await prepare(`delta-${status}-${String(exit)}-${String(name.length)}`, { script: ({ base }) => ({ after: () => balances(base, sourceAfter, targetAfter) }) });
-    const outcome = await r.run();
-    expect(outcome.exit).toBe(exit);
-    const row = rowOf(r.path, r.executionId);
-    expect(row.status).toBe('VERIFIED_SUCCESS');
-    expect(row.delta_status).toBe(status);
-    expect(r.alerts).toEqual(status === 'MATCH' ? [] : [{ kind: 'delta-mismatch', executionId: r.executionId, code: 'DELTA_MISMATCH' }]);
-    expect(r.node.count('listChannels')).toBe(2);
+  describe(`channel delta ${name} fixture`, () => {
+    let r: Awaited<ReturnType<typeof prepare>>;
+    let database: ExecDatabase | undefined;
+    let preparedAt: number, prepMs: number;
+    const close = (): void => { const owned = database; database = undefined; owned?.close(); };
+    beforeAll(async () => {
+      preparedAt = performance.now();
+      r = await prepare(`delta-${status}-${String(exit)}-${String(name.length)}`, { script: ({ base }) => ({ after: () => balances(base, sourceAfter, targetAfter) }) });
+      database = r.p.openDatabase(r.path, { readOnly: false });
+      prepMs = performance.now() - preparedAt;
+    }, 30_000);
+    afterAll(close);
+    it(`CP-030/B6 channel deltas ${name} give delta_status ${status} (exit ${String(exit)}); the execution stays VERIFIED_SUCCESS`, async () => {
+      const started = performance.now();
+      onTestFinished(close);
+      if (database === undefined) throw new Error('channel delta fixture is not open');
+      try {
+        const outcome = await r.run(r.node, database);
+        expect(outcome.exit).toBe(exit);
+        const row = rowOf(r.path, r.executionId);
+        expect(row.status).toBe('VERIFIED_SUCCESS');
+        expect(row.delta_status).toBe(status);
+        expect(r.alerts).toEqual(status === 'MATCH' ? [] : [{ kind: 'delta-mismatch', executionId: r.executionId, code: 'DELTA_MISMATCH' }]);
+        expect(r.node.count('listChannels')).toBe(2);
+      } finally {
+        close();
+        console.log(JSON.stringify({ case: `delta-${name}`, prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+      }
+    });
   });
 }
 
