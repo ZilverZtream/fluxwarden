@@ -140,6 +140,8 @@ export interface Run {
 }
 
 export interface SpawnOptions {
+  /** Existing protected working directory prepared by the scenario fixture. */
+  cwd?: string;
   /** Environment overrides; undefined removes a variable. Applied after FLUXWARDEN_* and NODE_* are cleared. */
   env?: Record<string, string | undefined>;
   /** Node options placed before the binary (process.execArgv of the child). */
@@ -180,7 +182,7 @@ export function spawnCli(args: readonly string[], options: SpawnOptions = {}): S
     nodeArgs.unshift('--import', pathToFileURL(file).href);
   }
   const child = spawn(process.execPath, [...nodeArgs, binPath(), ...args], {
-    cwd: scratch('cwd'),
+    cwd: options.cwd ?? scratch('cwd'),
     env: cliEnv(options.env),
     stdio: viaIpc ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
     windowsHide: true,

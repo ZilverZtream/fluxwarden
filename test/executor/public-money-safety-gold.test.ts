@@ -70,15 +70,16 @@ it('PUB001/db-clock fresh snapshots remain usable when the host clock jumps forw
   const base = seedBase(p, path);
   const approval = seedProposal(base);
   const policy = policyFor(base, { maxSnapshotAgeMs: 1_000 });
-  const observedAt = dbNow(path);
-  vi.spyOn(Date, 'now').mockReturnValue(observedAt + 86_400_000);
-  const node = new FakePreflightNode(base.sourceKey, base.targetKey, { channels: () => [
-    fakeChannel(base.sourceKey, OUT_PEER, { observedAt }), fakeChannel(base.targetKey, IN_PEER, { observedAt }),
-  ] });
   const db = p.openDatabase(path, { readOnly: false });
   try {
     const { prepareExecution } = await loadPreflight();
-    expect((await prepareExecution({ db, adapter: node, workerId: 'clock-control', leaseMs: 60_000 }, { approval, policy, approvalKeyIds: APPROVAL_KEYS })).kind).toBe('READY');
+    const observedAt = dbNow(path);
+    vi.spyOn(Date, 'now').mockReturnValue(observedAt + 86_400_000);
+    const node = new FakePreflightNode(base.sourceKey, base.targetKey, { channels: () => [
+      fakeChannel(base.sourceKey, OUT_PEER, { observedAt }), fakeChannel(base.targetKey, IN_PEER, { observedAt }),
+    ] });
+    const ready = await prepareExecution({ db, adapter: node, workerId: 'clock-control', leaseMs: 60_000 }, { approval, policy, approvalKeyIds: APPROVAL_KEYS });
+    expect(ready.kind, 'step' in ready ? `preflight step: ${ready.step}` : undefined).toBe('READY');
     expect(node.mutatingCalls()).toEqual([]);
   } finally { db.close(); }
 });

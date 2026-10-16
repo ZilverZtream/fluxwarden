@@ -6,9 +6,9 @@ reconciler leaves UNKNOWN), INV-19 (never sent again), INV-18 (zero affected row
 the new holder); SPEC §8.2 (SUBMITTING/IN_FLIGHT -> UNKNOWN on an ambiguous answer, transport loss or lost lease), §10.1
 (an interrupt after the mutating RPC may have reached the node leaves the execution to the reconciler, exit 7), §10.3 AE11.
 */
-import { expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from 'vitest';
 import { never, succeeded } from '../fakes/execution-node.js';
-import { sleep } from '../helpers/cp028-executor.js';
+import { sleep, type ExecDatabase } from '../helpers/cp028-executor.js';
 import { exec, reservationState, rowOf, transitionsOf } from '../helpers/cp030-execution.js';
 import { prepare, ROUTE_FEE } from '../helpers/cp030-dispatch.js';
 
@@ -55,16 +55,47 @@ it('CP-032/B1 a send that never answers ends at the attempt deadline as UNKNOWN'
   expectUnknown(r, outcome);
 });
 
-it('CP-032/B1 a stop request after dispatch leaves the execution UNKNOWN for the reconciler (exit 7), never cancelled or failed', async () => {
-  const stop = new AbortController();
-  const r = await prepare('stop-late', {
-    signal: stop.signal, attemptDeadlineMs: 60_000,
-    script: () => ({ send: c => { c.onDispatched?.(); setTimeout(() => { stop.abort(); }, 50); return never(); } }),
+describe('stop after dispatch', () => {
+  let stop: AbortController;
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
+  let r: Prepared;
+  let database: ExecDatabase | undefined;
+  let work: ReturnType<Prepared['run']> | undefined;
+  let cleanup: Promise<void> | undefined;
+  let preparedAt: number, prepMs: number;
+  const close = (): Promise<void> => cleanup ??= (async () => {
+    stop.abort();
+    if (abortTimer !== undefined) clearTimeout(abortTimer);
+    await Promise.allSettled(work === undefined ? [] : [work]);
+    const owned = database; database = undefined;
+    owned?.close();
+  })();
+  beforeEach(async () => {
+    preparedAt = performance.now();
+    stop = new AbortController(); abortTimer = undefined; work = undefined; cleanup = undefined;
+    r = await prepare('stop-late', {
+      signal: stop.signal, attemptDeadlineMs: 60_000,
+      script: () => ({ send: c => { c.onDispatched?.(); abortTimer = setTimeout(() => { stop.abort(); }, 50); return never(); } }),
+    });
+    database = r.p.openDatabase(r.path, { readOnly: false });
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  afterEach(close);
+  it('CP-032/B1 a stop request after dispatch leaves the execution UNKNOWN for the reconciler (exit 7), never cancelled or failed', async () => {
+    const caseStarted = performance.now();
+    onTestFinished(close);
+    if (database === undefined) throw new Error('stop-after-dispatch fixture is not open');
+    const started = Date.now();
+    try {
+      work = r.run(r.node, database);
+      const outcome = await work;
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expectUnknown(r, outcome);
+    } finally {
+      await close();
+      console.log(JSON.stringify({ case: 'stop-after-dispatch', prepMs, caseMs: performance.now() - caseStarted, totalMs: performance.now() - preparedAt }));
+    }
   });
-  const started = Date.now();
-  const outcome = await r.run();
-  expect(Date.now() - started).toBeLessThan(5_000);
-  expectUnknown(r, outcome);
 });
 
 it('CP-032/B1 a lease lost while the payment is in flight: the late answer is not written over the new holder (exit 7, lease-lost)', async () => {
