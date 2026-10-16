@@ -23,9 +23,11 @@ jobs:
         node: ['22.23.2', '22.x', '24.18.1', '24.x']
         shard: [core]
         include:
-          - { os: windows-latest, node: '22.23.2', shard: core }
+          - { os: windows-latest, node: '22.23.2', shard: core-1, coreShard: '1/2' }
+          - { os: windows-latest, node: '22.23.2', shard: core-2, coreShard: '2/2' }
           - { os: windows-latest, node: '22.23.2', shard: native }
-          - { os: windows-latest, node: '24.x', shard: core }
+          - { os: windows-latest, node: '24.x', shard: core-1, coreShard: '1/2' }
+          - { os: windows-latest, node: '24.x', shard: core-2, coreShard: '2/2' }
           - { os: windows-latest, node: '24.x', shard: native }
     defaults:
       run:
@@ -132,7 +134,7 @@ jobs:
         run: npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
       # Separate Windows VMs keep native process and owner-lifecycle proofs from competing with core tests.
       - name: Configure Windows core exclusions
-        if: matrix.os == 'windows-latest' && matrix.shard == 'core'
+        if: matrix.os == 'windows-latest' && startsWith(matrix.shard, 'core-')
         run: |
           node --input-type=module <<'NODE'
           import { appendFileSync, writeFileSync } from 'node:fs';
@@ -164,9 +166,10 @@ jobs:
           appendFileSync(process.env.GITHUB_ENV, `FLUXWARDEN_CI_CORE_CONFIG=${config}\n`);
           NODE
       - name: Test Windows core product
-        if: matrix.os == 'windows-latest' && matrix.shard == 'core'
+        if: matrix.os == 'windows-latest' && startsWith(matrix.shard, 'core-')
         run: >-
-          npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=2
+          npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=1 --fileParallelism=false
+          --shard=${{ matrix.coreShard }}
           --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
       - name: Test Windows native product
         if: matrix.os == 'windows-latest' && matrix.shard == 'native'
@@ -186,12 +189,15 @@ jobs:
           test/commands/cp043-t05-repository.test.ts
           --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-product.json"
       - name: Test harness
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core' || matrix.shard == 'core-1'
         run: npm run test:harness -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-harness.json"
       # Vitest exits 0 with skipped tests; every test must have run and passed.
       - name: Require all core tests passed
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core' || matrix.shard == 'core-1'
         run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json" "$RUNNER_TEMP/vitest-harness.json"
+      - name: Require all second core shard tests passed
+        if: matrix.os == 'windows-latest' && matrix.shard == 'core-2'
+        run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json"
       - name: Require all native tests passed
         if: matrix.os == 'windows-latest' && matrix.shard == 'native'
         run: node scripts/no-pending.mjs "$RUNNER_TEMP/vitest-product.json"
