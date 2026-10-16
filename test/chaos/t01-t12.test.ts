@@ -1,12 +1,12 @@
 // Interface: existing executor/reconciler ports in test/helpers/cp030-execution.ts.
 // SPEC §11.6 T-01..T-12; SECURITY INV-02..06,08,11,13,15..17.
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { failed, succeeded } from '../fakes/execution-node.js';
-import { fakeChannel, circularRoute } from '../fakes/preflight-node.js';
-import { APPROVAL_KEYS, codeOf, execById, loadClaim, loadPersistence, policyFor, scratchDb, seedBase, seedProposal } from '../helpers/cp028-executor.js';
+import { fakeChannel, circularRoute, FakePreflightNode } from '../fakes/preflight-node.js';
+import { APPROVAL_KEYS, codeOf, execById, execByProposal, loadClaim, loadPersistence, loadPreflight, policyFor, scratchDb, seedBase, seedProposal, type ExecDatabase } from '../helpers/cp028-executor.js';
 import { prepare } from '../helpers/cp030-dispatch.js';
 import { exec, loadReconciler, rowOf } from '../helpers/cp030-execution.js';
 import { cancelled, journalTypes, preflight, reconciliation, routeWorld } from '../helpers/chaos-matrix.js';
@@ -29,10 +29,39 @@ it('CP-033/B1 T-02 snapshot older than 60 seconds cancels with zero mutating RPC
   cancelled(await preflight('t02', b => ({ channels: () => [fakeChannel(b.sourceKey, `02${'aa'.repeat(32)}`, { observedAt: Date.now() - 61_000 }), fakeChannel(b.targetKey, `02${'bb'.repeat(32)}`)] })), 'STALE_SNAPSHOT');
 });
 
-it('CP-033/B1 T-03 a route over the absolute fee cap is refused', async () => {
-  const w = routeWorld(); w.constraints.maxFeeMsat = 202_100n;
-  expect(await w.validate()).toEqual({ ok: false, code: 'FEE_CEILING_EXCEEDED', check: 'V3' });
-  cancelled(await preflight('t03', b => ({ route: () => circularRoute(b.sourceKey, b.targetKey, 200_001n, 80) })), 'FEE_CEILING_EXCEEDED');
+describe('absolute fee ceiling', () => {
+  const prepareFixture = async () => {
+    const p = await loadPersistence(), { prepareExecution } = await loadPreflight();
+    const path = scratchDb('t03'), base = seedBase(p, path), approval = seedProposal(base), policy = policyFor(base);
+    const node = new FakePreflightNode(base.sourceKey, base.targetKey, { route: () => circularRoute(base.sourceKey, base.targetKey, 200_001n, 80) });
+    return { p, prepareExecution, path, base, approval, policy, node };
+  };
+  let fixture: Awaited<ReturnType<typeof prepareFixture>>;
+  let database: ExecDatabase | undefined;
+  let preparedAt: number, prepMs: number;
+  const close = (): void => { const owned = database; database = undefined; owned?.close(); };
+  beforeAll(async () => {
+    preparedAt = performance.now();
+    fixture = await prepareFixture();
+    database = fixture.p.openDatabase(fixture.path, { readOnly: false });
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  afterAll(close);
+  it('CP-033/B1 T-03 a route over the absolute fee cap is refused', async () => {
+    const started = performance.now();
+    onTestFinished(close);
+    if (database === undefined) throw new Error('fee ceiling fixture is not open');
+    try {
+      const w = routeWorld(); w.constraints.maxFeeMsat = 202_100n;
+      expect(await w.validate()).toEqual({ ok: false, code: 'FEE_CEILING_EXCEEDED', check: 'V3' });
+      const { prepareExecution, path, base, approval, policy, node } = fixture;
+      const outcome = await prepareExecution({ db: database, adapter: node, workerId: 'matrix', leaseMs: 60_000 }, { approval, policy, approvalKeyIds: APPROVAL_KEYS });
+      cancelled({ path, base, approval, node, outcome, row: execByProposal(path, approval.proposalId) }, 'FEE_CEILING_EXCEEDED');
+    } finally {
+      close();
+      console.log(JSON.stringify({ case: 'route-fee-ceiling', prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+    }
+  });
 });
 
 it('CP-033/B1 T-04 excessive CLTV cancels without invoice or send', async () => {
@@ -54,20 +83,48 @@ it('CP-033/B1 T-05 a reset after write is UNKNOWN then resolved by hash with one
   expect(journalTypes(r.path, r.executionId)).toEqual(['REBALANCE_SENT', 'REBALANCE_SETTLED']);
 });
 
-it('CP-033/B1 T-06 two workers claim once and the stale fence stops before every node call', async () => {
-  const p = await loadPersistence(), { claimExecution } = await loadClaim(), path = scratchDb('t06'), b = seedBase(p, path), approval = seedProposal(b), policy = policyFor(b);
-  const db = p.openDatabase(path, { readOnly: false });
-  try {
-    const one = claimExecution(db, { approval, policy, approvalKeyIds: APPROVAL_KEYS, workerId: 'one', leaseMs: 60_000 });
-    expect(one.ok).toBe(true); if (!one.ok) throw new Error('first claim refused');
-    expect(claimExecution(db, { approval, policy, approvalKeyIds: APPROVAL_KEYS, workerId: 'two', leaseMs: 60_000 })).toEqual({ ok: false, exit: 5, step: 'claimed-elsewhere', executionId: one.executionId });
-    const epoch = db.executions.transition(one.executionId, one.fenceEpoch, 'CLAIMED', 'PREFLIGHT');
-    expect(codeOf(() => db.executions.transition(one.executionId, one.fenceEpoch, 'CLAIMED', 'PREFLIGHT'))).toBe('LEASE_LOST');
-    expect(execById(path, one.executionId).fence_epoch).toBe(epoch);
-  } finally { db.close(); }
-  const r = await prepare('t06-fence');
-  expect(await r.run(r.node, undefined, { fenceEpoch: r.input.fenceEpoch - 1n })).toEqual({ executionId: r.executionId, exit: 5, step: 'lease-lost' });
-  expect(r.node.calls).toEqual([]);
+describe('claim and stale execution fence', () => {
+  const prepareFixture = async () => {
+    const p = await loadPersistence(), { claimExecution } = await loadClaim(), path = scratchDb('t06'), base = seedBase(p, path), approval = seedProposal(base), policy = policyFor(base);
+    return { p, claimExecution, path, approval, policy, dispatch: await prepare('t06-fence') };
+  };
+  let fixture: Awaited<ReturnType<typeof prepareFixture>>;
+  let claimDatabase: ExecDatabase | undefined, dispatchDatabase: ExecDatabase | undefined;
+  let preparedAt: number, prepMs: number;
+  const close = (): void => {
+    const claim = claimDatabase, dispatch = dispatchDatabase;
+    claimDatabase = undefined; dispatchDatabase = undefined;
+    try { claim?.close(); } finally { dispatch?.close(); }
+  };
+  beforeAll(async () => {
+    preparedAt = performance.now();
+    fixture = await prepareFixture();
+    claimDatabase = fixture.p.openDatabase(fixture.path, { readOnly: false });
+    dispatchDatabase = fixture.dispatch.p.openDatabase(fixture.dispatch.path, { readOnly: false });
+    prepMs = performance.now() - preparedAt;
+  }, 30_000);
+  afterAll(close);
+  it('CP-033/B1 T-06 two workers claim once and the stale fence stops before every node call', async () => {
+    const started = performance.now();
+    onTestFinished(close);
+    if (claimDatabase === undefined || dispatchDatabase === undefined) throw new Error('fence fixtures are not open');
+    try {
+      const { claimExecution, path, approval, policy, dispatch: r } = fixture;
+      const db = claimDatabase;
+      const one = claimExecution(db, { approval, policy, approvalKeyIds: APPROVAL_KEYS, workerId: 'one', leaseMs: 60_000 });
+      expect(one.ok).toBe(true); if (!one.ok) throw new Error('first claim refused');
+      expect(claimExecution(db, { approval, policy, approvalKeyIds: APPROVAL_KEYS, workerId: 'two', leaseMs: 60_000 })).toEqual({ ok: false, exit: 5, step: 'claimed-elsewhere', executionId: one.executionId });
+      const epoch = db.executions.transition(one.executionId, one.fenceEpoch, 'CLAIMED', 'PREFLIGHT');
+      expect(codeOf(() => db.executions.transition(one.executionId, one.fenceEpoch, 'CLAIMED', 'PREFLIGHT'))).toBe('LEASE_LOST');
+      expect(execById(path, one.executionId).fence_epoch).toBe(epoch);
+      db.close(); claimDatabase = undefined;
+      expect(await r.run(r.node, dispatchDatabase, { fenceEpoch: r.input.fenceEpoch - 1n })).toEqual({ executionId: r.executionId, exit: 5, step: 'lease-lost' });
+      expect(r.node.calls).toEqual([]);
+    } finally {
+      close();
+      console.log(JSON.stringify({ case: 'claim-and-stale-fence', prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+    }
+  });
 });
 
 it('CP-033/B1 T-07 death after claim leaves no send and reclaims with a higher fence', async () => {

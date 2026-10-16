@@ -9,9 +9,9 @@ SECURITY INV-03 (a higher actual fee raises INVARIANT_BREACH), INV-05 (hash pers
 INV-17 (one HTLC), INV-18 (fenced writes), INV-19 (never sent again).
 */
 // The seeded fake receiver is channel246290604752896 (seedBase); these receipts declare its independently simulated incoming settlement.
-import { expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
 import { failed, never, PAYMENT_SECRET, ScriptedExecutionNode, succeeded } from '../fakes/execution-node.js';
-import { APPROVED_MAX_FEE, PRINCIPAL, sleep } from '../helpers/cp028-executor.js';
+import { APPROVED_MAX_FEE, PRINCIPAL, sleep, type ExecDatabase } from '../helpers/cp028-executor.js';
 import { databaseText, exec, labelOf, reservationState, rowOf, sha256, transitionsOf } from '../helpers/cp030-execution.js';
 import { balances, HASH, prepare, PREIMAGE, ROUTE_FEE, S_BEFORE, settled, T_BEFORE, TOLERANCE } from '../helpers/cp030-dispatch.js';
 
@@ -322,14 +322,34 @@ for (const [name, cancel] of [
   ['answers NOT_FOUND', () => Promise.resolve('NOT_FOUND' as const)],
   ['fails', () => Promise.reject(new Error('delinvoice answer lost'))],
 ] as const) {
-  it(`CP-030/B5 a failure whose invoice cancel ${name} is not closed: UNKNOWN, exit 7, reservation held`, async () => {
-    const r = await prepare(`cancel-${String(name.length)}`, {
-      script: () => ({ send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_NO_ROUTE')); }, cancel }),
+  describe(`invoice cancel ${name}`, () => {
+    let r: Awaited<ReturnType<typeof prepare>>;
+    let database: ExecDatabase | undefined;
+    let preparedAt: number, prepMs: number;
+    const close = (): void => { const owned = database; database = undefined; owned?.close(); };
+    beforeAll(async () => {
+      preparedAt = performance.now();
+      r = await prepare(`cancel-${String(name.length)}`, {
+        script: () => ({ send: c => { c.onDispatched?.(); return Promise.resolve(failed('FAILURE_REASON_NO_ROUTE')); }, cancel }),
+      });
+      database = r.p.openDatabase(r.path, { readOnly: false });
+      prepMs = performance.now() - preparedAt;
+    }, 30_000);
+    afterAll(close);
+    it(`CP-030/B5 a failure whose invoice cancel ${name} is not closed: UNKNOWN, exit 7, reservation held`, async () => {
+      const started = performance.now();
+      onTestFinished(close);
+      if (database === undefined) throw new Error('invoice cancellation fixture is not open');
+      try {
+        const outcome = await r.run(r.node, database);
+        expect(outcome).toEqual({ executionId: r.executionId, exit: 7, step: 'OUTCOME_UNKNOWN' });
+        expect(rowOf(r.path, r.executionId).status).toBe('UNKNOWN');
+        expect(reservationState(r.path, r.executionId).state).toBe('HELD');
+      } finally {
+        close();
+        console.log(JSON.stringify({ case: `invoice-cancel-${name}`, prepMs, caseMs: performance.now() - started, totalMs: performance.now() - preparedAt }));
+      }
     });
-    const outcome = await r.run();
-    expect(outcome).toEqual({ executionId: r.executionId, exit: 7, step: 'OUTCOME_UNKNOWN' });
-    expect(rowOf(r.path, r.executionId).status).toBe('UNKNOWN');
-    expect(reservationState(r.path, r.executionId).state).toBe('HELD');
   });
 }
 
