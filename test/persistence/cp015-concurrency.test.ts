@@ -28,13 +28,33 @@ process.stdin.once('data', () => { db.exec('COMMIT'); db.close(); process.exit(0
 
 // Records snapshots through the product module, one transaction each, with block heights from..from+n-1.
 const WRITER = `
+import { createInterface } from 'node:readline';
 const [modulePath, dbPath, channelId, from, n] = process.argv.slice(1);
 const { openDatabase } = await import(modulePath);
 const db = openDatabase(dbPath, { readOnly: false });
 const base = JSON.parse(process.env.FW_CHANNEL, (k, v) => typeof v === 'string' && /^bigint:/.test(v) ? BigInt(v.slice(7)) : v);
-for (let i = 0; i < Number(n); i += 1) db.snapshots.record(channelId, { ...base, blockHeight: Number(from) + i });
-db.close();
-process.stdout.write('done\\n');
+const commands = createInterface({ input: process.stdin });
+let written = 0;
+try {
+  process.stdout.write('ready:1\\n');
+  for await (const command of commands) {
+    if (command !== 'go' || written >= Number(n)) throw new Error('invalid writer command');
+    db.snapshots.record(channelId, { ...base, blockHeight: Number(from) + written });
+    written += 1;
+    process.stdout.write('written:' + written + '\\n');
+    if (written === Number(n)) break;
+    process.stdout.write('ready:' + (written + 1) + '\\n');
+  }
+  if (written !== Number(n)) throw new Error('incomplete writer input');
+  process.stdout.write('done\\n');
+} catch (error) {
+  process.stdout.write('failed:' + (error && error.code === 'BUSY' ? 'BUSY' : 'ERROR') + '\\n');
+  process.exitCode = 1;
+} finally {
+  commands.close();
+  process.stdin.destroy();
+  db.close();
+}
 `;
 
 function run(code: string, args: string[], env: NodeJS.ProcessEnv = {}): ChildProcessWithoutNullStreams {
@@ -86,23 +106,94 @@ it('CP-015/B6 a write blocked by another process fails as BUSY within the bounde
 });
 
 it('CP-015/B6 two processes writing snapshots at once lose no rows', async () => {
+  const started = performance.now();
   expect(existsSync(built), 'built persistence module').toBe(true);
   const p = await loadPersistence();
   const path = join(scratch('race'), 'fluxwarden.db');
   const channelId = seeded(p, path);
   const encoded = JSON.stringify(channel(), (_k, v: unknown) => typeof v === 'bigint' ? `bigint:${v.toString()}` : v);
   const moduleUrl = pathToFileURL(built).href;
-  const a = run(WRITER, [moduleUrl, path, channelId, '1', '50'], { FW_CHANNEL: encoded });
-  const b = run(WRITER, [moduleUrl, path, channelId, '1001', '50'], { FW_CHANNEL: encoded });
-  const done = [waitFor(a, 'done'), waitFor(b, 'done')];
-  expect(await Promise.all([exited(a), exited(b)])).toEqual([0, 0]);
-  await Promise.all(done);
+  const children = [
+    run(WRITER, [moduleUrl, path, channelId, '1', '50'], { FW_CHANNEL: encoded }),
+    run(WRITER, [moduleUrl, path, channelId, '1001', '50'], { FW_CHANNEL: encoded }),
+  ];
+  const lifecycle = { accepting: true };
+  const observers = children.map(child => {
+    let buffered = '', failure: Error | undefined;
+    const seen = new Set<string>();
+    const waiting = new Map<string, { resolve(): void; reject(error: Error): void }>();
+    const fail = (error: Error): void => {
+      failure ??= error;
+      for (const pending of waiting.values()) pending.reject(failure);
+      waiting.clear();
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      buffered += chunk.toString();
+      for (let end = buffered.indexOf('\n'); end >= 0; end = buffered.indexOf('\n')) {
+        const message = buffered.slice(0, end); buffered = buffered.slice(end + 1);
+        if (!/^(?:ready|written):(?:[1-9]|[1-4][0-9]|50)$|^done$/.test(message) || seen.has(message)) {
+          fail(new Error(message === 'failed:BUSY' ? 'snapshot writer reported BUSY' : 'snapshot writer protocol failed'));
+          continue;
+        }
+        seen.add(message); waiting.get(message)?.resolve(); waiting.delete(message);
+      }
+    });
+    child.on('error', () => { fail(new Error('snapshot writer process failed')); });
+    child.stdin.on('error', () => { fail(new Error('snapshot writer input failed')); });
+    // Drain diagnostics without echoing child data into a failed assertion.
+    child.stderr.resume();
+    const closed = new Promise<number | null>(resolve => {
+      child.once('close', status => {
+        if (status !== 0 || !seen.has('done')) fail(new Error('snapshot writer closed before successful completion'));
+        resolve(status);
+      });
+    });
+    const wait = (message: string): Promise<void> => {
+      const result = new Promise<void>((resolve, reject) => {
+        if (failure) reject(failure);
+        else if (seen.has(message)) resolve();
+        else waiting.set(message, { resolve, reject });
+      });
+      void result.catch(() => undefined);
+      return result;
+    };
+    return { wait, closed };
+  });
+  let cleanup: Promise<void> | undefined;
+  const stop = (): Promise<void> => cleanup ??= (async () => {
+    lifecycle.accepting = false;
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await Promise.all(observers.map(observer => observer.closed));
+  })();
+  onTestFinished(stop);
+  let fixtureMs: number, roundsMs: number;
+  try {
+    // Bounded busy handling does not promise starvation freedom across 50 consecutive commits.
+    // Both writers compete once per round; neither can monopolize the next 49 transactions.
+    await Promise.all(observers.map(observer => observer.wait('ready:1')));
+    const ready = performance.now();
+    fixtureMs = ready - started;
+    for (let round = 1; round <= 50; round += 1) {
+      await Promise.all(observers.map(observer => observer.wait(`ready:${String(round)}`)));
+      if (!lifecycle.accepting) throw new Error('snapshot writer fixture has closed');
+      expect(children.every(child => child.exitCode === null && child.signalCode === null), 'both writers are live before each paired release').toBe(true);
+      const acknowledged = Promise.all(observers.map(observer => observer.wait(`written:${String(round)}`)));
+      void acknowledged.catch(() => undefined);
+      for (const child of children) child.stdin.write('go\n');
+      await acknowledged;
+    }
+    const done = Promise.all(observers.map(observer => observer.wait('done')));
+    await Promise.all([done, ...observers.map(observer => observer.closed)]);
+    expect(await Promise.all(observers.map(observer => observer.closed))).toEqual([0, 0]);
+    roundsMs = performance.now() - ready;
+  } finally { await stop(); }
   const check = raw(path);
   try {
     const heights = (check.prepare('SELECT block_height AS h FROM channel_snapshots ORDER BY block_height').all() as { h: bigint }[]).map(r => Number(r.h));
     const expected = [...Array.from({ length: 50 }, (_, i) => 1 + i), ...Array.from({ length: 50 }, (_, i) => 1001 + i)];
     expect(heights).toEqual(expected);
   } finally { check.close(); }
+  console.log(JSON.stringify({ case: 'snapshot-writers', fixtureMs, roundsMs, totalMs: performance.now() - started, writers: children.length, rounds: 50, activeChildren: children.filter(child => child.exitCode === null && child.signalCode === null).length }));
 }, 60_000);
 
 // Loads the module, says "ready", waits for "go" on stdin so that all openers start together, then opens a database
