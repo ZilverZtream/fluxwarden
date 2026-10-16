@@ -83,7 +83,9 @@ function forms(bytes: Buffer): [string, Buffer][] {
     ...text.map(([name, value]): [string, Buffer] => [name, Buffer.from(value)])];
 }
 
-it('CP-002/B8 every registered secret kind and retained encoding is detected in output and artifacts with safe diagnostics', async () => {
+const candidateKinds = ['preimage', 'macaroon', 'rune', 'tls-key', 'ed25519-key', 'outbox-key', 'macaroon-without-version', 'macaroon-signature'] as const;
+
+it.each(candidateKinds)('CP-002/B8 %s retained encodings are detected in output and artifacts with safe diagnostics', async candidateKind => {
   const scanner = await import(pathToFileURL(join(repoRoot, 'scripts/leak-check.mjs')).href) as Scanner;
   const o = owner();
   const signature = randomBytes(32);
@@ -93,12 +95,16 @@ it('CP-002/B8 every registered secret kind and retained encoding is detected in 
     ['tls-key', Buffer.from(`-----BEGIN PRIVATE KEY-----\n${randomBytes(48).toString('base64')}\n-----END PRIVATE KEY-----`)],
     ['ed25519-key', randomBytes(64)], ['outbox-key', randomBytes(32)],
   ];
+  expect(kinds.map(([kind]) => kind)).toEqual(['preimage', 'macaroon', 'rune', 'tls-key', 'ed25519-key', 'outbox-key']);
   for (const [kind, source] of kinds) writeFileSync(join(o.sentinelDir, `${kind}.bin`), source);
   const candidates = [...kinds, ['macaroon-without-version', macaroon.subarray(1)] as [string, Buffer], ['macaroon-signature', signature] as [string, Buffer]];
+  expect(candidates.map(([kind]) => kind)).toEqual(candidateKinds);
+  const candidate = candidates.find(([kind]) => kind === candidateKind);
+  if (!candidate) throw new Error(`missing candidate kind: ${candidateKind}`);
+  const [kind, bytes] = candidate;
   const locations = ['temporary.log', 'state.sqlite', 'retained/evidence.log'];
   mkdirSync(join(o.root, 'retained'));
   try {
-  for (const [kind, bytes] of candidates) {
     for (const [encoding, value] of forms(bytes)) {
       for (const location of locations) {
         const target = join(o.root, location);
@@ -123,7 +129,6 @@ it('CP-002/B8 every registered secret kind and retained encoding is detected in 
         expect.soft(output !== null, `${kind}/${encoding}: captured output detected`).toBe(true);
       }
     }
-  }
   } finally {
     removePlantedFiles(o.root, [...locations, 'state.sqlite-wal', 'state.sqlite-shm', 'state.sqlite-journal']);
   }
