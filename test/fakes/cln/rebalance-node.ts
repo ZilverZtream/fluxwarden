@@ -115,7 +115,7 @@ const hashParam = (context: ClnContext): string | null => typeof context.params[
 export async function startRebalanceCln(dir: string, open: FakeServer[], over: Partial<Pick<RebalanceState, 'network' | 'id' | 'sendpay' | 'bkprFeeMsat'>> & { identity?: Identity; tls?: TlsMaterial } = {}): Promise<RebalanceCln> {
   const rune = randomBytes(48).toString('base64url');
   const runeFile = join(dir, `${randomBytes(4).toString('hex')}.rune`);
-  writeFileSync(runeFile, `${rune}\n`);
+  writeFileSync(runeFile, `${rune}\n`, { mode: 0o600 });
   const layers = askrene();
   const state: RebalanceState = {
     network: over.network ?? 'regtest', id: over.id ?? SELF, sendpay: over.sendpay ?? 'settle', unreachable: false,
