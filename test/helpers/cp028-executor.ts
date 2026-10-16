@@ -619,26 +619,35 @@ export async function raceClaims(path: string, workers: readonly { workerId: str
     });
     let out = '';
     let err = '';
+    const closed = new Promise<void>(resolve => { child.once('close', () => { resolve(); }); });
     const ready = new Promise<void>((resolve, reject) => {
       child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString(); if (out.includes('ready\n')) resolve(); });
       child.stderr.on('data', (chunk: Buffer) => { err += chunk.toString(); });
       child.once('exit', status => { if (!out.includes('ready\n')) reject(new Error(`worker exited ${String(status)} before ready: ${err}`)); });
+      child.once('error', reject);
     });
     const done = new Promise<WorkerResult>((resolve, reject) => {
+      child.once('error', reject);
       child.once('exit', status => {
         if (status !== 0) { reject(new Error(`worker ${worker.workerId} exited ${String(status)}: ${err}`)); return; }
         const line = out.split('\n').filter(text => text.startsWith('[')).pop() ?? '[]';
         resolve({ workerId: worker.workerId, outcomes: JSON.parse(line, reviveBigints) as ClaimOutcome[] });
       });
     });
-    return { child, ready, done };
+    return { child, ready, done, closed };
   });
+  const completed = Promise.all(children.map(c => c.done));
+  // A worker can fail before the readiness barrier; observe that rejection
+  // immediately while retaining it for the awaited result and cleanup.
+  void completed.catch(() => undefined);
   try {
     await Promise.all(children.map(c => c.ready));
     for (const c of children) c.child.stdin.write('go\n');
-    return await Promise.all(children.map(c => c.done));
+    return await completed;
   } finally {
-    for (const c of children) if (c.child.exitCode === null) c.child.kill();
+    for (const c of children) if (c.child.exitCode === null && c.child.signalCode === null) c.child.kill();
+    await Promise.all(children.map(c => c.closed));
+    await Promise.allSettled(children.map(c => c.done));
   }
 }
 

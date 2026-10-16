@@ -85,19 +85,24 @@ it('CP-035/B1 two worker processes racing for ten proposals under a budget for f
   const p = await loadPersistence();
   const path = scratchDb('budget-race');
   const base = seedBase(p, path);
-  const policy = policyFor(base, { budget: { msat: 500_000n, periodMs: DAY } });
-  const inputs = Array.from({ length: 10 }, () => ({ approval: seedProposal(base, { approvedMaxFeeMsat: 100_000n }), policy }));
-  const results = await raceClaims(path, [
-    { workerId: 'worker-a', inputs },
-    { workerId: 'worker-b', inputs: [...inputs].reverse() },
-  ]);
-  const admitted = results.flatMap(r => r.outcomes).filter(o => o.ok);
-  expect(admitted).toHaveLength(5);
-  expect(scalar(path, "SELECT coalesce(sum(reserved_msat), 0) AS v FROM budget_reservations WHERE state = 'HELD'")).toBe(500_000n);
-  expect(scalar(path, "SELECT count(*) AS v FROM executions WHERE status = 'CLAIMED'")).toBe(5n);
-  expect(scalar(path, "SELECT count(*) AS v FROM executions WHERE status = 'CANCELLED' AND error_code = 'BUDGET_EXHAUSTED'")).toBe(5n);
-  const refusals = results.flatMap(r => r.outcomes).flatMap(o => o.ok ? [] : [o.step]);
-  expect(new Set(refusals)).toEqual(new Set(['BUDGET_EXHAUSTED', 'claimed-elsewhere']));
+  // Claims race against an initialized database; keep its WAL/SHM lifecycle
+  // owned while both workers open their handles and wait at the ready barrier.
+  const db = p.openDatabase(path, { readOnly: false });
+  try {
+    const policy = policyFor(base, { budget: { msat: 500_000n, periodMs: DAY } });
+    const inputs = Array.from({ length: 10 }, () => ({ approval: seedProposal(base, { approvedMaxFeeMsat: 100_000n }), policy }));
+    const results = await raceClaims(path, [
+      { workerId: 'worker-a', inputs },
+      { workerId: 'worker-b', inputs: [...inputs].reverse() },
+    ]);
+    const admitted = results.flatMap(r => r.outcomes).filter(o => o.ok);
+    expect(admitted).toHaveLength(5);
+    expect(scalar(path, "SELECT coalesce(sum(reserved_msat), 0) AS v FROM budget_reservations WHERE state = 'HELD'")).toBe(500_000n);
+    expect(scalar(path, "SELECT count(*) AS v FROM executions WHERE status = 'CLAIMED'")).toBe(5n);
+    expect(scalar(path, "SELECT count(*) AS v FROM executions WHERE status = 'CANCELLED' AND error_code = 'BUDGET_EXHAUSTED'")).toBe(5n);
+    const refusals = results.flatMap(r => r.outcomes).flatMap(o => o.ok ? [] : [o.step]);
+    expect(new Set(refusals)).toEqual(new Set(['BUDGET_EXHAUSTED', 'claimed-elsewhere']));
+  } finally { db.close(); }
 }, 90_000);
 
 it('CP-035/B2 VERIFIED_FAILURE and CANCELLED release the reservation, which frees the budget', async () => {
