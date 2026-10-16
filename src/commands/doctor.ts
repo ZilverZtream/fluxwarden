@@ -1,7 +1,7 @@
 // `fluxwarden doctor` (SPEC.md §10.3 item 1): runtime, database and every configured node, read-only.
 import { requireCapabilities, REQUIRED_CAPABILITIES } from '../core/capabilities.js';
 import { ExitCode } from '../core/exit-codes.js';
-import { SCHEMA_VERSION } from '../persistence/index.js';
+import { SCHEMA_VERSION, sqliteAvailable } from '../persistence/index.js';
 import { nodeText } from '../output/index.js';
 import { handshake, moreUrgent, networkName, nodeFailure, quarantineWarning, type NodeFailure } from './handshake.js';
 import { emitJson, refuse, table, writeWarnings, type Io } from './report.js';
@@ -37,6 +37,7 @@ export async function doctor(io: Io, configPath: string, nodeVersion: string): P
   let db;
   try {
     config = configStage(configPath);
+    if (!sqliteAvailable()) throw new StageFailure(ExitCode.CAPABILITY_UNSUPPORTED, 'sqlite', 'node:sqlite is unavailable');
     db = databaseStage(config.database, 'create');
   } catch (error) {
     if (error instanceof StageFailure) return refuse(io, COMMAND, error.code, error.step, error.message);

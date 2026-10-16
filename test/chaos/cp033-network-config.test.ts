@@ -23,7 +23,12 @@ for (const network of ['mainnet','testnet4','signet']) {
     expect(existsSync(f.database)).toBe(false);
   });
 }
-it('CP-033/B1 T-01 malformed unknown configured network remains INVALID_INPUT rather than a valid off-regtest network',async()=>{
+it('CP-033/B1 T-01 public execute refuses an unknown configured network before database and credential access',async()=>{
   const f=fixture('made-up-network'),result=await runCli(['--json','actions','execute','prop_00000000000000000000000000','--require-regtest','--config',f.config]);
+  expect(result.status).toBe(5);expect(jsonDocument(result)['error']).toMatchObject({ code:5,step:'network-lock' });
+  expect(existsSync(f.database)).toBe(false);expect(existsSync(`${f.database}-wal`)).toBe(false);expect(existsSync(`${f.database}-shm`)).toBe(false);
+});
+it('CP-033/B1 T-01 readonly unknown configured network retains INVALID_INPUT',async()=>{
+  const f=fixture('made-up-network'),result=await runCli(['--json','liquidity','diagnose','--config',f.config]);
   expect(result.status).toBe(2);expect(jsonDocument(result)['error']).toMatchObject({ code:2,step:'config' });expect(existsSync(f.database)).toBe(false);
 });

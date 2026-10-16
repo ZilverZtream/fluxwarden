@@ -1,11 +1,11 @@
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
-import { transitionAllowed, type ExecutionStatus } from '../core/execution.js';
+import { reportedFeeBreach, transitionAllowed, type ExecutionStatus } from '../core/execution.js';
 import { committedMsat, inFlightCount, lastTerminal, type TerminalTimes } from './budget.js';
 import { PersistenceError } from './errors.js';
 import { bigintColumn, checkedMsat, DB_NOW, dbNow, immediate, newUlid, numberColumn, textColumn } from './sql.js';
 import { ledgerTransaction } from './ledger.js';
 import { post, postAccountTransfer, postTransition } from '../ledger/post.js';
-import { CLEARING_UNASSIGNED, channelLocalAccount, EXPENSE_ROUTING_FEES, RECON_DIFFERENCE } from '../ledger/accounts.js';
+import { CLEARING_INFLIGHT, CLEARING_UNASSIGNED, channelLocalAccount, EXPENSE_ROUTING_FEES, RECON_DIFFERENCE } from '../ledger/accounts.js';
 
 export type DeltaStatus = 'MATCH' | 'MISMATCH' | 'PENDING';
 
@@ -49,6 +49,9 @@ export interface UnresolvedExecution {
   readonly submittedAgeMs: number | null;
   readonly approvedMaxFeeMsat: bigint;
   readonly plannedFeeMsat: bigint | null;
+  readonly principalMsat: bigint;
+  readonly maxFeePpm: bigint;
+  readonly exemptFeeMsat: bigint;
 }
 
 export interface ExecutionEvent {
@@ -155,7 +158,7 @@ export interface ExecutionsRepository {
   /** Runs `work` inside one BEGIN IMMEDIATE transaction. */
   claim<T>(work: (scope: ClaimScope) => T): T;
   plan(executionId: string): ExecutionPlan | null;
-  /** Whether the row still carries `fenceEpoch`. */
+  /** Whether the row still carries `fenceEpoch` and any preparation lease is live by the database clock. */
   holds(executionId: string, fenceEpoch: bigint): boolean;
   /** Whether the approval or the proposal behind the row has expired by the database clock. */
   authorityLapsed(executionId: string): boolean;
@@ -164,14 +167,15 @@ export interface ExecutionsRepository {
   /** Takes the row's lease for `workerId` if it is CLAIMED/PREFLIGHT with an expired lease. */
   takeOver(executionId: string, workerId: string, leaseMs: number): HeldClaim | null;
   /** Fenced write of the delta verification result on a VERIFIED_SUCCESS row. Returns the new epoch. */
-  recordDelta(executionId: string, fenceEpoch: bigint, deltaStatus: DeltaStatus): bigint;
+  recordDelta(executionId: string, fenceEpoch: bigint, deltaStatus: DeltaStatus, deltas?: { sourceDeltaMsat: bigint | null; targetDeltaMsat: bigint | null }): bigint;
   /** Read-only node evidence completes attribution through fenced append-only corrections, never another send. */
   recoverSettlement(executionId: string, fenceEpoch: bigint, settledChannelKey: string | null, actualFeeMsat: bigint): bigint;
   /** Every SUBMITTING, IN_FLIGHT and UNKNOWN execution with its node and lease state, oldest first. */
   unresolved(): readonly UnresolvedExecution[];
   /**
-   * Takes the reconciler's fenced lease on a SUBMITTING, IN_FLIGHT or UNKNOWN row still at `fenceEpoch`: an UNKNOWN row
-   * whatever its lease, the others only once their lease has expired. Null when not taken.
+   * Takes the reconciler's fenced lease on a SUBMITTING, IN_FLIGHT, UNKNOWN or pending-attribution row at `fenceEpoch`.
+   * UNKNOWN and paid truth may enter recovery immediately, but another worker cannot preempt a live recovery lease.
+   * Other dispatch rows must have an expired lease. Null when not taken.
    */
   takeUnresolved(executionId: string, fenceEpoch: bigint, workerId: string, leaseMs: number): HeldClaim | null;
   view(executionId: string): ExecutionView | null;
@@ -208,6 +212,30 @@ function optionalNumber(row: Record<string, SQLOutputValue>, key: string): numbe
 
 function optionalText(row: Record<string, SQLOutputValue>, key: string): string | null {
   return row[key] === null ? null : textColumn(row, key);
+}
+
+function storedFeeExemption(row: Record<string, SQLOutputValue>): bigint {
+  const policy = JSON.parse(textColumn(row, 'policy_canonical_json')) as { fees?: { exempt_fee_msat?: unknown } };
+  const reason = JSON.parse(textColumn(row, 'reason_json')) as { exempt_fee_msat?: unknown };
+  // SPEC §7.2 default is zero; missing legacy metadata can never waive the ppm ceiling.
+  const value = policy.fees?.exempt_fee_msat ?? reason.exempt_fee_msat ?? '0';
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) throw new Error('settlement: invalid stored fee exemption');
+  return checkedMsat(BigInt(value), 'stored fee exemption');
+}
+
+/** Quarantine is committed with paid truth and accounting, even if the alert consumer fails. */
+function quarantineFeeBreach(db: DatabaseSync, executionId: string, feeMsat: bigint): void {
+  // MySQL: same
+  const row = db.prepare(`SELECT p.node_id, p.principal_msat, p.max_fee_ppm, p.reason_json, v.policy_canonical_json,
+      a.max_fee_msat AS approved_max_fee_msat FROM executions e
+    JOIN liquidity_proposals p ON p.id = e.proposal_id JOIN approvals a ON a.id = e.approval_id
+    JOIN policy_versions v ON v.id = p.policy_version_id WHERE e.id = ?`).get(executionId);
+  if (row === undefined) throw new Error('settlement: missing stored authority');
+  if (reportedFeeBreach(feeMsat, { principalMsat: bigintColumn(row, 'principal_msat'), approvedMaxFeeMsat: bigintColumn(row, 'approved_max_fee_msat'),
+    maxFeePpm: bigintColumn(row, 'max_fee_ppm'), exemptFeeMsat: storedFeeExemption(row) })) {
+    // MySQL: same; this side effect shares the execution's fenced transaction.
+    db.prepare("UPDATE nodes SET state = 'QUARANTINED' WHERE id = ?").run(textColumn(row, 'node_id'));
+  }
 }
 
 function deltaColumn(row: Record<string, SQLOutputValue>, key: string): DeltaStatus | null {
@@ -290,12 +318,13 @@ function fencedTransition(db: DatabaseSync, executionId: string, fenceEpoch: big
         submitted_at = CASE WHEN ? = 'SUBMITTING' THEN ${DB_NOW} ELSE submitted_at END,
         fence_epoch = fence_epoch + 1, updated_at = ${DB_NOW}
     WHERE id = ? AND fence_epoch = ? AND status = ?
+      AND (? = 'paid-observation' OR status NOT IN ('CLAIMED','PREFLIGHT') OR lease_expires_at > ${DB_NOW})
       AND (? = 'paid-observation' OR ? <> 'SUBMITTING' OR (lease_expires_at > ${DB_NOW} AND EXISTS (
         SELECT 1 FROM approvals a JOIN liquidity_proposals p ON p.id = a.proposal_id
         WHERE a.id = executions.approval_id AND p.id = executions.proposal_id
           AND a.expires_at > ${DB_NOW} AND p.expires_at > ${DB_NOW})))`)
     .run(to, fields.errorCode ?? null, fields.routeJson ?? null, planned, actual, hash, fields.deltaStatus ?? null, lease, lease, to,
-      executionId, fenceEpoch, from, admission, to);
+      executionId, fenceEpoch, from, admission, admission, to);
   if (Number(result.changes) === 0) throw leaseLost(executionId);
   const epoch = fenceEpoch + 1n;
   const evidence: Record<string, string> = {};
@@ -307,22 +336,39 @@ function fencedTransition(db: DatabaseSync, executionId: string, fenceEpoch: big
     evidence['targetLocalMsat'] = checkedMsat(fields.baseline.targetLocalMsat, 'baseline').toString();
   }
   appendEvent(db, executionId, epoch, from, to, evidence);
+  if (to === 'CANCELLED' && fields.errorCode === 'identity') {
+    // MySQL: same; quarantine shares the fenced cancellation and reservation release transaction.
+    db.prepare(`UPDATE nodes SET state = 'QUARANTINED' WHERE id = (
+      SELECT p.node_id FROM liquidity_proposals p JOIN executions e ON e.proposal_id = p.id WHERE e.id = ?
+    )`).run(executionId);
+  }
   if (to === 'IN_FLIGHT' || to === 'VERIFIED_SUCCESS' || to === 'VERIFIED_FAILURE') {
     // MySQL: same
     const row = db.prepare(`SELECT n.name, s.channel_key AS source_key, t.channel_key AS target_key, p.principal_msat, e.planned_fee_msat
       FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id JOIN nodes n ON n.id = p.node_id
       JOIN channels s ON s.id = p.source_channel_id JOIN channels t ON t.id = p.target_channel_id WHERE e.id = ?`).get(executionId);
-    if (row !== undefined && row['planned_fee_msat'] !== null) {
-      let active = true;
-      const tx = ledgerTransaction(db, newUlid, () => active);
-      try {
+    if (row === undefined) throw new PersistenceError('INVALID_TRANSITION', 'the execution lacks its ledger metadata');
+    let active = true;
+    const tx = ledgerTransaction(db, newUlid, () => active);
+    try {
+      const principal = bigintColumn(row, 'principal_msat');
+      const sent = tx.findJournal('REBALANCE_SENT', executionId);
+      // Preserve an existing send's amount. When no send survived and the route fee is missing, a reported actual
+      // fee can reconstruct the completed movement; an unreported fee can never be guessed from the reservation.
+      const sentAmount = sent?.lines.filter(line => line.account === CLEARING_INFLIGHT)
+        .reduce((sum, line) => sum + line.debitMsat - line.creditMsat, 0n);
+      const fee = row['planned_fee_msat'] === null ? (sentAmount === undefined ? actual : sentAmount - principal) : bigintColumn(row, 'planned_fee_msat');
+      if (fee === null && to !== 'VERIFIED_FAILURE') {
+        throw new PersistenceError('INVALID_TRANSITION', 'the execution lacks a known amount for its required journal');
+      }
+      if (fee !== null) {
         postTransition(tx, { executionId, node: textColumn(row, 'name'), sourceChannel: textColumn(row, 'source_key'),
-          principalMsat: bigintColumn(row, 'principal_msat'), routeFeeMsat: bigintColumn(row, 'planned_fee_msat') },
+          principalMsat: principal, routeFeeMsat: checkedMsat(fee, 'ledgerFeeMsat') },
         to === 'VERIFIED_SUCCESS'
           ? { status: to, settledChannel: fields.settledChannelKey ?? null, actualFeeMsat: actual }
           : { status: to }, dbNow(db));
-      } finally { active = false; }
-    }
+      }
+    } finally { active = false; }
   }
   if (to === 'CANCELLED' || to === 'VERIFIED_FAILURE') {
     // MySQL: same
@@ -331,6 +377,7 @@ function fencedTransition(db: DatabaseSync, executionId: string, fenceEpoch: big
     // MySQL: same
     db.prepare(`UPDATE budget_reservations SET state = 'CONSUMED', consumed_msat = coalesce(?, reserved_msat)
       WHERE execution_id = ? AND state IN ('HELD','CONSUMED')`).run(actual, executionId);
+    if (actual !== null) quarantineFeeBreach(db, executionId, actual);
   }
   return epoch;
 }
@@ -457,9 +504,13 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
           return { status: 'CANCELLED' as const, fenceEpoch: fencedTransition(db, executionId, fenceEpoch, 'PREFLIGHT', 'CANCELLED', { errorCode: 'APPROVAL_INVALID' }) };
         }
         // MySQL: same
-        const node = db.prepare(`SELECT p.node_id, e.payment_hash FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id
+        const node = db.prepare(`SELECT p.node_id, e.payment_hash, n.state AS node_state FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id
+          JOIN nodes n ON n.id = p.node_id
           WHERE e.id = ?`).get(executionId);
         if (node === undefined) throw leaseLost(executionId);
+        if (node['node_state'] === 'QUARANTINED') {
+          return { status: 'CANCELLED' as const, fenceEpoch: fencedTransition(db, executionId, fenceEpoch, 'PREFLIGHT', 'CANCELLED', { errorCode: 'node-quarantined' }) };
+        }
         if (node['payment_hash'] === null) {
           throw new PersistenceError('INVALID_TRANSITION', 'SUBMITTING needs the payment hash stored first');
         }
@@ -538,8 +589,9 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
     }),
 
     holds: (executionId, fenceEpoch) => run(() => {
-      // MySQL: same
-      return db.prepare('SELECT 1 AS held FROM executions WHERE id = ? AND fence_epoch = ?').get(executionId, fenceEpoch) !== undefined;
+      // MySQL: same, with NOW(6) for the clock
+      return db.prepare(`SELECT 1 AS held FROM executions WHERE id = ? AND fence_epoch = ?
+        AND (status NOT IN ('CLAIMED','PREFLIGHT') OR lease_expires_at > ${DB_NOW})`).get(executionId, fenceEpoch) !== undefined;
     }),
 
     authorityLapsed: executionId => run(() => {
@@ -577,14 +629,15 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       });
     },
 
-    recordDelta(executionId, fenceEpoch, deltaStatus) {
+    recordDelta(executionId, fenceEpoch, deltaStatus, deltas) {
       writable('executions.recordDelta');
       return immediate(db, () => {
         // MySQL: same, with NOW(6) for the clock
         const result = db.prepare(`UPDATE executions SET delta_status = ?, fence_epoch = fence_epoch + 1, updated_at = ${DB_NOW}
           WHERE id = ? AND fence_epoch = ? AND status = 'VERIFIED_SUCCESS'`).run(deltaStatus, executionId, fenceEpoch);
         if (Number(result.changes) === 0) throw leaseLost(executionId);
-        appendEvent(db, executionId, fenceEpoch + 1n, 'VERIFIED_SUCCESS', 'VERIFIED_SUCCESS', { deltaStatus });
+        appendEvent(db, executionId, fenceEpoch + 1n, 'VERIFIED_SUCCESS', 'VERIFIED_SUCCESS', { deltaStatus,
+          ...(deltas === undefined ? {} : { sourceDeltaMsat: deltas.sourceDeltaMsat?.toString() ?? null, targetDeltaMsat: deltas.targetDeltaMsat?.toString() ?? null }) });
         return fenceEpoch + 1n;
       });
     },
@@ -623,6 +676,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
           if (priorFee === null) db.prepare("UPDATE budget_reservations SET consumed_msat = ? WHERE execution_id = ? AND state = 'CONSUMED'").run(fee, executionId);
           appendEvent(db, executionId, fenceEpoch + 1n, 'VERIFIED_SUCCESS', 'VERIFIED_SUCCESS',
             { actualFeeMsat: fee.toString(), settledChannelKey, attributionPending: settledChannelKey === null });
+          quarantineFeeBreach(db, executionId, fee);
         } finally { active = false; }
         return fenceEpoch + 1n;
       });
@@ -631,11 +685,13 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
     unresolved: () => run(() => {
       // MySQL: same, with NOW(6) and TIMESTAMPDIFF for the clock
       const rows = db.prepare(`SELECT e.id, e.status, e.fence_epoch, p.node_id, n.implementation, e.payment_hash, a.max_fee_msat AS approved_max_fee_msat, e.planned_fee_msat,
+          p.principal_msat, p.max_fee_ppm, p.reason_json, v.policy_canonical_json,
           CASE WHEN e.lease_expires_at IS NULL OR e.lease_expires_at < ${DB_NOW} THEN 1 ELSE 0 END AS lease_expired,
           CASE WHEN e.submitted_at IS NULL THEN NULL ELSE ${DB_NOW} - e.submitted_at END AS submitted_age_ms
         FROM executions e
         JOIN liquidity_proposals p ON p.id = e.proposal_id
         JOIN approvals a ON a.id = e.approval_id
+        JOIN policy_versions v ON v.id = p.policy_version_id
         JOIN nodes n ON n.id = p.node_id
         WHERE e.status IN ('SUBMITTING','IN_FLIGHT','UNKNOWN') OR (e.status = 'VERIFIED_SUCCESS' AND (
           e.actual_fee_msat IS NULL OR (EXISTS (SELECT 1 FROM ledger_journals j JOIN ledger_lines l ON l.journal_id = j.id
@@ -654,6 +710,9 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
         submittedAgeMs: optionalNumber(row, 'submitted_age_ms'),
         approvedMaxFeeMsat: bigintColumn(row, 'approved_max_fee_msat'),
         plannedFeeMsat: optionalBigint(row, 'planned_fee_msat'),
+        principalMsat: bigintColumn(row, 'principal_msat'),
+        maxFeePpm: bigintColumn(row, 'max_fee_ppm'),
+        exemptFeeMsat: storedFeeExemption(row),
       }));
     }),
 
@@ -661,6 +720,13 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       writable('executions.takeUnresolved');
       const lease = checkedLease(leaseMs);
       return immediate(db, () => {
+        // MySQL: JSON_UNQUOTE(JSON_EXTRACT(event.evidence_json, '$.reclaimedBy')) for the recorded recovery owner.
+        const recovering = db.prepare(`SELECT 1 FROM executions e WHERE e.id = ? AND e.fence_epoch = ?
+          AND e.worker_id <> ? AND e.lease_expires_at >= ${DB_NOW} AND EXISTS (
+            SELECT 1 FROM execution_events event WHERE event.execution_id = e.id
+              AND event.from_status IN ('SUBMITTING','IN_FLIGHT','UNKNOWN','VERIFIED_SUCCESS')
+              AND json_extract(event.evidence_json, '$.reclaimedBy') = e.worker_id)`).get(executionId, fenceEpoch, workerId);
+        if (recovering !== undefined) return null;
         // MySQL: same, with NOW(6) and NOW(6) + INTERVAL ? * 1000 MICROSECOND for the clock
         const result = db.prepare(`UPDATE executions
           SET worker_id = ?, lease_expires_at = ${DB_NOW} + ?, fence_epoch = fence_epoch + 1, updated_at = ${DB_NOW}

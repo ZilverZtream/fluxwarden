@@ -62,14 +62,19 @@ export function terminalText(text: string): string {
 export interface RenderOutput {
   redact(text: string): string;
   write(text: string, options?: { stream?: Stream; exitCode?: number }): Promise<void>;
+  /** Drains one complete document on its selected transport; the writer remains usable. */
   json(value: unknown, options?: { exitCode?: number }): Promise<void>;
+  /** Completes finite output, draining unmatched ordinary fragments without ending either transport. */
+  finalize(): Promise<void>;
 }
 
 /** UTF-8 rendering over injected transports, including pipes with closed readers. */
 export function createOutput(options: { stdout: Writable; stderr: Writable; secrets: readonly Secret[] }): RenderOutput {
   const secrets = Secret.redactor(options.secrets);
   const overlap = Math.max(PAYMENT_REQUEST_CONTEXT, secrets.overlap);
-  const streams = new WeakMap<Writable, { context: string; suffix: string; pending: Promise<void> }>();
+  type Transport = { context: string; suffix: string; held: string; pending: Promise<void> };
+  const streams = new Map<Writable, Transport>();
+  let finalized: Promise<void> | undefined;
   const redact = (text: string): string => {
     text = secrets.redact(text);
     return redactPatterns(text);
@@ -80,55 +85,77 @@ export function createOutput(options: { stdout: Writable; stderr: Writable; secr
   for (const target of new Set([options.stdout, options.stderr])) {
     target.on('error', () => { closed.add(target); });
   }
-  const write = (text: string, settings: { stream?: Stream; exitCode?: number } = {}): Promise<void> => {
+  const emit = async (target: Writable, transport: Transport, credentialFree: string): Promise<void> => {
+    const rendered = redactPatterns(credentialFree, transport.suffix);
+    for (const [piece, chunk] of utf8Chunks(rendered, value => escapeText(value, true))) {
+      if (closed.has(target) || target.destroyed || !target.writable) return;
+      // Node.js nodejs/node, lib/internal/streams/writable.js: a completed write
+      // callback releases the next write, bounding pending data under backpressure.
+      const accepted = await new Promise<boolean>((resolve, reject) => {
+        try {
+          target.write(chunk, error => {
+            if (!error) { resolve(true); return; }
+            closed.add(target);
+            if (pipeClosed(error)) resolve(false);
+            else reject(new Error('output: transport failed'));
+          });
+        } catch (error) {
+          closed.add(target);
+          if (pipeClosed(error)) resolve(false);
+          else reject(new Error('output: transport failed'));
+        }
+      });
+      if (!accepted) return;
+      // Only actual emitted text becomes continuation context, taken before escaping so a
+      // credential that contains control characters is still recognised across writes.
+      // The bound depends on credential and invoice sizes, not on the output calls.
+      transport.suffix = (transport.suffix + piece).slice(-overlap);
+    }
+    const contextLimit = overlap - transport.held.length;
+    transport.context = contextLimit === 0 ? '' : (transport.context + credentialFree).slice(-contextLimit);
+  };
+  const write = (text: string, settings: { stream?: Stream; exitCode?: number } = {}, completeDocument = false): Promise<void> => {
+    if (finalized !== undefined) return Promise.reject(new Error('output: already finalized'));
     const target = settings.stream === 'stderr' ? options.stderr : options.stdout;
     let state = streams.get(target);
     if (!state) {
-      state = { context: '', suffix: '', pending: Promise.resolve() };
+      state = { context: '', suffix: '', held: '', pending: Promise.resolve() };
       streams.set(target, state);
     }
     const transport = state;
     const completed = transport.pending.then(async () => {
-      // Registered credentials take precedence: they are matched against the emitted text
-      // before payment-request redaction, so a request look-alike inside a credential that
-      // continues in a later write cannot hide the credential's start from that write.
-      const credentialFree = secrets.redact(text, transport.context);
-      const rendered = redactPatterns(credentialFree, transport.suffix);
-      for (const [piece, chunk] of utf8Chunks(rendered, value => escapeText(value, true))) {
-        if (closed.has(target) || target.destroyed || !target.writable) return;
-        // Node.js nodejs/node, lib/internal/streams/writable.js: a completed write
-        // callback releases the next write, bounding pending data under backpressure.
-        const accepted = await new Promise<boolean>((resolve, reject) => {
-          try {
-            target.write(chunk, error => {
-              if (!error) { resolve(true); return; }
-              closed.add(target);
-              if (pipeClosed(error)) resolve(false);
-              else reject(new Error('output: transport failed'));
-            });
-          } catch (error) {
-            closed.add(target);
-            if (pipeClosed(error)) resolve(false);
-            else reject(new Error('output: transport failed'));
-          }
-        });
-        if (!accepted) return;
-        // Only actual emitted text becomes continuation context, taken before escaping so a
-        // credential that contains control characters is still recognised across writes.
-        // The bound depends on credential and invoice sizes, not on the output calls.
-        transport.suffix = (transport.suffix + piece).slice(-overlap);
-      }
-      transport.context = (transport.context + credentialFree).slice(-overlap);
+      // Match registered values before pattern redaction can obscure their starts. Only an undecidable suffix is
+      // retained; write completion acknowledges this bounded acceptance, independently for each transport.
+      const credentialFree = secrets.redact(transport.held + text, transport.context);
+      // A complete document disambiguates its own remaining ordinary text without closing the writer
+      // or releasing an undecidable fragment on an independent transport.
+      const boundary = completeDocument ? credentialFree.length : secrets.pendingStart(credentialFree);
+      if (credentialFree.length - boundary > secrets.overlap) throw new Error('output: unresolved fragment exceeds its recognition bound');
+      transport.held = credentialFree.slice(boundary);
+      await emit(target, transport, credentialFree.slice(0, boundary));
     });
     // The next call observes the bytes of the entire previous call, even when
     // callers enqueue concurrently. Independent transports have independent queues.
     transport.pending = completed.catch(() => undefined);
     return completed;
   };
+  const finalize = (): Promise<void> => {
+    finalized ??= Promise.all([...streams].map(([target, transport]) => {
+      const completed = transport.pending.then(async () => {
+        const text = transport.held;
+        transport.held = '';
+        await emit(target, transport, secrets.redact(text, transport.context));
+      });
+      transport.pending = completed.catch(() => undefined);
+      return completed;
+    })).then(() => undefined);
+    return finalized;
+  };
   return {
     redact,
     write,
-    json: (value, settings = {}) => write(`${jsonText(value, redact)}\n`, settings),
+    json: async (value, settings = {}) => { await write(`${jsonText(value, redact)}\n`, settings, true); },
+    finalize,
   };
 }
 

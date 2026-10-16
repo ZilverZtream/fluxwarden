@@ -158,8 +158,7 @@ function nodeEntry(value: YamlValue, index: number, base: string): NodeConfig {
   const expectedNetwork = text(value, 'expected_network', where);
   if (expectedNetwork !== 'regtest') {
     const message = `${where}: expected_network must be regtest`;
-    if (['mainnet', 'testnet', 'testnet4', 'signet'].includes(expectedNetwork)) throw new ConfigNetworkError(message);
-    throw new ConfigError(message);
+    throw new ConfigNetworkError(message);
   }
   return {
     name, implementation, endpoint,

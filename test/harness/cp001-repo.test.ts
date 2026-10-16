@@ -292,7 +292,12 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     expect(job['strategy'], `${name} has no matrix`).toBeUndefined();
     expect(String(job['if']).replace(/\s+/g, ' '), `${name} if`).toMatch(/^(\$\{\{ )?github\.event_name == 'workflow_dispatch'( \}\})?$/);
     const runs = list(job['steps'], `${name}.steps`).map(s => map(s, 'step')['run']).filter((r): r is string => typeof r === 'string');
-    expect(runs.some(r => r.trim() === `npm run ${script}`), `${name} runs npm run ${script}`).toBe(true);
+    // Chaos may request real reporter output for its scanned artifact. Keep the
+    // exact npm script identity; only reporter/output arguments may follow it.
+    const invocation = script === 'test:chaos'
+      ? /^npm run test:chaos(?:\s+--)?(?:\s+--(?:reporter|outputFile(?:\.json)?)(?:=|\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s]+))*$/
+      : /^npm run test:lab$/;
+    expect(runs.some(r => invocation.test(r.trim()) && !/[;&|`\r\n]/.test(r.trim())), `${name} runs npm run ${script}`).toBe(true);
   }
 });
 

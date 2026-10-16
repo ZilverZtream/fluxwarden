@@ -38,6 +38,7 @@ import { loadClnRest } from '../helpers/adapter-interfaces.js';
 import { syntheticInvoice } from '../helpers/cp004-invoice.js';
 import { testRoot } from '../helpers/env.js';
 import type { CircularRoute, RouteRequest } from '../helpers/cp028-executor.js';
+import type { HopPolicy } from '../helpers/route-interfaces.js';
 import { prepare } from '../helpers/cp030-dispatch.js';
 import { labelOf, loadClnExecute, reservationState, rowOf, sha256, type ClnExecutionAdapter, type ExecutionAdapter } from '../helpers/cp030-execution.js';
 
@@ -58,12 +59,14 @@ const PREIMAGE = randomBytes(32);
 const HASH = sha256(PREIMAGE);
 const SECRET = '9c'.repeat(32);
 
-const ROUTE: CircularRoute = {
+const ROUTE: CircularRoute & { readonly hops: readonly (CircularRoute['hops'][number] & { readonly policy: HopPolicy | null })[] } = {
   sourceChannelKey: CH2, targetChannelKey: CH5, outPeer: LND_R, inPeer: CLN_R, principalMsat: P,
   hops: [
-    { channelKey: CH2, nodeOut: LND_R, amountOutMsat: 100_202_101n, expiry: HEIGHT + 132 },
-    { channelKey: CH3, nodeOut: CLN_R, amountOutMsat: 100_101_000n, expiry: HEIGHT + 52 },
-    { channelKey: CH5, nodeOut: OWN, amountOutMsat: P, expiry: HEIGHT + 18 },
+    { channelKey: CH2, nodeOut: LND_R, amountOutMsat: 100_202_101n, expiry: HEIGHT + 132, policy: null },
+    { channelKey: CH3, nodeOut: CLN_R, amountOutMsat: 100_101_000n, expiry: HEIGHT + 52,
+      policy: { baseFeeMsat: 1000n, feePpm: 1000n, cltvExpiryDelta: 80, minHtlcMsat: 1n, maxHtlcMsat: 4_950_000_000n } },
+    { channelKey: CH5, nodeOut: OWN, amountOutMsat: P, expiry: HEIGHT + 18,
+      policy: { baseFeeMsat: 1000n, feePpm: 1000n, cltvExpiryDelta: 34, minHtlcMsat: 1n, maxHtlcMsat: 4_950_000_000n } },
   ],
   totalFeeMsat: 202_101n, feePpmCeil: 2_022n, totalTimelockDelta: 132, parts: 1,
 };

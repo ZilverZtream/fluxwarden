@@ -1,5 +1,6 @@
 export type PersistenceCode =
-  | 'SCHEMA_TOO_NEW' | 'SCHEMA_OUTDATED' | 'NOT_FOUND' | 'UNSAFE_PATH' | 'BUSY' | 'OUT_OF_RANGE' | 'READ_ONLY' | 'LEASE_LOST' | 'INVALID_TRANSITION';
+  | 'SCHEMA_TOO_NEW' | 'SCHEMA_OUTDATED' | 'NOT_FOUND' | 'UNSAFE_PATH' | 'BUSY' | 'OUT_OF_RANGE' | 'READ_ONLY' | 'LEASE_LOST' | 'INVALID_TRANSITION'
+  | 'AMBIGUOUS_CHANNEL_IDENTITY';
 
 export class PersistenceError extends Error {
   readonly code: PersistenceCode;

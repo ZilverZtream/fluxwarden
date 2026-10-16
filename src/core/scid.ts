@@ -19,3 +19,18 @@ export function chanIdToScid(chanId: string): string | null {
   if (id === 0n) return null;
   return `${(id >> 40n).toString()}x${((id >> 16n) & 0xFFFFFFn).toString()}x${(id & 0xFFFFn).toString()}`;
 }
+
+/** The same BOLT 7 channel in either direction, including LND's packed identity. */
+export function channelScid(key: string): string | null {
+  const bare = key.replace(/\/[01]$/, '');
+  try {
+    if (SCID.test(bare)) return chanIdToScid(scidToChanId(bare));
+    if (/^[1-9][0-9]*$/.test(bare) && BigInt(bare) <= 0xFFFFFFFFFFFFFFFFn) return chanIdToScid(bare);
+  } catch { /* An application channel key need not be a BOLT 7 identity. */ }
+  return null;
+}
+
+export function channelExcluded(key: string, excluded: readonly string[] = []): boolean {
+  const scid = channelScid(key);
+  return excluded.some(entry => entry === key || (scid !== null && channelScid(entry) === scid));
+}

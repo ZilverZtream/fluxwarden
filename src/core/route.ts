@@ -1,6 +1,7 @@
 // Validation of a candidate circular route (checks V1..V12). Pure: every figure is recomputed
 // from the hops, and totals a node reports are accepted only when they equal the recomputed ones.
 import type { Msat } from './money.js';
+import { channelExcluded } from './scid.js';
 
 export type Implementation = 'lnd' | 'cln';
 
@@ -50,6 +51,7 @@ export interface RouteConstraints {
   readonly maxCltvDelta: number;
   readonly finalCltvDelta: number;
   readonly blockHeight: number;
+  readonly excludeChannels?: readonly string[];
 }
 
 /** A node's answer that no acceptable route exists; `reason` is the node's text, for display only. */
@@ -125,6 +127,8 @@ function forwardingFee(amountOut: bigint, policy: HopPolicy): bigint {
  */
 export function validateRoute(route: CandidateRoute, c: RouteConstraints, channels: readonly RouteChannel[], policy: EffectivePolicy): RouteVerdict {
   const hops = route.hops;
+  if (hops.some(hop => channelExcluded(hop.scid, c.excludeChannels)
+    || channels.some(channel => channel.scid === hop.scid && channelExcluded(channel.channelKey, c.excludeChannels)))) return refuse('NO_FEASIBLE_ROUTE', 'V1');
   const first = hops[0];
   const last = hops[hops.length - 1];
   const principal: bigint = c.principalMsat;

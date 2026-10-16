@@ -1,5 +1,4 @@
-// D76 engineering accounting oracle, routed by the orchestrator: a proven
-// paid principal with unknown incoming channel is an explicit unassigned
+// INV-08/09: a proven paid principal with unknown incoming channel is an explicit unassigned
 // settlement asset. SPEC §8.2/§9.2/§9.5 still require one balanced SETTLED
 // journal and exact actual fee. No missing-journal waiver or target guess.
 import { expect, it } from 'vitest';
@@ -33,7 +32,7 @@ it('CP-037/B2 a proven paid unknown incoming principal has a complete balanced t
     expect(m.runLedgerVerify(db)).toEqual({ exitCode: 0, report: { ok: true, failures: [] } });
   } finally { db.close(); }
 
-  // D76: terminal success with pending attribution is recovered through the
+  // Terminal success with pending attribution is recovered through the
   // existing public reconciler using read-only observations, never a new send.
   const originalSettled = (() => {
     const book = m.openDatabase(r.path, { readOnly: true });

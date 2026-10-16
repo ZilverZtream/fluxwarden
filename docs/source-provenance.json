@@ -53,9 +53,9 @@
     {
       "upstreamPath": "scripts/leak-check.mjs",
       "path": "scripts/leak-check.mjs",
-      "changes": "Generic sentinel scanning, bounded matching, artifact validation, and monotonic five-second busy retries.",
+      "changes": "Generic sentinel scanning, bounded matching, artifact validation, monotonic five-second busy retries, and bounded exact recognizer-state reuse.",
       "upstreamSha256": "521c444539273c084354a34f84b9e0a6d6030b639ebd32885b0f77b0141cddae",
-      "importedSha256": "0190586f0f82d51a1eee02cdd574782636ce097b88964c074e0f80c0f7545ffb",
+      "importedSha256": "0a6d5987e64f9b9563ee95e317984bde9ad69877d62c2f64012fd188b7b1974c",
       "disposition": "adapted"
     },
     {

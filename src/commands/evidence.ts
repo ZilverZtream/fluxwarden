@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { ExitCode } from '../cli/exit-codes.js';
 import type { Secret } from '../core/secret.js';
 import { buildBundle, holdsPreimage, RUN_ID, type EvidenceInput } from '../evidence/bundle.js';
-import { createStagingDirectory, publishDirectory, removeDirectory, writeNewFile } from '../output/files.js';
+import { createStagingDirectory, publishDirectory, removeDirectory, writeNewFiles } from '../output/files.js';
 
 export type EvidenceExit = typeof ExitCode.SUCCESS | typeof ExitCode.INVALID_INPUT | typeof ExitCode.INVARIANT_BREACH;
 
@@ -53,7 +53,7 @@ function writeBundle(input: EvidenceInput, options: { outDir: string; secrets: r
   const bundle = buildBundle(input, options.secrets);
   const staging = createStagingDirectory(options.outDir);
   try {
-    for (const [name, bytes] of bundle) writeNewFile(join(staging, name), bytes);
+    writeNewFiles(new Map([...bundle].map(([name, bytes]) => [join(staging, name), bytes])));
     const written = [...bundle.keys()].map(name => ({ name, bytes: readFileSync(join(staging, name)) }));
     const leaked = written.some(file => options.secrets.some(secret => secret.foundIn(file.bytes) || secret.foundIn(Buffer.from(file.name))))
       || holdsPreimage(written.map(file => file.bytes.toString('utf8')));

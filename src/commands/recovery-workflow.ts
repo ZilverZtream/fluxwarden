@@ -7,7 +7,9 @@ import { ulid } from '../core/ulid.js';
 import { exportEvidence } from './evidence.js';
 import { buildBundle, type EvidenceInput } from '../evidence/bundle.js';
 import { buildIdentity } from '../evidence/build.js';
+import { evidenceCredentials } from '../evidence/credentials.js';
 import type { AlertWriter } from '../daemon/alerts.js';
+import { bootstrapAlerts } from '../daemon/bootstrap.js';
 import { recoverPreflight } from '../executor/preflight.js';
 import { writeRunRecord, readRunRecord } from '../output/run-record.js';
 import { reconcile } from '../reconciler/index.js';
@@ -35,12 +37,16 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
       if (input === null) throw new StageFailure(2, null, 'no evidence run has this id');
       const bound = await labEvidence(input, command.config, env, db);
       const out = resolve(command.out);
-      const exported = await exportEvidence(bound, { outDir: out, secrets: [] });
+      let secrets: ReturnType<typeof evidenceCredentials>;
+      try { secrets = evidenceCredentials(bound, config); }
+      catch { throw new StageFailure(8, 'evidence', 'the recorded run credential context is unavailable'); }
+      const exported = await exportEvidence(bound, { outDir: out, secrets });
       if (exported.exitCode !== 0) throw new StageFailure(exported.exitCode, 'evidence', 'the evidence destination is unavailable or the leak check failed');
-      const bundle = buildBundle(bound, []);
+      const bundle = buildBundle(bound, secrets);
       return emit(io, command.kind, { run_id: command.runId, out, files: [...bundle].filter(([name]) => name !== 'checksums.sha256').map(([name, bytes]) => ({ name, sha256: createHash('sha256').update(bytes).digest('hex') })) });
     }
     if (window === null) throw new Error('the reconciliation window is unavailable');
+    const writer = alerts ?? bootstrapAlerts(config);
     const database = db;
     const nodes = selectNodes(config, command.node);
     const adapters = new Map<string, ExecutionAdapter>();
@@ -49,7 +55,7 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
     const topologyBefore: unknown[] = [];
     for (const node of nodes) {
       const session = await handshake(db, node, resolveConnection(node, command.connection, env));
-      const payment = await controller(node, config, session);
+      const payment = await controller(node, config, session, db);
       if (payment.fingerprints !== undefined) fingerprints.set(node.name, payment.fingerprints);
       adapters.set(session.rowId, payment.adapter);
       sources.push({ node: node.name, implementation: node.implementation, api: payment.accounting } as AccountingSource);
@@ -59,10 +65,10 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
     }
     const ids = db.commandData.executionIds();
     const before = new Map(ids.map(id => [id, database.executions.view(id)?.status]));
-    await recoverPreflight({ db, workerId: randomUUID(), leaseMs: 60_000 });
+    await recoverPreflight({ db, adapters, workerId: randomUUID(), leaseMs: 60_000 });
     const pass = await reconcile({ db, adapters, workerId: randomUUID(), leaseMs: 60_000, notFoundWindowMs: 120_000,
       escalateAfterMs: config.escalateAfterMs, deltaToleranceMsat: config.deltaToleranceMsat, confirmIntervalMs: 1000, nodeIds: new Set(adapters.keys()),
-      alert: alert => { alerts?.raise({ kind: alert.kind === 'INVARIANT_BREACH' ? 'invariant-breach' : alert.kind,
+      alert: alert => { writer.raise({ kind: alert.kind === 'INVARIANT_BREACH' ? 'invariant-breach' : alert.kind,
         subject: alert.executionId, state: alert.code }); } }, { startup: true });
     const executions: ReconExecution[] = [];
     for (const id of ids) {
@@ -76,7 +82,7 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
     if (checked.exitCode === 8 || pass.exit === 8) throw new StageFailure(8, 'ledger', JSON.stringify(checked.report.verify.failures, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value));
     const accounting = checked.report.accounting;
     if (accounting === null) throw new Error('accounting report is absent');
-    for (const difference of accounting.differences) alerts?.raise({ kind: 'recon-difference', subject: difference.executionId ?? difference.node,
+    for (const difference of accounting.differences) writer.raise({ kind: 'recon-difference', subject: difference.executionId ?? difference.node,
       state: `${difference.source}:${difference.kind}:${String(difference.ledgerMsat)}:${String(difference.nodeMsat)}:${difference.reason ?? ''}` });
     const runId = `run_${ulid(db.now())}`;
     const changes = executions.filter(execution => before.get(execution.id) !== execution.status).map(execution => ({ execution_id: execution.id, from: before.get(execution.id), to: execution.status }));

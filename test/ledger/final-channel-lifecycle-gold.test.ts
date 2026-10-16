@@ -70,7 +70,7 @@ it('CP-037/B1 a committed pending channel becoming active on the same physical f
     expect(balanceOf(db, 'equity:opening_balance')).toBe(-600_000_000n);
     const channelAssets = [...db.ledger.balances()].filter(([account]) => account.startsWith('channel:')).reduce((sum, [, value]) => sum + (value ?? 0n), 0n);
     expect(channelAssets).toBe(600_000_000n);
-    // D76: append-only rekey corrections must also move the original asset;
+    // INV-08/09: append-only rekey corrections must also move the original asset;
     // preserving total equity alone cannot leave funds stranded on an old key.
     expect(balanceOf(db, m.channelLocalAccount('cln-m', pendingKey))).toBe(0n);
     expect(balanceOf(db, m.channelLocalAccount('cln-m', activeKey))).toBe(600_000_000n);

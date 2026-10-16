@@ -14,6 +14,8 @@ export class YamlError extends Error {
 
 interface Line { readonly number: number; readonly indent: number; readonly text: string }
 
+const MAX_DEPTH = 64;
+
 /** The line without its comment: `#` at the start or after whitespace, outside quotes. */
 function stripComment(text: string, number: number): string {
   let quote: string | null = null;
@@ -37,6 +39,7 @@ function stripComment(text: string, number: number): string {
 
 function lines(source: string): Line[] {
   const result: Line[] = [];
+  let started = false;
   source.split('\n').forEach((raw, index) => {
     const number = index + 1;
     const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
@@ -45,8 +48,10 @@ function lines(source: string): Line[] {
     if (body === '') return;
     if (indentText.includes('\t')) throw new YamlError('tab in indentation', number);
     if (indentText === '' && (body === '---' || body === '...' || body.startsWith('--- ') || body.startsWith('%'))) {
+      if (!started && body === '---') { started = true; return; }
       throw new YamlError('documents and directives are not supported', number);
     }
+    started = true;
     result.push({ number, indent: indentText.length, text: body });
   });
   return result;
@@ -115,13 +120,13 @@ function entry(text: string, number: number): { key: string; rest: string } | nu
         break;
       }
     }
-    const after = text.slice(index + 1);
+    const after = text.slice(index + 1).trimStart();
     if (!after.startsWith(':') || !/^:(\s|$)/.test(after)) return null;
     return { key: scalar(text.slice(0, index + 1), number), rest: after.slice(1).trim() };
   }
   const match = /^([^\s:][^:]*?):(?:\s+(.*))?$/.exec(text);
   if (match === null) return null;
-  const key = match[1] ?? '';
+  const key = (match[1] ?? '').trimEnd();
   if (key.startsWith('- ') || key === '-' || key.startsWith('? ')) return null;
   return { key: scalar(key, number), rest: (match[2] ?? '').trim() };
 }
@@ -138,29 +143,34 @@ class Parser {
     const first = this.#lines[0];
     if (first === undefined) return null;
     if (first.indent !== 0) throw new YamlError('the document must start at column 0', first.number);
-    const value = this.#block(0);
+    const value = this.#block(0, 1);
     const extra = this.#lines[this.#at];
     if (extra !== undefined) throw new YamlError('unexpected indentation', extra.number);
     return value;
   }
 
-  #block(indent: number): YamlValue {
+  #block(indent: number, depth: number): YamlValue {
     const line = this.#lines[this.#at];
     if (line === undefined) return null;
-    return line.text === '-' || line.text.startsWith('- ') ? this.#sequence(indent) : this.#mapping(indent);
+    return line.text === '-' || line.text.startsWith('- ') ? this.#sequence(indent, depth) : this.#mapping(indent, depth);
   }
 
   /** The nested block of a `key:` or `-` with nothing after it: deeper lines, or null when there are none. */
-  #nested(parentIndent: number, sequenceAllowedAtParent: boolean): YamlValue {
+  #nested(parentIndent: number, sequenceAllowedAtParent: boolean, depth: number): YamlValue {
     const next = this.#lines[this.#at];
     if (next === undefined) return null;
-    if (next.indent > parentIndent) return this.#block(next.indent);
+    if (next.indent > parentIndent) return this.#block(next.indent, depth + 1);
     // A block sequence may sit at the same indentation as its mapping key.
-    if (sequenceAllowedAtParent && next.indent === parentIndent && (next.text === '-' || next.text.startsWith('- '))) return this.#sequence(parentIndent);
+    if (sequenceAllowedAtParent && next.indent === parentIndent && (next.text === '-' || next.text.startsWith('- '))) return this.#sequence(parentIndent, depth + 1);
     return null;
   }
 
-  #mapping(indent: number): YamlMap {
+  #checkDepth(depth: number): void {
+    if (depth > MAX_DEPTH) throw new YamlError('nesting is too deep', this.#lines[this.#at]?.number ?? 1);
+  }
+
+  #mapping(indent: number, depth: number): YamlMap {
+    this.#checkDepth(depth);
     const map: Record<string, YamlValue> = {};
     for (let line = this.#lines[this.#at]; line !== undefined && line.indent === indent; line = this.#lines[this.#at]) {
       if (line.text === '-' || line.text.startsWith('- ')) break;
@@ -169,14 +179,18 @@ class Parser {
       if (found.key === '<<') throw new YamlError('merge keys are not supported', line.number);
       if (Object.prototype.hasOwnProperty.call(map, found.key)) throw new YamlError('duplicate key', line.number);
       this.#at += 1;
-      map[found.key] = found.rest === '' ? this.#nested(indent, true) : scalar(found.rest, line.number);
+      Object.defineProperty(map, found.key, {
+        value: found.rest === '' ? this.#nested(indent, true, depth) : scalar(found.rest, line.number),
+        enumerable: true, writable: true, configurable: true,
+      });
     }
     const next = this.#lines[this.#at];
     if (next !== undefined && next.indent > indent) throw new YamlError('unexpected indentation', next.number);
     return map;
   }
 
-  #sequence(indent: number): YamlValue[] {
+  #sequence(indent: number, depth: number): YamlValue[] {
+    this.#checkDepth(depth);
     const items: YamlValue[] = [];
     for (let line = this.#lines[this.#at]; line !== undefined && line.indent === indent; line = this.#lines[this.#at]) {
       if (line.text !== '-' && !line.text.startsWith('- ')) break;
@@ -184,14 +198,14 @@ class Parser {
       const inner = rest.trimStart();
       if (inner === '') {
         this.#at += 1;
-        items.push(this.#nested(indent, false));
+        items.push(this.#nested(indent, false, depth));
         continue;
       }
       const column = indent + 2 + (rest.length - inner.length);
       if (inner === '-' || inner.startsWith('- ') || entry(inner, line.number) !== null) {
         // The item's first line continues at the column after the dash.
         this.#lines[this.#at] = { number: line.number, indent: column, text: inner };
-        items.push(this.#block(column));
+        items.push(this.#block(column, depth + 1));
       } else {
         this.#at += 1;
         items.push(scalar(inner, line.number));

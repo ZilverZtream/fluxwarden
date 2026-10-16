@@ -110,10 +110,12 @@ export async function liquidityPlan(input: LiquidityPlanInput): Promise<CommandO
         maxCltvDelta: policy.routing.max_cltv_delta,
         finalCltvDelta: input.finalCltvDelta,
         blockHeight: input.blockHeight,
+        excludeChannels: policy.exclude_channels,
       };
       const found = await input.routes.buildCircularRoute(constraints);
       if (isNoRoute(found)) { record(found.code, found.reason); continue; }
-      const verdict = validateRoute(found, constraints, routeChannels, effective);
+      // The request's combined limit preserves both ceilings; validation identifies which policy ceiling failed.
+      const verdict = validateRoute(found, { ...constraints, maxFeeMsat: effective.maxFeeMsat }, routeChannels, effective);
       if (!verdict.ok) { record(verdict.code, null); continue; }
       record(null, null);
       valid.push({ sourceChannel: pair.sourceChannel, targetChannel: pair.targetChannel, principalMsat: pair.principalMsat, verdict });

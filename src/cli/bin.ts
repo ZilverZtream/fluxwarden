@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The `fluxwarden` binary: process-level handlers, signals and the exit code around main().
 import { readFileSync } from 'node:fs';
-import { processOutput, processRenderOutput, type Output } from '../output/index.js';
+import { processOutput, processRenderOutput, type Output, type RenderOutput } from '../output/index.js';
 import { parseArgs } from './args.js';
 import { ExitCode } from './exit-codes.js';
 import { main } from './main.js';
@@ -27,6 +27,8 @@ const output: Output = {
 let json = false;
 /** The command's own exit code, once main() has returned. */
 let commandCode: number = ExitCode.SUCCESS;
+let pendingCode: number | null = null;
+let paymentMayHaveStarted = false;
 let breached = false;
 let interrupted = false;
 /** This file has written its interrupt or internal-error report. */
@@ -34,13 +36,26 @@ let reported = false;
 /** How a long-running command (the daemon) stops at the first signal, once it has registered. */
 let gracefulStop: (() => void) | null = null;
 let stopRequested = false;
+let exitPending = false;
+const renderedOutputs = new Set<RenderOutput>();
 
-// Exit-code precedence: 8 INVARIANT_BREACH over 6 INTERRUPTED over the command's
-// own code. Decided whenever the code is set or the process exits, never captured earlier.
+async function finalizeRenderedOutputs(): Promise<void> {
+  await Promise.all([...renderedOutputs].map(output => output.finalize()));
+}
+
+function exitFinalized(): void {
+  armFallbackExit();
+  void finalizeRenderedOutputs().then(exitNow, exitNow);
+}
+
+// A breach or a possibly submitted unresolved payment survives interruption: 8 > 7 > 6.
+// Decide at exit too, after an aborted command has recorded its durable outcome.
 function currentCode(): number {
-  if (breached) return ExitCode.INVARIANT_BREACH;
-  if (interrupted) return ExitCode.INTERRUPTED;
-  return commandCode;
+  const code = pendingCode ?? commandCode;
+  if (breached || code === ExitCode.INVARIANT_BREACH) return ExitCode.INVARIANT_BREACH;
+  if (code === ExitCode.OUTCOME_UNKNOWN) return ExitCode.OUTCOME_UNKNOWN;
+  if (interrupted && !paymentMayHaveStarted) return ExitCode.INTERRUPTED;
+  return code;
 }
 
 // At most one report per run: with --json, stdout holds exactly one document, so once the
@@ -60,7 +75,9 @@ function exitNow(): void {
  * after the next-tick queue has drained, is seen first and turns the code into 8.
  */
 function exitAfterPending(): void {
-  setImmediate(exitNow);
+  if (exitPending) return;
+  exitPending = true;
+  setImmediate(exitFinalized);
 }
 
 /**
@@ -91,26 +108,24 @@ function onInternal(): void {
   breached = true;
   process.exitCode = currentCode();
   if (!mayReport()) {
-    exitNow();
+    exitFinalized();
     return;
   }
   reported = true;
   armFallbackExit();
   try {
-    reportInternal(output, json, exitNow);
+    reportInternal(output, json, exitFinalized);
   } catch {
     // The output channel failed as well; the exit code still reports the breach.
-    exitNow();
+    exitFinalized();
   }
 }
 
-// The first SIGINT or SIGTERM stops the run. No command issues a mutating call yet, so the
-// interrupt always comes before one: exit 6, or 8 after a breach.
-// A second signal ends the process at once with the code chosen so far and no second report.
-// A command with a graceful stop (the daemon, SPEC.md §10.4 DM6) finishes its current work at the
-// first signal and exits with its own code; a second signal then exits at once with 6.
+// A graceful command stops new work on the first signal. Repeated signals use the existing
+// check-phase exit so the abort's pending continuation can persist UNKNOWN and report its code.
+// Commands without a graceful handler have issued no payment RPC and retain pre-send exit 6.
 function onSignal(): void {
-  if (gracefulStop !== null && !interrupted) {
+  if (gracefulStop !== null) {
     if (!stopRequested) {
       stopRequested = true;
       gracefulStop();
@@ -118,7 +133,7 @@ function onSignal(): void {
     }
     interrupted = true;
     process.exitCode = currentCode();
-    exitNow();
+    exitAfterPending();
     return;
   }
   if (interrupted) {
@@ -151,9 +166,11 @@ process.on('unhandledRejection', onInternal);
 process.on('SIGINT', onSignal);
 process.on('SIGTERM', onSignal);
 
-function settle(code: number): void {
+async function settle(code: number): Promise<void> {
   commandCode = code;
+  pendingCode = null;
   process.exitCode = currentCode();
+  await finalizeRenderedOutputs();
 }
 
 try {
@@ -161,10 +178,20 @@ try {
   json = parsed.kind === 'command' ? parsed.command.json : parsed.json;
   const result = main(argv, {
     output, version: readVersion, env: process.env, execArgv: process.execArgv, nodeVersion: process.versions.node,
-    onGracefulStop: stop => { gracefulStop = stop; }, daemonOutput: () => processRenderOutput(),
+    onSafetyCode: code => {
+      if (code === ExitCode.INVARIANT_BREACH) breached = true;
+      if (code === ExitCode.OUTCOME_UNKNOWN) paymentMayHaveStarted = true;
+      pendingCode = code;
+      process.exitCode = currentCode();
+    },
+    onGracefulStop: stop => { gracefulStop = stop; }, daemonOutput: () => {
+      const writer = processRenderOutput();
+      renderedOutputs.add(writer);
+      return writer;
+    },
   });
-  if (typeof result === 'number') settle(result);
-  else result.then(settle, onInternal);
+  if (typeof result === 'number') void settle(result).catch(onInternal);
+  else void result.then(settle, onInternal).catch(onInternal);
 } catch {
   onInternal();
 }

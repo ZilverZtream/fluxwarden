@@ -25,6 +25,8 @@ export interface ClnRouteRequest {
   readonly layer: string;
   /** Channels neither direction of which may be used. */
   readonly excludeScids: readonly string[];
+  /** An execution caller records an actual successful acquisition and conclusive immediate removal. */
+  readonly lifecycle?: { beforeCreate(): void; acquired(): void; removed(): void };
 }
 
 interface PathItem {
@@ -133,6 +135,7 @@ export class ClnRouteApi {
    */
   async #withLayer(self: string, request: ClnRouteRequest, work: () => Promise<JsonObject>): Promise<JsonObject | Error> {
     const layer = request.layer;
+    request.lifecycle?.beforeCreate();
     try {
       await this.#rest.call('askrene-create-layer', { layer });
     } catch (error) {
@@ -144,6 +147,7 @@ export class ClnRouteApi {
     let outcome: JsonObject | Error | undefined;
     let failure: { readonly error: unknown } | undefined;
     try {
+      request.lifecycle?.acquired();
       await this.#rest.call('askrene-disable-node', { layer, node: self });
       for (const scid of request.excludeScids) {
         for (const direction of [0, 1]) {
@@ -161,6 +165,7 @@ export class ClnRouteApi {
     }
     try {
       await this.#rest.call('askrene-remove-layer', { layer });
+      request.lifecycle?.removed();
     } catch (error) {
       failure ??= { error };
     }

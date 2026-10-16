@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
-  invoiceLabel, isApprovedRoute,
-  type Alert, type ApprovedRoute, type CancelResult, type CircularRoute, type ExecutionAdapter, type ExecutionPolicy, type ExecutionStatus, type InvoiceResult, type PaymentObservation,
+  invoiceLabel, isApprovedRoute, reportedFeeBreach,
+  type Alert, type ApprovedRoute, type CancelResult, type CircularRoute, type ExecutionAdapter, type ExecutionPolicy, type ExecutionStatus, type InvoiceResult, type InvoiceState, type PaymentObservation,
 } from '../core/execution.js';
 import type { VerifiedApproval } from '../approval/verified.js';
 import { ExitCode } from '../core/exit-codes.js';
@@ -19,6 +19,8 @@ export interface DispatchDeps {
   readonly invoiceExpirySeconds: number;
   readonly deltaToleranceMsat: bigint;
   readonly alert: (alert: Alert) => void;
+  /** Known payment safety while command completion may still await node observations. */
+  readonly onSafetyCode?: (code: number) => void;
 }
 
 /**
@@ -117,7 +119,10 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
   const { executionId, route, approval } = input;
   const label = invoiceLabel(executionId);
   let epoch = input.fenceEpoch;
-  const outcome = (exit: number, step: string | null): DispatchOutcome => ({ executionId, exit, step });
+  const outcome = (exit: number, step: string | null): DispatchOutcome => {
+    deps.onSafetyCode?.(exit);
+    return { executionId, exit, step };
+  };
 
   const fenced = (from: ExecutionStatus, to: ExecutionStatus, fields?: TransitionFields): void => {
     try {
@@ -132,6 +137,7 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
   let hash: string | null = null;
   let paid = false;
   const admitPaid = (stored: string): void => {
+    deps.onSafetyCode?.(ExitCode.INVARIANT_BREACH);
     deps.alert({ kind: 'INVARIANT_BREACH', executionId, code: PAID_BEFORE_SUBMISSION });
     try {
       epoch = db.executions.recordPaidIntent(executionId, epoch, stored, { routeJson: routeJson(route) });
@@ -195,6 +201,18 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
     } catch {
       baseline = null;
     }
+    if (!db.executions.holds(executionId, epoch)) throw new LeaseLost();
+    const stale = (): boolean => {
+      const now = db.now();
+      return [route.sourceChannelKey, route.targetChannelKey].some(key => {
+        const channel = baseline?.find(entry => entry.channelKey === key);
+        return channel === undefined || Math.abs(now - channel.observedAt) > input.policy.maxSnapshotAgeMs;
+      });
+    };
+    if (stale()) {
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'STALE_SNAPSHOT' });
+      return outcome(ExitCode.SAFETY_REFUSAL, 'STALE_SNAPSHOT');
+    }
 
     const preimage = deps.randomBytes(PREIMAGE_BYTES);
     if (preimage.length !== PREIMAGE_BYTES) throw new Error('the random source returned a preimage of the wrong length');
@@ -208,10 +226,28 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       invoice = null;
     }
     if (!db.executions.holds(executionId, epoch)) return outcome(ExitCode.SAFETY_REFUSAL, LEASE_LOST);
-    if (invoice === null || invoice.paymentHash !== hash) {
+    if (invoice === null) {
+      let observed: InvoiceState | null;
+      try { observed = await adapter.invoiceState(hash); } catch { observed = null; }
+      if (!db.executions.holds(executionId, epoch)) {
+        if (observed === 'SETTLED') return paidPreparation(baseline);
+        throw new LeaseLost();
+      }
+      let closed: CancelResult | null;
+      try { closed = await adapter.cancelUnpaidInvoice(hash, label); } catch { closed = null; }
+      if (closed === 'ALREADY_PAID' || observed === 'SETTLED') return paidPreparation(baseline);
+      if (!db.executions.holds(executionId, epoch)) throw new LeaseLost();
+      if (closed === null && observed !== 'CANCELED' && observed !== 'NOT_FOUND') {
+        // The stored intent remains recoverable; neither transport failure proves invoice closure.
+        return outcome(ExitCode.SAFETY_REFUSAL, 'INVOICE_UNCONFIRMED');
+      }
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'INVOICE_UNCONFIRMED' });
+      return outcome(ExitCode.SAFETY_REFUSAL, 'INVOICE_UNCONFIRMED');
+    }
+    if (invoice.paymentHash !== hash) {
       if (await closeInvoice()) return paidPreparation(baseline);
-      fenced('PREFLIGHT', 'CANCELLED', { errorCode: invoice === null ? 'INVOICE_UNCONFIRMED' : 'INVOICE_HASH_MISMATCH' });
-      return outcome(ExitCode.SAFETY_REFUSAL, invoice === null ? 'INVOICE_UNCONFIRMED' : 'INVOICE_HASH_MISMATCH');
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'INVOICE_HASH_MISMATCH' });
+      return outcome(ExitCode.SAFETY_REFUSAL, 'INVOICE_HASH_MISMATCH');
     }
     if (finalDelta(route) < invoice.finalCltvDelta) {
       if (await closeInvoice()) return paidPreparation(baseline);
@@ -220,6 +256,13 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
     }
 
     if (stopped()) return await interrupt();
+    // Route discovery, baseline collection and invoice creation may each outlive the snapshot.
+    // Use the database clock immediately before admitting the money-moving step (INV-06).
+    if (stale()) {
+      if (await closeInvoice()) return paidPreparation(baseline);
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'STALE_SNAPSHOT' });
+      return outcome(ExitCode.SAFETY_REFUSAL, 'STALE_SNAPSHOT');
+    }
     try {
       epoch = db.executions.renewLease(executionId, epoch, deps.leaseMs);
     } catch (error) {
@@ -289,9 +332,10 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
 
   try {
     let send: Promise<PaymentObservation>;
+    deps.onSafetyCode?.(paid ? ExitCode.INVARIANT_BREACH : ExitCode.OUTCOME_UNKNOWN);
     try {
       // A paid invoice found on re-claim is resolved from the node's record; nothing is sent.
-      send = paid ? adapter.observePayment(paymentHash) : adapter.sendOnRoute(route, paymentHash, paymentSecret, onDispatched);
+      send = paid ? adapter.observePayment(paymentHash) : adapter.sendOnRoute(route, paymentHash, paymentSecret, onDispatched, invoiceLabel(executionId));
     } catch (error) {
       send = Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
@@ -313,27 +357,35 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       let exit: number = paid ? ExitCode.INVARIANT_BREACH : ExitCode.SUCCESS;
       let step: string | null = paid ? PAID_BEFORE_SUBMISSION : null;
       const raise = (kind: Alert['kind'], code: string, codeExit: number): void => {
-        deps.alert({ kind, executionId, code });
         // Exit numbers are labels, not severity: a reconciliation alert cannot replace an invariant breach.
         if (exit !== ExitCode.INVARIANT_BREACH && (codeExit === ExitCode.INVARIANT_BREACH || codeExit > exit)) {
           exit = codeExit;
           step = code;
         }
+        deps.onSafetyCode?.(exit);
+        deps.alert({ kind, executionId, code });
       };
       if (htlcCount !== 1) raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE', ExitCode.INVARIANT_BREACH);
-      if (feeMsat > approval.approvedMaxFeeMsat) raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP', ExitCode.INVARIANT_BREACH);
+      if (reportedFeeBreach(feeMsat, { principalMsat: route.principalMsat,
+        approvedMaxFeeMsat: approval.approvedMaxFeeMsat < input.policy.maxFeeMsat ? approval.approvedMaxFeeMsat : input.policy.maxFeeMsat,
+        maxFeePpm: input.policy.maxFeePpm, exemptFeeMsat: input.policy.exemptFeeMsat })) raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP', ExitCode.INVARIANT_BREACH);
       else if (feeMsat !== route.totalFeeMsat) raise('fee-mismatch', 'FEE_MISMATCH', ExitCode.RECONCILIATION_ALERT);
 
+      // Paid truth is already durable. Missing current balances can leave verification pending, never pre-send.
+      deps.onSafetyCode?.(exit === ExitCode.INVARIANT_BREACH ? exit : ExitCode.RECONCILIATION_ALERT);
       let after: readonly NormalizedChannel[] | null;
       try {
         after = await adapter.listChannels();
       } catch {
         after = null;
       }
-      const delta = settledChannelKey === null ? 'PENDING' : deltaStatus(baseline, after, route, feeMsat, deps.deltaToleranceMsat);
-      if (delta !== 'PENDING') {
+      const deltas = observedDeltas(baseline, after, route, settledChannelKey);
+      const delta: DeltaStatus = deltas.sourceDeltaMsat === null || deltas.targetDeltaMsat === null ? 'PENDING'
+        : absolute(deltas.sourceDeltaMsat + route.principalMsat + feeMsat) <= deps.deltaToleranceMsat
+          && absolute(deltas.targetDeltaMsat - route.principalMsat) <= deps.deltaToleranceMsat ? 'MATCH' : 'MISMATCH';
+      if (deltas.sourceDeltaMsat !== null || deltas.targetDeltaMsat !== null) {
         try {
-          epoch = db.executions.recordDelta(executionId, epoch, delta);
+          epoch = db.executions.recordDelta(executionId, epoch, delta, deltas);
         } catch (error) {
           if (error instanceof PersistenceError && error.code === 'LEASE_LOST') return outcome(ExitCode.OUTCOME_UNKNOWN, LEASE_LOST);
           throw error;
@@ -396,18 +448,16 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
 }
 
 /**
- * SPEC §8.7 step 5: the source lost P + F and the target gained P, each within the tolerance. PENDING when either
- * snapshot is missing a channel.
+ * SPEC §8.7 step 5: measured changes on the source and the observed incoming channel. Missing snapshots or channels
+ * leave verification pending; an expected economic movement is never substituted for an observation.
  */
-function deltaStatus(
-  before: readonly NormalizedChannel[] | null, after: readonly NormalizedChannel[] | null, route: CircularRoute, feeMsat: bigint, tolerance: bigint,
-): DeltaStatus {
+function observedDeltas(
+  before: readonly NormalizedChannel[] | null, after: readonly NormalizedChannel[] | null, route: CircularRoute, settledChannelKey: string | null,
+): { sourceDeltaMsat: bigint | null; targetDeltaMsat: bigint | null } {
   const sourceBefore = localBalance(before, route.sourceChannelKey);
-  const targetBefore = localBalance(before, route.targetChannelKey);
+  const targetBefore = settledChannelKey === null ? null : localBalance(before, settledChannelKey);
   const sourceAfter = localBalance(after, route.sourceChannelKey);
-  const targetAfter = localBalance(after, route.targetChannelKey);
-  if (sourceBefore === null || targetBefore === null || sourceAfter === null || targetAfter === null) return 'PENDING';
-  const sourceOff = absolute(sourceAfter - sourceBefore + route.principalMsat + feeMsat);
-  const targetOff = absolute(targetAfter - targetBefore - route.principalMsat);
-  return sourceOff <= tolerance && targetOff <= tolerance ? 'MATCH' : 'MISMATCH';
+  const targetAfter = settledChannelKey === null ? null : localBalance(after, settledChannelKey);
+  return { sourceDeltaMsat: sourceBefore === null || sourceAfter === null ? null : sourceAfter - sourceBefore,
+    targetDeltaMsat: targetBefore === null || targetAfter === null ? null : targetAfter - targetBefore };
 }

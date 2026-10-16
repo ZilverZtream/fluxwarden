@@ -9,21 +9,62 @@ import { reservationState, rowOf, seedExecution } from '../helpers/cp030-executi
 import { cancelled, journalTypes, preflight, reconciliation, routeWorld } from '../helpers/chaos-matrix.js';
 import { loadLedger } from '../helpers/cp037-ledger.js';
 
+async function executionJournals(path: string, executionId: string) {
+  const m = await loadLedger(), db = m.openDatabase(path, { readOnly: true });
+  try { return db.ledger.journals().filter(j => j.executionId === executionId).sort((a, b) => a.eventType.localeCompare(b.eventType)); }
+  finally { db.close(); }
+}
+
+async function expectPaidRecovery(w: Awaited<ReturnType<typeof reconciliation>>) {
+  // SPEC 8.7 / 9.2 and SECURITY INV-07/08: the receipt proves payment and
+  // receiving-channel identity, but this fixture has no preflight balance baseline.
+  expect(w.row()).toMatchObject({ status: 'VERIFIED_SUCCESS', payment_hash: w.hash, actual_fee_msat: 150_000n, delta_status: 'PENDING' });
+  expect(w.reservation()).toEqual({ state: 'CONSUMED', consumed: 150_000n });
+  expect(w.alerts).toContainEqual(expect.objectContaining({ executionId: w.executionId, code: 'DELTA_UNVERIFIED' }));
+  const journals = await executionJournals(w.path, w.executionId);
+  expect(journals.map(j => j.eventType)).toEqual(['REBALANCE_SENT', 'REBALANCE_SETTLED']);
+  expect(journals.map(j => j.lines.map(l => [l.account, l.debitMsat, l.creditMsat]))).toEqual([
+    [
+      ['clearing:inflight', 100_150_000n, 0n],
+      [`channel:lnd-r:${w.base.sourceKey}:local`, 0n, 100_150_000n],
+    ],
+    [
+      [`channel:lnd-r:${w.base.targetKey}:local`, 100_000_000n, 0n],
+      ['expense:routing_fees', 150_000n, 0n],
+      ['clearing:inflight', 0n, 100_150_000n],
+    ],
+  ]);
+  for (const journal of journals) {
+    expect(journal.lines.reduce((sum, line) => sum + line.debitMsat, 0n)).toBe(100_150_000n);
+    expect(journal.lines.reduce((sum, line) => sum + line.creditMsat, 0n)).toBe(100_150_000n);
+  }
+  expect(w.node.fundMovingCalls()).toEqual([]);
+  expect(w.node.count('cancelUnpaidInvoice')).toBe(0);
+}
+
 it('CP-034/B1 T-13 a FAILED record with a pending HTLC stays unresolved then settles without reversal', async () => {
   // seedBase's independently declared receiving fixture channel, not inferred
   // from a production route. The final ordinary receipt includes its identity.
   const w = await reconciliation('t13', [failed('FAILURE_REASON_TIMEOUT', 1), succeeded(150_000n, 1, true, '246290604752896')]);
   expect((await w.run()).exit).toBe(7); expect(w.reservation().state).toBe('HELD');
+  expect(w.row()).toMatchObject({ status: 'UNKNOWN', payment_hash: w.hash, actual_fee_msat: null });
   expect(journalTypes(w.path, w.executionId)).not.toContain('REBALANCE_REVERSED');
-  expect((await w.run()).exit).toBe(0); expect(w.row().status).toBe('VERIFIED_SUCCESS');
+  const report = await w.run();
+  expect(report.exit).toBe(9); expect(report.unresolved).toEqual([]);
+  await expectPaidRecovery(w);
   expect(journalTypes(w.path, w.executionId)).toEqual(['REBALANCE_SENT', 'REBALANCE_SETTLED']);
+  expect(w.node.named('observePayment').map(c => c.args[0])).toEqual([w.hash, w.hash]);
   expect(w.node.fundMovingCalls()).toEqual([]);
 });
 
 it('CP-034/B1 T-14 already-paid without preimage stays UNKNOWN until evidence for the same hash appears', async () => {
   const w = await reconciliation('t14', [{ kind: 'AMBIGUOUS', cause: 'already paid without a preimage' }, succeeded(150_000n, 1, true, '246290604752896')]);
   expect((await w.run()).exit).toBe(7); expect(w.row().status).toBe('UNKNOWN'); expect(w.row().payment_hash).toBe(w.hash);
-  expect((await w.run()).exit).toBe(0); expect(w.row().status).toBe('VERIFIED_SUCCESS'); expect(w.row().payment_hash).toBe(w.hash);
+  expect(w.reservation()).toEqual({ state: 'HELD', consumed: null }); expect(w.row().actual_fee_msat).toBeNull();
+  const report = await w.run();
+  expect(report.exit).toBe(9); expect(report.unresolved).toEqual([]);
+  await expectPaidRecovery(w);
+  expect(w.row().status).toBe('VERIFIED_SUCCESS'); expect(w.row().payment_hash).toBe(w.hash);
   expect(w.node.named('observePayment').map(c => c.args[0])).toEqual([w.hash, w.hash]);
   expect(w.node.fundMovingCalls()).toEqual([]);
 });

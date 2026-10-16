@@ -143,22 +143,31 @@
           "$ref": "#/$defs/msat"
         },
         "actual_fee_msat": {
-          "$ref": "#/$defs/msat"
+          "anyOf": [
+            { "$ref": "#/$defs/msat" },
+            { "type": "null" }
+          ]
         },
         "fee_ppm": {
-          "type": "integer",
+          "type": ["integer", "null"],
           "minimum": 0
         },
         "cltv_delta": {
-          "type": "integer",
+          "type": ["integer", "null"],
           "minimum": 0,
           "maximum": 2016
         },
         "source_delta_msat": {
-          "$ref": "#/$defs/signedMsat"
+          "anyOf": [
+            { "$ref": "#/$defs/signedMsat" },
+            { "type": "null" }
+          ]
         },
         "target_delta_msat": {
-          "$ref": "#/$defs/signedMsat"
+          "anyOf": [
+            { "$ref": "#/$defs/signedMsat" },
+            { "type": "null" }
+          ]
         },
         "delta_status": {
           "enum": [
@@ -175,7 +184,21 @@
           },
           "uniqueItems": true
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "delta_status": { "enum": ["MATCH", "MISMATCH"] } },
+            "required": ["delta_status"]
+          },
+          "then": {
+            "properties": {
+              "source_delta_msat": { "$ref": "#/$defs/signedMsat" },
+              "target_delta_msat": { "$ref": "#/$defs/signedMsat" }
+            }
+          }
+        }
+      ]
     }
   }
 }

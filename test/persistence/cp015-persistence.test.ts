@@ -44,8 +44,9 @@ Rules under test (SPEC §4.3 and §6, ARCHITECTURE §7, SECURITY §5):
     link above the state directory is tolerated on POSIX only), as is a database file with more than one hard link.
   - A write that fails inside its transaction is rolled back; the connection stays usable.
   - A read-only handle never returns data older than the last commit: it reads the new state or fails with BUSY.
-  - One channel keeps one row for its whole life: pending (keyed by outpoint, or per peer while uncommitted), open
-    (alias or real scid), closing; a later uncommitted open with the same peer is a new row.
+  - Proven native channel/funding identity keeps one physical row from pending through open to closing. A shared
+    peer alone cannot link an uncommitted observation to a new committed identity; an ambiguous transition refuses
+    atomically. A later uncommitted open after closing is a new row.
 */
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -53,9 +54,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { unlinkFixture } from '../helpers/fixture-links.js';
 import { repoRoot } from '../helpers/cli.js';
+import { loadCore } from '../helpers/cp004-reference.js';
+import { loadLedger, type LedgerDatabase } from '../helpers/cp037-ledger.js';
 import {
   channel, codeOf, count, descriptor, expectOwnerOnly, fileHash, grantDirectoryMutation, grantOthers, listing, loadPersistence, makeOwnerOnlyDir, NODE_ID, PUBKEY, raw,
-  scratch, seeded, sideFiles, type SnapshotInput,
+  scratch, seeded, sideFiles, type Database, type SnapshotInput,
 } from '../helpers/cp015-persistence.js';
 
 // SPEC §6.2 schema v1.
@@ -843,6 +846,17 @@ describe('pre-existing directories are never rewritten', () => {
 });
 
 describe('one channel row for the whole lifecycle', () => {
+  type SnapshotLedgerDatabase = Database & LedgerDatabase & { readonly snapshots: LedgerDatabase['snapshots'] & {
+    readonly storeAll: (channels: readonly SnapshotInput[]) => string[];
+  } };
+  function financialState(db: SnapshotLedgerDatabase, path: string) {
+    const r = raw(path);
+    try {
+      return { channels: r.prepare('SELECT * FROM channels ORDER BY id').all(),
+        snapshots: r.prepare('SELECT * FROM channel_snapshots ORDER BY channel_id, observed_at').all(),
+        journals: db.ledger.journals(), balances: [...db.ledger.balances()].sort(([a], [b]) => a.localeCompare(b)) };
+    } finally { r.close(); }
+  }
   function rows(path: string): { id: string; channel_key: string; scid: string | null; lifecycle_state: string }[] {
     const r = raw(path);
     try { return r.prepare('SELECT id, channel_key, scid, lifecycle_state FROM channels ORDER BY id').all() as never; } finally { r.close(); }
@@ -872,30 +886,78 @@ describe('one channel row for the whole lifecycle', () => {
     expect(all[0]?.lifecycle_state).toBe('CLOSING');
   });
 
-  it('CP-015/B5 a CLN channel keeps one row from uncommitted to closing, and a later open with the same peer is a new row', async () => {
+  it('CP-015/B5 a CLN channel with native funding linkage keeps one row from pending to closing, and a later open with the same peer is a new row', async () => {
     const p = await loadPersistence();
+    const m = await loadLedger();
     const path = join(scratch('cln-life'), 'fluxwarden.db');
     p.openDatabase(path, { readOnly: false }).close();
     const peer = `02${'ab'.repeat(32)}`;
     const outpoint = `${'cd'.repeat(32)}:1`;
-    const db = p.openDatabase(path, { readOnly: false });
+    const db = p.openDatabase(path, { readOnly: false }) as SnapshotLedgerDatabase;
     const ids: string[] = [];
     let later: string;
     try {
       db.nodes.insert({ id: NODE_ID, name: 'cln-m', implementation: 'cln', expectedNetwork: 'regtest', expectedPubkey: PUBKEY });
-      const step = (over: Partial<SnapshotInput>): void => { ids.push(db.channels.upsert(channel({ peerPubkey: peer, ...over }))); };
-      // uncommitted (no channel_id, no funding fields: the normalizer keys it per peer), then committed, locked in, closing
-      step({ channelKey: `uncommitted:${peer}`, scid: null, fundingOutpoint: '', state: 'PENDING', nodeState: 'OPENINGD' });
+      const step = (over: Partial<SnapshotInput>): void => { ids.push(...db.snapshots.storeAll([channel({ peerPubkey: peer, ...over })])); };
+      // The first native committed channel_id and outpoint already exist while awaiting lock-in.
       step({ channelKey: 'e1'.repeat(32), scid: null, fundingOutpoint: outpoint, state: 'PENDING', nodeState: 'CHANNELD_AWAITING_LOCKIN' });
+      const original = financialState(db, path);
+      const opening = original.journals.filter(journal => journal.eventType === 'OPENING');
+      expect(opening).toHaveLength(1);
       step({ channelKey: '109x1x1', scid: '109x1x1', fundingOutpoint: outpoint, state: 'ACTIVE', nodeState: 'CHANNELD_NORMAL' });
       step({ channelKey: '109x1x1', scid: '109x1x1', fundingOutpoint: outpoint, state: 'CLOSING', nodeState: 'ONCHAIN' });
+      const closed = financialState(db, path);
+      expect(closed.journals.filter(journal => journal.eventType === 'OPENING')).toEqual(opening);
+      expect(closed.journals).toEqual(expect.arrayContaining(original.journals));
+      expect(closed.snapshots).toEqual(expect.arrayContaining(original.snapshots));
+      expect(db.ledger.balances().get(m.EQUITY_OPENING_BALANCE)).toBe(-600_000_000n);
+      expect(db.ledger.balances().get(m.channelLocalAccount('cln-m', 'e1'.repeat(32))) ?? 0n).toBe(0n);
+      expect(db.ledger.balances().get(m.channelLocalAccount('cln-m', '109x1x1'))).toBe(600_000_000n);
+      expect(m.runLedgerVerify(db).exitCode).toBe(0);
       later = db.channels.upsert(channel({ peerPubkey: peer, channelKey: `uncommitted:${peer}`, scid: null, fundingOutpoint: '', state: 'PENDING', nodeState: 'OPENINGD' }));
+      expect(db.ledger.journals()).toEqual(closed.journals);
+      expect([...db.ledger.balances()].sort(([a], [b]) => a.localeCompare(b))).toEqual(closed.balances);
     } finally { db.close(); }
+    expect(ids).toHaveLength(3);
     expect(new Set(ids).size).toBe(1);
     expect(later).not.toBe(ids[0]);
     const all = rows(path);
     expect(all).toHaveLength(2);
     expect(all.find(r => r.id === ids[0])?.lifecycle_state).toBe('CLOSING');
+  });
+
+  it('CP-015/B5 an uncommitted CLN observation cannot acquire an unproven new committed identity and refuses without changing financial history', async () => {
+    const p = await loadPersistence();
+    const m = await loadLedger();
+    const { normalizeClnChannel } = await loadCore<{ readonly normalizeClnChannel: (raw: unknown, context: { nodeId: string; observedAt: number; blockHeight: number }) => SnapshotInput }>('normalize');
+    const path = join(scratch('cln-unproven-life'), 'fluxwarden.db');
+    const db = p.openDatabase(path, { readOnly: false }) as SnapshotLedgerDatabase;
+    const context = { nodeId: NODE_ID, observedAt: 1_800_000_000_000, blockHeight: 109 };
+    const common = { peer_id: `02${'ab'.repeat(32)}`, peer_connected: true, opener: 'local',
+      features: ['option_static_remotekey'], to_us_msat: 600_000_000, total_msat: 1_000_000_000 };
+    try {
+      db.nodes.insert({ id: NODE_ID, name: 'cln-m', implementation: 'cln', expectedNetwork: 'regtest', expectedPubkey: PUBKEY });
+      // Native OPENINGD supplies neither channel_id nor funding fields; the later committed observation supplies its own.
+      const uncommitted = normalizeClnChannel({ ...common, state: 'OPENINGD', owner: 'lightning_openingd', status: [] }, context);
+      expect(uncommitted.fundingOutpoint || '').toBe('');
+      expect(db.snapshots.storeAll([uncommitted])).toHaveLength(1);
+      const before = financialState(db, path);
+      expect(before.channels).toHaveLength(1);
+      expect(before.snapshots).toHaveLength(1);
+      expect(before.journals.filter(journal => journal.eventType === 'OPENING')).toHaveLength(1);
+      expect(db.ledger.balances().get(m.EQUITY_OPENING_BALANCE)).toBe(-600_000_000n);
+      expect(m.runLedgerVerify(db).exitCode).toBe(0);
+      const committed = normalizeClnChannel({ ...common, state: 'CHANNELD_NORMAL', owner: 'channeld',
+        channel_id: 'e1'.repeat(32), short_channel_id: '109x1x1', funding_txid: 'cd'.repeat(32), funding_outnum: 1,
+        our_reserve_msat: 10_000_000, their_reserve_msat: 10_000_000, spendable_msat: 580_000_000, receivable_msat: 390_000_000, htlcs: [] },
+      { ...context, observedAt: context.observedAt + 1_000 });
+      let refusal: unknown;
+      try { db.snapshots.storeAll([committed]); } catch (error) { refusal = error; }
+      expect(refusal).toBeInstanceOf(p.PersistenceError);
+      expect(String((refusal as { code?: unknown }).code)).toMatch(/^[A-Z][A-Z_]+$/);
+      expect((refusal as Error).message).toMatch(/channel|identity|ambig|uncommitted|link|pending|collision/i);
+      expect(financialState(db, path)).toEqual(before);
+    } finally { db.close(); }
   });
 
   it('CP-015/B5 uncommitted channels with two different peers are two rows', async () => {

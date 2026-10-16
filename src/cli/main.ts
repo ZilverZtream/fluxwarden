@@ -30,6 +30,8 @@ export interface Deps {
   readonly nodeVersion?: string;
   /** Registers how a long-running command stops at the first signal; the second signal ends the process. */
   readonly onGracefulStop?: (stop: () => void) => void;
+  /** Publishes established payment safety before a command's remaining observations finish. */
+  readonly onSafetyCode?: (code: number) => void;
   /** Output for the daemon's warning lines. */
   readonly daemonOutput?: () => RenderOutput;
 }
@@ -97,7 +99,8 @@ function run(command: Command, deps: Deps): number | Promise<number> {
     default: {
       const controller = new AbortController();
       deps.onGracefulStop?.(() => { controller.abort(); });
-      return workflow(command, io, env, controller.signal);
+      return workflow(command, io, env, controller.signal,
+        deps.onSafetyCode === undefined ? {} : { onSafetyCode: deps.onSafetyCode });
     }
   }
 }
@@ -107,6 +110,12 @@ async function daemon(command: Command, deps: Deps, io: Io): Promise<number> {
   deps.onGracefulStop?.(() => { controller.abort(); });
   const output = deps.daemonOutput?.();
   if (output === undefined) return refuse(io, 'daemon', ExitCode.INVALID_INPUT, null, 'the daemon needs an output channel');
+  try {
+    return await collectDaemon(command, deps, io, controller, output);
+  } finally { await output.finalize(); }
+}
+
+async function collectDaemon(command: Command, deps: Deps, io: Io, controller: AbortController, output: RenderOutput): Promise<number> {
   const silent: Io = { json: true, output: { write: () => undefined, wrote: () => false } };
   let alerts: ReturnType<typeof bootstrapAlerts> | undefined;
   if (command.kind === 'daemon' && !command.collect) {

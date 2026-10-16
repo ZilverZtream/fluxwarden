@@ -356,12 +356,14 @@ export async function reconcileAccounting(input: {
       const side = sides.get(execution.id);
       if (side === undefined) continue;
       for (const name of expected) {
+        const corrections = feeCorrections(input.journals, execution.id, name);
+        const expensedMsat = side.feeMsat + corrections.expensedMsat;
         const sourceRead = read.reads.find(item => item.source === name);
         const found = sourceRead?.records.get(execution.paymentHash);
         const record = found?.unusable === null ? found : undefined;
         comparisons.push({
           executionId: execution.id, node: source.node, source: name, ledgerPrincipalMsat: side.principalMsat,
-          nodePrincipalMsat: name === 'bkpr' ? null : record?.principalMsat ?? null, ledgerFeeMsat: side.feeMsat, nodeFeeMsat: record?.feeMsat ?? null,
+          nodePrincipalMsat: name === 'bkpr' ? null : record?.principalMsat ?? null, ledgerFeeMsat: expensedMsat, nodeFeeMsat: record?.feeMsat ?? null,
         });
         const base = { node: source.node, executionId: execution.id, source: name, reason: null };
         if (found !== undefined && record === undefined) {
@@ -376,24 +378,22 @@ export async function reconcileAccounting(input: {
         if (record.principalMsat !== null && record.principalMsat !== side.principalMsat) {
           differences.push({ ...base, kind: 'principal', ledgerMsat: side.principalMsat, nodeMsat: record.principalMsat });
         }
-        if (record.feeMsat !== side.feeMsat) {
-          differences.push({ ...base, kind: 'fee', ledgerMsat: side.feeMsat, nodeMsat: record.feeMsat });
+        if (record.feeMsat !== expensedMsat) {
+          differences.push({ ...base, kind: 'fee', ledgerMsat: expensedMsat, nodeMsat: record.feeMsat });
         }
         {
-          const corrections = feeCorrections(input.journals, execution.id, name);
-          const expensedMsat = side.feeMsat + corrections.expensedMsat;
-          const identity = `${execution.id}:fee:${side.feeMsat.toString()}:${record.feeMsat.toString()}`;
-          // Agreeing accounting sources describe one economic adjustment, while each observation stays in the report.
-          if (corrected.has(identity)) continue;
+          // Accounting sources describe one economic fee. Keep every observation in the report, but use the first
+          // differing observation for the adjustment; conflicting sources cannot repeatedly undo each other's fees.
+          if (corrected.has(execution.id)) continue;
           if (record.feeMsat === side.feeMsat && corrections.count === 0
             && read.reads.some(other => {
               const observed = other.records.get(execution.paymentHash);
               return observed?.unusable === null && observed.feeMsat !== record.feeMsat;
             })) continue;
+          corrected.add(execution.id);
           if (record.feeMsat !== expensedMsat) {
             const reference = corrections.count === 0 ? `${execution.id}:fee:${name}` : `${execution.id}:fee:${name}:${String(corrections.count + 1)}`;
             journals.push(feeJournal(execution.id, reference, expensedMsat, record.feeMsat, input.occurredAt));
-            corrected.add(identity);
           }
         }
       }

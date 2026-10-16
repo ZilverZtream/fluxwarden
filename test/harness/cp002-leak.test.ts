@@ -415,9 +415,9 @@ it('CP-002/B8 scratch roots are owner-only and linked parents are refused throug
   })).rejects.toThrow();
 });
 
-// D40 preserves the original genuinely empty-suite control even when real reference tests exist.
-// Bug caught: normal empty-suite scripts failing, or substituting a live suite/fabricated success.
-it('CP-002/B15 empty lab and chaos commands succeed while two unavailable capabilities keep their exact refusal', async () => {
+// Preserve the genuinely empty fixture without substituting live tests. Lab keeps
+// its empty-suite success; chaos must fail explicitly when its required matrix is absent.
+it('CP-002/B15 empty lab succeeds, empty chaos fails explicitly, and unavailable capabilities keep their exact refusal', async () => {
   const base = process.env['FLUXWARDEN_TEST_TMP'];
   const npmCli = process.env['npm_execpath'];
   if (!base || !npmCli || !/npm-cli\.js$/.test(npmCli)) throw new Error('private temporary root and npm CLI are required');
@@ -439,8 +439,13 @@ it('CP-002/B15 empty lab and chaos commands succeed while two unavailable capabi
         cwd: fixture, env: childEnv(), encoding: 'utf8', windowsHide: true, timeout: 10000,
       });
       expect(result.error, script).toBeUndefined();
-      expect(result.status, script).toBe(0);
-      expect(`${result.stdout}\n${result.stderr}`, script).toMatch(/No test files found/i);
+      expect(result.status, script).toBe(script === 'test:chaos' ? 1 : 0);
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(output, script).toMatch(/No test files found/i);
+      if (script === 'test:chaos') {
+        expect(output, 'chaos fails for empty selection, not an unrelated exit-1 error').toMatch(/No test files found, exiting with code 1/i);
+        expect(output, 'the clean empty-selection control is not a leak failure').not.toMatch(/leak-check failed/i);
+      }
     }
   } finally {
     // Unlink only the owned fixture junction: keep immutable installed dependencies intact,

@@ -9,5 +9,7 @@ export type {
   TransitionFields, UnresolvedExecution,
 } from './executions.js';
 export { SCHEMA_VERSION } from './schema.js';
+export type { PendingRoutingLayer, RoutingLayerClaim, RoutingLayersRepository } from './routing-layers.js';
+export { sqliteAvailable } from './runtime.js';
 export type { ExecutionRecord, JournalRecord, LedgerBook, LedgerLine, StoredJournal, StoredLine, Transaction } from '../core/ledger.js';
 export type { DemandSource, NewProposal, ProposalAction, ProposalRepository, ProposalStatus, StoredProposal } from './proposals.js';

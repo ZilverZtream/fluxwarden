@@ -135,8 +135,10 @@ export function plan(input: PlanInput): PlanResult {
       const remaining = cooldownRemaining(sourceChannel, targetChannel, input.cooldowns, policy, now);
       if (remaining !== null) { refuse(sourceChannel, targetChannel, 'COOLDOWN_ACTIVE', remaining); continue; }
       if (budgetExhausted) { refuse(sourceChannel, targetChannel, 'BUDGET_EXHAUSTED'); continue; }
-      // INV-14: after sending principal + worst-case fee the source keeps min_channel_reserve_msat.
-      const reserveTerm = source.spendableMsat - policy.fees.max_fee_msat - policy.amounts.min_channel_reserve_msat;
+      // Principal plus the worst-case fee must preserve both the reserve and required outbound liquidity.
+      const outboundTarget = source.outboundTargetMsat ?? 0n;
+      const sourceFloor = outboundTarget > policy.amounts.min_channel_reserve_msat ? outboundTarget : policy.amounts.min_channel_reserve_msat;
+      const reserveTerm = source.spendableMsat - policy.fees.max_fee_msat - sourceFloor;
       const principalMsat = min(source.inboundDeficitMsat, target.inboundSurplusMsat, reserveTerm, policy.amounts.max_principal_msat);
       if (principalMsat < policy.amounts.min_principal_msat) {
         refuse(sourceChannel, targetChannel,

@@ -1,4 +1,4 @@
-// D76, SPEC §9.2/§9.5: observing a previously unreported actual fee debits
+// SPEC §9.2/§9.5: observing a previously unreported actual fee debits
 // routing expense and credits recon:difference. A balanced journal with those
 // directions reversed cannot prove the observed expense, even if amounts match.
 import { expect, it } from 'vitest';
@@ -40,7 +40,7 @@ it('CP-037/B5 a balanced reversed fee-report correction fails verification while
 });
 
 it('CP-037/B5 a terminal success with an unreported actual fee cannot validate a positive routing expense', async () => {
-  // D76's terminal unreported-fee rule must remain strict when the legacy
+  // The terminal unreported-fee rule must remain strict when the legacy
   // UNKNOWN status-only fixture keeps its distinct null-field semantics.
   const m = await loadLedger();
   const reportedBook = book(false);

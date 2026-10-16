@@ -43,7 +43,8 @@ Interface: src/reconciler/accounting.ts (depends on src/core and src/ledger only
     }): Promise<AccountingReport>;
 
     Ledger side: an execution is compared when its REBALANCE_SETTLED journal has occurredAt in the window.
-      Ledger principal = Σ debits of its `channel:` lines; ledger fee = Σ debits of `expense:routing_fees` (0 when absent).
+      Ledger principal = Σ debits of its `channel:` lines; ledger fee = its settled expense plus the signed
+      expense changes in its durable RECON_DIFFERENCE fee corrections (0 when absent).
     A node answer is evidence, never trusted blindly: an LND payment repeated with the same payment_index counts once
       (lnd#9410); a listsendpays part whose payment_hash is not the hash asked for is ignored; a duplicated bookkeeper
       event (same account, payment_id, part_id, debit, credit and timestamp; cln#9487) counts once.
@@ -70,11 +71,11 @@ Interface: src/reconciler/accounting.ts (depends on src/core and src/ledger only
       without any REBALANCE_SETTLED journal      → missing-in-ledger {ledgerMsat: null, nodeMsat: node principal}
       incomplete read                            → incomplete {executionId: null, ledgerMsat: null, nodeMsat: null, reason}
       `reason` is null except for incomplete.
-    Journals: every fee difference from listpayments, listsendpays or bkpr posts the part of d = node fee − ledger fee
-      (ledger fee from the REBALANCE_SETTLED journal) that earlier RECON_DIFFERENCE fee corrections of the same
-      execution across all accounting sources (found in input.journals) have not yet posted; nothing when that remainder is 0. One
+    Journals: an available fee answer from listpayments, listsendpays or bkpr can post d = node fee − current ledger fee.
+      Durable RECON_DIFFERENCE fee corrections of the same execution across all accounting sources are already
+      included in that current fee; nothing when d is 0. Contradictory fresh sources retain diagnostics. One
       RECON_DIFFERENCE journal, executionId set, occurredAt = input.occurredAt, reference unique per execution, source
-      and node fee answer (e.g. `${executionId}:fee:${source}:${nodeFee}`), with r the remainder:
+      and node fee answer (e.g. `${executionId}:fee:${source}:${nodeFee}`), with r the current difference:
         r > 0: [Dr expense:routing_fees r, Cr recon:difference r];  r < 0: [Dr recon:difference −r, Cr expense:routing_fees −r].
       So a rerun with the same answer posts nothing, and a changed answer posts only the change.
       SPEC §9.4 includes bookkeeper fee differences in these balanced, idempotent RECON_DIFFERENCE postings.
@@ -238,8 +239,11 @@ describe('reconcile against node accounting', () => {
     expect(db.ledger.balances().get(m.RECON_DIFFERENCE)).toBe(-1n);
 
     const second = await runReconcile(input);
-    expect(second.exitCode).toBe(9);
-    expect(second.report.accounting?.differences).toHaveLength(1);
+    expect(second.exitCode).toBe(0);
+    expect(second.report.accounting?.comparisons).toEqual([{
+      executionId: EXEC, node: 'lnd-r', source: 'listpayments', ledgerPrincipalMsat: P, nodePrincipalMsat: P, ledgerFeeMsat: F + 1n, nodeFeeMsat: F + 1n,
+    }]);
+    expect(second.report.accounting?.differences).toEqual([]);
     expect(reconJournals(db)).toHaveLength(1);
     expect(second.report.postedJournalIds).toEqual([]);
     expect(db.ledger.balances().get(m.RECON_DIFFERENCE)).toBe(-1n);
@@ -277,7 +281,13 @@ describe('reconcile against node accounting', () => {
     expect(result.report.postedJournalIds).toEqual([posted[0]?.id]);
     const replay = await runReconcile(input);
     expect(replay.exitCode).toBe(9);
-    expect(replay.report.accounting?.differences).toEqual(result.report.accounting?.differences);
+    expect(replay.report.accounting?.comparisons).toEqual([
+      { executionId: EXEC, node: 'cln-m', source: 'bkpr', ledgerPrincipalMsat: P, nodePrincipalMsat: null, ledgerFeeMsat: 0n, nodeFeeMsat: source === 'bkpr' ? 0n : F },
+      { executionId: EXEC, node: 'cln-m', source: 'listsendpays', ledgerPrincipalMsat: P, nodePrincipalMsat: P, ledgerFeeMsat: 0n, nodeFeeMsat: source === 'listsendpays' ? 0n : F },
+    ]);
+    expect(replay.report.accounting?.differences).toEqual([
+      { kind: 'fee', node: 'cln-m', executionId: EXEC, source: source === 'bkpr' ? 'listsendpays' : 'bkpr', ledgerMsat: 0n, nodeMsat: F, reason: null },
+    ]);
     expect(replay.report.postedJournalIds).toEqual([]);
     expect(reconJournals(db)).toEqual(posted);
     expect(db.ledger.balances().get(m.EXPENSE_ROUTING_FEES)).toBe(0n);
@@ -318,9 +328,12 @@ describe('reconcile against node accounting', () => {
       expect(m.runLedgerVerify(db).exitCode).toBe(0);
 
       const replay = await runReconcile(input);
-      expect(replay.exitCode).toBe(9);
-      expect(replay.report.accounting?.comparisons).toEqual(first.report.accounting?.comparisons);
-      expect(replay.report.accounting?.differences).toEqual(first.report.accounting?.differences);
+      expect(replay.exitCode).toBe(0);
+      expect(replay.report.accounting?.comparisons).toEqual([
+        { executionId: EXEC, node: 'cln-m', source: 'bkpr', ledgerPrincipalMsat: P, nodePrincipalMsat: null, ledgerFeeMsat: F + 1n, nodeFeeMsat: F + 1n },
+        { executionId: EXEC, node: 'cln-m', source: 'listsendpays', ledgerPrincipalMsat: P, nodePrincipalMsat: P, ledgerFeeMsat: F + 1n, nodeFeeMsat: F + 1n },
+      ]);
+      expect(replay.report.accounting?.differences).toEqual([]);
       expect(replay.report.postedJournalIds).toEqual([]);
       expect(reconJournals(db)).toEqual(posted);
       expect(db.ledger.balances().get(m.EXPENSE_ROUTING_FEES)).toBe(F + 1n);
@@ -361,26 +374,37 @@ describe('reconcile against node accounting', () => {
       }
       expect(m.runLedgerVerify(db).exitCode).toBe(0);
     };
-    const checkObservations = (result: Awaited<ReturnType<typeof run>>, fee: bigint, mode: 'both' | 'listsendpays') => {
-      expect(result.exitCode).toBe(9);
+    const checkObservations = (result: Awaited<ReturnType<typeof run>>, ledgerFee: bigint, fee: bigint, mode: 'both' | 'listsendpays', exitCode: 0 | 9) => {
+      expect(result.exitCode).toBe(exitCode);
       expect(result.report.verify.ok).toBe(true);
       expect(result.report.accounting?.comparisons.map(row => [row.source, row.ledgerFeeMsat, row.nodeFeeMsat])).toEqual([
-        ['bkpr', baseFee, mode === 'both' ? fee : null], ['listsendpays', baseFee, fee],
+        ['bkpr', ledgerFee, mode === 'both' ? fee : null], ['listsendpays', ledgerFee, fee],
       ]);
+      expect(result.report.accounting?.differences.filter(row => row.kind === 'fee')).toEqual(fee === ledgerFee ? [] :
+        (mode === 'both' ? ['bkpr', 'listsendpays'] : ['listsendpays']).map(source => ({
+          kind: 'fee', node: 'cln-m', executionId: EXEC, source, ledgerMsat: ledgerFee, nodeMsat: fee, reason: null,
+        })));
+      if (mode === 'listsendpays') {
+        expect(result.report.accounting?.differences).toContainEqual(expect.objectContaining({ kind: 'incomplete', source: 'bkpr' }));
+      } else if (fee === ledgerFee) {
+        expect(result.report.accounting?.differences).toEqual([]);
+      }
     };
     try {
       expect(original.filter(journal => journal.eventType === 'REBALANCE_SENT')).toHaveLength(1);
       expect(original.filter(journal => journal.eventType === 'REBALANCE_SETTLED')).toHaveLength(1);
       expect(m.runLedgerVerify(db).exitCode).toBe(0);
       const first = await run(150n, initialMode);
-      checkObservations(first, 150n, initialMode);
+      checkObservations(first, baseFee, 150n, initialMode, 9);
       expect(first.report.postedJournalIds).toHaveLength(1);
       checkBook(150n, 1);
-      expect((await run(150n, initialMode)).report.postedJournalIds).toEqual([]);
+      const firstReplay = await run(150n, initialMode);
+      checkObservations(firstReplay, 150n, 150n, initialMode, initialMode === 'both' ? 0 : 9);
+      expect(firstReplay.report.postedJournalIds).toEqual([]);
       checkBook(150n, 1);
 
       const switched = await run(nextFee, nextMode);
-      checkObservations(switched, nextFee, nextMode);
+      checkObservations(switched, 150n, nextFee, nextMode, 9);
       expect(switched.report.postedJournalIds).toHaveLength(1);
       const correction = reconJournals(db).find(journal => journal.id === switched.report.postedJournalIds[0]);
       const delta = nextFee - 150n;
@@ -388,11 +412,13 @@ describe('reconcile against node accounting', () => {
         ? [[m.EXPENSE_ROUTING_FEES, delta, 0n], [m.RECON_DIFFERENCE, 0n, delta]]
         : [[m.RECON_DIFFERENCE, -delta, 0n], [m.EXPENSE_ROUTING_FEES, 0n, -delta]]);
       checkBook(nextFee, 2);
-      expect((await run(nextFee, nextMode)).report.postedJournalIds).toEqual([]);
+      const switchedReplay = await run(nextFee, nextMode);
+      checkObservations(switchedReplay, nextFee, nextFee, nextMode, nextMode === 'both' ? 0 : 9);
+      expect(switchedReplay.report.postedJournalIds).toEqual([]);
       checkBook(nextFee, 2);
 
       const restored = await run(nextFee, 'both');
-      checkObservations(restored, nextFee, 'both');
+      checkObservations(restored, nextFee, nextFee, 'both', 0);
       expect(restored.report.postedJournalIds).toEqual([]);
       expect((await run(nextFee, 'both')).report.postedJournalIds).toEqual([]);
       checkBook(nextFee, 2);
@@ -584,8 +610,9 @@ describe('reconcile against node accounting: hostile and changing node answers',
     expect((await run(F + 7n)).exitCode).toBe(9);
     expect(db.ledger.balances().get(m.EXPENSE_ROUTING_FEES)).toBe(F + 7n);
     const second = await run(F + 9n);
+    expect(second.exitCode).toBe(9);
     expect(second.report.accounting?.differences).toEqual([
-      { kind: 'fee', node: 'lnd-r', executionId: EXEC, source: 'listpayments', ledgerMsat: F, nodeMsat: F + 9n, reason: null },
+      { kind: 'fee', node: 'lnd-r', executionId: EXEC, source: 'listpayments', ledgerMsat: F + 7n, nodeMsat: F + 9n, reason: null },
     ]);
     expect(db.ledger.balances().get(m.EXPENSE_ROUTING_FEES)).toBe(F + 9n);
     expect(db.ledger.balances().get(m.RECON_DIFFERENCE)).toBe(-9n);
@@ -595,6 +622,11 @@ describe('reconcile against node accounting: hostile and changing node answers',
     expect(amounts).toContainEqual([[m.EXPENSE_ROUTING_FEES, 2n, 0n], [m.RECON_DIFFERENCE, 0n, 2n]]);
     expect(amounts).toContainEqual([[m.EXPENSE_ROUTING_FEES, 7n, 0n], [m.RECON_DIFFERENCE, 0n, 7n]]);
     const third = await run(F + 9n);
+    expect(third.exitCode).toBe(0);
+    expect(third.report.accounting?.comparisons).toEqual([{
+      executionId: EXEC, node: 'lnd-r', source: 'listpayments', ledgerPrincipalMsat: P, nodePrincipalMsat: P, ledgerFeeMsat: F + 9n, nodeFeeMsat: F + 9n,
+    }]);
+    expect(third.report.accounting?.differences).toEqual([]);
     expect(third.report.postedJournalIds).toEqual([]);
     expect(reconJournals(db)).toHaveLength(2);
     expect(m.verifyLedger({ journals: db.ledger.journals(), balances: db.ledger.balances(), executions: db.ledger.executions() }).ok).toBe(true);

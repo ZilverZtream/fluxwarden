@@ -7,8 +7,8 @@
 // files are admitted and protected through a held native handle. This is the only module that starts
 // a child process.
 import { execFileSync } from 'node:child_process';
-import { fchmodSync, fstatSync, lstatSync } from 'node:fs';
-import { win32 } from 'node:path';
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import { resolve, win32 } from 'node:path';
 
 export type OwnerOnlyKind = 'file' | 'directory';
 
@@ -154,7 +154,7 @@ export function restrictToOwner(path: string, kind: OwnerOnlyKind, target: Owner
 // microsoft/referencesource mscorlib/system/io/{filestream,directory}.cs.
 const CREATE_PRIVATE_OBJECT = [
   "$ErrorActionPreference='Stop'; Import-Module Microsoft.PowerShell.Utility, Microsoft.PowerShell.Security;",
-  '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $request=ConvertFrom-Json ([Console]::In.ReadToEnd()); $path=$request.path;',
+  "[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $inputJson=[Console]::In.ReadToEnd(); $multiple=$inputJson.TrimStart().StartsWith('['); $requests=ConvertFrom-Json $inputJson; $answers=@(); foreach ($request in $requests) { $path=$request.path;",
   "$file=$request.operation -eq 'create-empty-file'; if (!$file -and $request.operation -ne 'create-directory') { throw 'invalid creation operation' };",
   "$parent=[IO.Path]::GetDirectoryName($path); if (![IO.Directory]::Exists($parent) -or ([IO.File]::GetAttributes($parent) -band [IO.FileAttributes]::ReparsePoint)) { throw 'invalid creation parent' };",
   '$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; $flags=if ($file) { [Security.AccessControl.InheritanceFlags]::None } else { [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit };',
@@ -163,57 +163,74 @@ const CREATE_PRIVATE_OBJECT = [
   '$created=$true; $stream=$null; try {',
   'if ($file) { try { $stream=[IO.FileStream]::new($path,[IO.FileMode]::CreateNew,[Security.AccessControl.FileSystemRights]::FullControl,[IO.FileShare]::None,4096,[IO.FileOptions]::None,$security) } catch {',
   '$nativeError=$_.Exception; while ($nativeError.InnerException) { $nativeError=$nativeError.InnerException }; $code=$nativeError.HResult -band 65535;',
-  `if ($nativeError -is [IO.IOException] -and ($code -eq 80 -or $code -eq 183) -and [IO.File]::Exists($path) -and !([IO.File]::GetAttributes($path) -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))) { [Console]::Out.Write('{"created":false}'); return }; throw;`,
+  `if ($nativeError -is [IO.IOException] -and ($code -eq 80 -or $code -eq 183) -and [IO.File]::Exists($path) -and !([IO.File]::GetAttributes($path) -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))) { $answers+=@{created=$false}; continue }; throw;`,
   "}; if ($stream.Length -ne 0 -or ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint)) { throw 'invalid created file' }; $acl=$stream.GetAccessControl();",
   '} else { $created=![IO.Directory]::Exists($path); if ([IO.File]::Exists($path) -or ([IO.Directory]::Exists($path) -and ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint))) { throw \'invalid created directory\' }; [IO.Directory]::CreateDirectory($path,$security) | Out-Null; $acl=[IO.Directory]::GetAccessControl($path) };',
   '$sddl=$acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access); $native=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0);',
   "$entries=[regex]::Matches($sddl,'\\([^()]*\\)'); if ($null -ne $native.DiscretionaryAcl -and $entries.Count -eq $native.DiscretionaryAcl.Count) { for ($index=$entries.Count-1; $index -ge 0; $index--) { $entry=$entries[$index]; $ace=$native.DiscretionaryAcl[$index]; $fields=$entry.Value.Substring(1,$entry.Length-2).Split(';'); if ($fields.Length -ne 6 -or $ace -isnot [Security.AccessControl.KnownAce]) { throw 'unsupported native access entry' }; $fields[5]=$ace.SecurityIdentifier.Value; $sddl=$sddl.Remove($entry.Index,$entry.Length).Insert($entry.Index,'('+($fields -join ';')+')') } };",
-  '$answer=@{created=$created;ownerSid=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;sddl=$sddl}; if ($file) { $answer.length=$stream.Length }; ConvertTo-Json -Compress -InputObject $answer;',
+  '$answer=@{created=$created;ownerSid=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;sddl=$sddl}; if ($file) { $answer.length=$stream.Length }; $answers+=$answer;',
   '} finally { if ($stream) { $stream.Dispose() } }',
+  '}; if ($multiple) { ConvertTo-Json -Compress -InputObject @($answers) } else { ConvertTo-Json -Compress -InputObject $answers[0] }',
 ].join(' ');
 
-function createPrivateObject(path: string, kind: OwnerOnlyKind): boolean {
+function createPrivateObjects(paths: readonly string[], kind: OwnerOnlyKind, multiple: boolean): boolean[] {
   if (!windows) throw new Error('owner-only: native creation is available on Windows only');
-  if (typeof path !== 'string' || !win32.isAbsolute(path)) throw new Error('owner-only: an absolute creation path is required');
-  const input = JSON.stringify({ operation: kind === 'file' ? 'create-empty-file' : 'create-directory', path });
+  if (paths.length > 512 || new Set(paths).size !== paths.length) throw new Error('owner-only: invalid creation batch');
+  if (paths.some(path => typeof path !== 'string' || !win32.isAbsolute(path))) throw new Error('owner-only: an absolute creation path is required');
+  const requests = paths.map(path => ({ operation: kind === 'file' ? 'create-empty-file' : 'create-directory', path }));
+  const input = JSON.stringify(multiple ? requests : requests[0]);
   if (Buffer.byteLength(input, 'utf8') > 262_144) throw new Error('owner-only: native creation exceeds its input bound');
-  const parent = win32.dirname(path);
-  const beforeParent = lstatSync(parent, { throwIfNoEntry: false });
-  const before = lstatSync(path, { throwIfNoEntry: false });
-  if (beforeParent === undefined || !beforeParent.isDirectory() || beforeParent.isSymbolicLink()
-    || (before !== undefined && (before.isSymbolicLink() || (kind === 'file' ? !before.isFile() : !before.isDirectory())))) {
-    throw new Error('owner-only: invalid native creation path');
-  }
+  const objects = paths.map(path => {
+    const parent = win32.dirname(path);
+    const beforeParent = lstatSync(parent, { throwIfNoEntry: false });
+    const before = lstatSync(path, { throwIfNoEntry: false });
+    if (beforeParent === undefined || !beforeParent.isDirectory() || beforeParent.isSymbolicLink()
+      || (before !== undefined && (before.isSymbolicLink() || (kind === 'file' ? !before.isFile() : !before.isDirectory())))) {
+      throw new Error('owner-only: invalid native creation path');
+    }
+    return { path, parent, before, beforeParent };
+  });
+  if (objects.length === 0) return [];
   const sid = currentUserSid();
-  const value: unknown = JSON.parse(run('WindowsPowerShell\\v1.0\\powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', CREATE_PRIVATE_OBJECT], input));
-  const afterParent = lstatSync(parent, { throwIfNoEntry: false });
-  const after = lstatSync(path, { throwIfNoEntry: false });
-  if (afterParent === undefined || afterParent.isSymbolicLink() || !afterParent.isDirectory()
-    || afterParent.dev !== beforeParent.dev || afterParent.ino !== beforeParent.ino
-    || after === undefined || after.isSymbolicLink() || (kind === 'file' ? !after.isFile() : !after.isDirectory())
-    || (before !== undefined && (after.dev !== before.dev || after.ino !== before.ino))) {
-    throw new Error('owner-only: native creation path changed');
-  }
-  if (value === null || typeof value !== 'object' || !('created' in value) || typeof value.created !== 'boolean') {
-    throw new Error('owner-only: invalid native creation result');
-  }
-  if (kind === 'file' && !value.created) return false;
-  if (!('ownerSid' in value) || typeof value.ownerSid !== 'string' || !('sddl' in value) || typeof value.sddl !== 'string'
-    || !isOwnerOnlySecurityDescriptor(value.sddl, value.ownerSid, sid, kind)
-    || (kind === 'file' && (!('length' in value) || value.length !== 0 || after.size !== 0 || after.nlink !== 1 || before !== undefined))) {
-    throw new Error('owner-only: invalid native creation security');
-  }
-  return value.created;
+  const parsed: unknown = JSON.parse(run('WindowsPowerShell\\v1.0\\powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', CREATE_PRIVATE_OBJECT], input));
+  const values = multiple ? parsed : [parsed];
+  if (!Array.isArray(values) || values.length !== objects.length) throw new Error('owner-only: invalid native creation results');
+  return objects.map(({ path, parent, before, beforeParent }, index) => {
+    const value: unknown = values[index];
+    const afterParent = lstatSync(parent, { throwIfNoEntry: false });
+    const after = lstatSync(path, { throwIfNoEntry: false });
+    if (afterParent === undefined || afterParent.isSymbolicLink() || !afterParent.isDirectory()
+      || afterParent.dev !== beforeParent.dev || afterParent.ino !== beforeParent.ino
+      || after === undefined || after.isSymbolicLink() || (kind === 'file' ? !after.isFile() : !after.isDirectory())
+      || (before !== undefined && (after.dev !== before.dev || after.ino !== before.ino))) {
+      throw new Error('owner-only: native creation path changed');
+    }
+    if (value === null || typeof value !== 'object' || !('created' in value) || typeof value.created !== 'boolean') {
+      throw new Error('owner-only: invalid native creation result');
+    }
+    if (kind === 'file' && !value.created) return false;
+    if (!('ownerSid' in value) || typeof value.ownerSid !== 'string' || !('sddl' in value) || typeof value.sddl !== 'string'
+      || !isOwnerOnlySecurityDescriptor(value.sddl, value.ownerSid, sid, kind)
+      || (kind === 'file' && (!('length' in value) || value.length !== 0 || after.size !== 0 || after.nlink !== 1 || before !== undefined))) {
+      throw new Error('owner-only: invalid native creation security');
+    }
+    return value.created;
+  });
 }
 
 /** Creates an empty protected file with CreateNew, or reports an existing regular-file collision. */
 export function createOwnerOnlyEmptyFile(path: string): boolean {
-  return createPrivateObject(path, 'file');
+  return createPrivateObjects([path], 'file', false)[0] === true;
+}
+
+/** Batches native startup only; each file still uses exclusive CreateNew and held DACL readback. */
+export function createOwnerOnlyEmptyFiles(paths: readonly string[]): boolean[] {
+  return createPrivateObjects(paths, 'file', true);
 }
 
 /** Creates only the requested protected directory; an existing directory is inspected without mutation. */
-export function createOwnerOnlyDirectory(path: string): void {
-  createPrivateObject(path, 'directory');
+export function createOwnerOnlyDirectory(path: string): boolean {
+  return createPrivateObjects([path], 'directory', false)[0] === true;
 }
 
 // This operation opens only an existing file. The held handle admits its identity, owner and full
@@ -298,4 +315,77 @@ export function restrictOwnerOnlyCreatedFile(path: string, expectedUserSid: stri
     || !isOwnerOnlySecurityDescriptor(value.sddl, value.ownerSid, expectedUserSid, 'file')) {
     throw new Error('owner-only: invalid created-file protection read-back');
   }
+}
+
+// A read-only FileStream holds the object exclusively while its owner, DACL, native identity and
+// bounded bytes are inspected. The same existing native identity bridge is used as above.
+// microsoft/referencesource mscorlib/system/io/filestream.cs: GetAccessControl and Read.
+const READ_PRIVATE_FILE = [
+  "$ErrorActionPreference='Stop'; Import-Module Microsoft.PowerShell.Utility;",
+  '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); $request=ConvertFrom-Json ([Console]::In.ReadToEnd());',
+  "$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; if ($user.Value -ne $request.expectedUserSid) { throw 'unexpected native identity' };",
+  "$nativeType=[System.Management.Automation.PSObject].Assembly.GetType('Microsoft.PowerShell.Commands.InternalSymbolicLinkLinkCodeMethods'); $method=$nativeType.GetMethod('GetFileInformationByHandle',[Reflection.BindingFlags]'NonPublic,Public,Static'); $infoType=$method.GetParameters()[1].ParameterType.GetElementType();",
+  'function AssertHeld($stream) { $arguments=[object[]]@($stream.SafeFileHandle.DangerousGetHandle(),[Activator]::CreateInstance($infoType));',
+  "if (!$method.Invoke($null,$arguments)) { throw 'held identity query failed' }; $info=$arguments[1]; $culture=[Globalization.CultureInfo]::InvariantCulture;",
+  "$device=$info.VolumeSerialNumber.ToString($culture); $hex=$info.FileIndexHigh.ToString('x8')+$info.FileIndexLow.ToString('x8'); $fileId=[UInt64]::Parse($hex,[Globalization.NumberStyles]::HexNumber,$culture).ToString($culture);",
+  "if ($device -ne $request.expectedDevice -or $fileId -ne $request.expectedFileId -or $info.NumberOfLinks -ne 1 -or ($info.FileAttributes -band 1040) -or $stream.Length -gt $request.maxBytes) { throw 'invalid held file' };",
+  "$acl=$stream.GetAccessControl(); if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user.Value) { throw 'foreign native owner' };",
+  '$sddl=$acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access); $raw=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0);',
+  "$entries=[regex]::Matches($sddl,'\\([^()]*\\)'); if ($null -eq $raw.DiscretionaryAcl -or $entries.Count -ne $raw.DiscretionaryAcl.Count -or $sddl -notmatch '^D:[A-Z]*(?:\\([^()]*\\))*$') { throw 'invalid native access list' };",
+  'for ($index=0; $index -lt $entries.Count; $index++) { $entry=$entries[$index]; $ace=$raw.DiscretionaryAcl[$index];',
+  "$fields=$entry.Value.Substring(1,$entry.Length-2).Split(';'); if ($fields.Length -ne 6 -or $ace -isnot [Security.AccessControl.KnownAce] -or $fields[0] -notin @('A','D','OA','OD')) { throw 'unsupported native access entry' };",
+  "if ($fields[0] -in @('A','OA') -and $ace.SecurityIdentifier.Value -notin @($user.Value,'S-1-5-18','S-1-5-32-544')) { throw 'foreign native access grant' } } };",
+  '$rights=[Security.AccessControl.FileSystemRights]::Read -bor [Security.AccessControl.FileSystemRights]::ReadPermissions -bor [Security.AccessControl.FileSystemRights]::Synchronize;',
+  '$stream=$null; try { $stream=[IO.FileStream]::new($request.path,[IO.FileMode]::Open,$rights,[IO.FileShare]::None,4096,[IO.FileOptions]::None,$null); AssertHeld $stream;',
+  "$bytes=[byte[]]::new($request.maxBytes+1); $length=0; do { $read=$stream.Read($bytes,$length,$bytes.Length-$length); $length+=$read; if ($length -gt $request.maxBytes) { throw 'file exceeds its bound' } } while ($read -ne 0);",
+  'AssertHeld $stream; ConvertTo-Json -Compress -InputObject @{bytes=[Convert]::ToBase64String($bytes,0,$length);device=$request.expectedDevice;fileId=$request.expectedFileId};',
+  '} finally { if ($stream) { $stream.Dispose() } }',
+].join(' ');
+
+/** Reads bounded bytes from the same real owner-only file object that is admitted; changes nothing. */
+export function readOwnerOnlyFile(path: string, maxBytes: number): Uint8Array {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 65_536) throw new Error('owner-only: invalid read bound');
+  const absolute = resolve(path);
+  const before = lstatSync(absolute, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > BigInt(maxBytes)) throw new Error('owner-only: invalid read object');
+  const unchanged = (): void => {
+    const after = lstatSync(absolute, { bigint: true });
+    if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1n || after.dev !== before.dev || after.ino !== before.ino || after.size > BigInt(maxBytes)) {
+      throw new Error('owner-only: read object changed');
+    }
+  };
+  if (windows) {
+    const input = JSON.stringify({ path: absolute, maxBytes, expectedUserSid: currentUserSid(), expectedDevice: before.dev.toString(), expectedFileId: before.ino.toString() });
+    if (Buffer.byteLength(input, 'utf8') > 262_144) throw new Error('owner-only: read request exceeds its bound');
+    const value: unknown = JSON.parse(run('WindowsPowerShell\\v1.0\\powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', READ_PRIVATE_FILE], input));
+    unchanged();
+    if (value === null || typeof value !== 'object' || !('bytes' in value) || typeof value.bytes !== 'string'
+      || !('device' in value) || value.device !== before.dev.toString() || !('fileId' in value) || value.fileId !== before.ino.toString()
+      || value.bytes.length > 4 * Math.ceil(maxBytes / 3) || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.bytes)) {
+      throw new Error('owner-only: invalid held read result');
+    }
+    const bytes = Buffer.from(value.bytes, 'base64');
+    if (bytes.length > maxBytes) throw new Error('owner-only: read exceeds its bound');
+    return bytes;
+  }
+  const fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const admit = (): void => {
+      const held = fstatSync(fd, { bigint: true });
+      if (!held.isFile() || held.nlink !== 1n || held.dev !== before.dev || held.ino !== before.ino || held.size > BigInt(maxBytes)
+        || (held.mode & 0o077n) !== 0n || held.uid !== BigInt(process.getuid?.() ?? -1)) throw new Error('owner-only: invalid held read object');
+    };
+    admit();
+    const bytes = Buffer.alloc(maxBytes + 1);
+    let length = 0;
+    for (;;) {
+      const read = readSync(fd, bytes, length, bytes.length - length, length);
+      length += read;
+      if (length > maxBytes) throw new Error('owner-only: read exceeds its bound');
+      if (read === 0) break;
+    }
+    admit();
+    unchanged();
+    return bytes.subarray(0, length);
+  } finally { closeSync(fd); }
 }

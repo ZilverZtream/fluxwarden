@@ -241,7 +241,7 @@ jobs:
         run: |
           mkdir -m 700 "$FLUXWARDEN_TEST_TMP" "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
           printf '%s\n' "FLUXWARDEN_TEST_TMP=$FLUXWARDEN_TEST_TMP" "FLUXWARDEN_SENTINEL_DIR=$FLUXWARDEN_SENTINEL_DIR" "FLUXWARDEN_EVIDENCE_DIR=$FLUXWARDEN_EVIDENCE_DIR" >> "$GITHUB_ENV"
-      - run: npm run test:chaos
+      - run: npm run test:chaos -- --reporter=default --reporter=json --outputFile.json "$FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json"
       - name: Scan chaos evidence
         if: always()
         id: evidence-scan

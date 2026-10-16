@@ -1,4 +1,4 @@
-// D76: expiry blocks new sends, while already-paid evidence remains financial
+// INV-04/05: expiry blocks new sends, while already-paid evidence remains financial
 // truth. Lost invoice-creation acknowledgement, then ALREADY_PAID at cleanup,
 // must recover through ordinary read-only observations without another send.
 import { createHash, generateKeyPairSync, sign, verify } from 'node:crypto';

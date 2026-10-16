@@ -2,10 +2,9 @@
 // out of its Secret container: to sign, and to write a newly generated key to an owner-only file.
 // No function here returns the key's bytes or passes them to a caller.
 import { createPrivateKey, createPublicKey, sign, type KeyObject } from 'node:crypto';
-import { readFileSync, lstatSync } from 'node:fs';
 import type { Msat } from '../core/money.js';
 import { revealSecret, Secret } from '../core/secret.js';
-import { onlyOwnerAccess } from '../persistence/owner-files.js';
+import { readOwnerOnlyFile } from '../platform/owner-only.js';
 import { writeOwnerOnlyFile, type OwnerOnlyWrite } from '../output/private-file.js';
 import { ApprovalError } from './errors.js';
 import { findPublicKey, keyIdOf, rawPublicKey } from './keys.js';
@@ -26,10 +25,7 @@ export interface ApprovalRequest {
 
 function readSigningKey(path: string): Secret {
   try {
-    const stat = lstatSync(path);
-    const privateMode = process.platform === 'win32' ? onlyOwnerAccess(path) : (stat.mode & 0o077) === 0 && stat.uid === process.getuid?.();
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096 || !privateMode) throw new ApprovalError(2, 'INVALID_KEY');
-    return new Secret(readFileSync(path));
+    return new Secret(readOwnerOnlyFile(path, 4096));
   } catch { throw new ApprovalError(2, 'INVALID_KEY'); }
 }
 

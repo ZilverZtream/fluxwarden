@@ -9,11 +9,13 @@ import type { Environment } from '../cli/connect.js';
 import { resolveConnection } from '../cli/connect.js';
 import { parseDuration, readBoundedText, ConfigError, type Config, type NodeConfig } from '../config/config.js';
 import type { ExecutionAdapter, PreflightAdapter, ExecutionPolicy, NodeCapability } from '../core/execution.js';
+import { CredentialFileError } from '../core/node.js';
 import { parseAmount, type Msat } from '../core/money.js';
 import { scidToChanId } from '../core/scid.js';
 import { ULID, ulid } from '../core/ulid.js';
 import { prepareExecution } from '../executor/preflight.js';
 import { dispatchExecution } from '../executor/dispatch.js';
+import { bootstrapAlerts } from '../daemon/bootstrap.js';
 import { openClnController } from '../node-cln/controller.js';
 import { openLndController } from '../node-lnd/controller.js';
 import { LND_FINAL_CLTV_DELTA } from '../node-lnd/execute.js';
@@ -76,12 +78,12 @@ export function selectNodes(config: Config, name: string | null): readonly NodeC
   return nodes;
 }
 
-export async function controller(node: NodeConfig, config: Config, session: Handshake) {
+export async function controller(node: NodeConfig, config: Config, session: Handshake, clock: { now(): number } = { now: () => Date.now() }) {
   const connection = session.connection;
   const payment = node.implementation === 'cln'
     ? await openClnController({ ...connection.endpoint, tlsCertPath: connection.tlsCertPath, runePath: connection.credentialPath, timeoutMs: Math.min(30_000, config.attemptDeadlineMs) }, node.expectedPubkey, config.attemptDeadlineMs)
     : await openLndController({ ...connection.endpoint, tlsCertPath: connection.tlsCertPath, macaroonPath: connection.credentialPath }, config.attemptDeadlineMs);
-  const listChannels = () => session.reader.listChannels({ nodeId: session.rowId, observedAt: Date.now(), blockHeight: session.result.identity.blockHeight });
+  const listChannels = () => session.reader.listChannels({ nodeId: session.rowId, observedAt: clock.now(), blockHeight: session.result.identity.blockHeight });
   const capabilities = new Set<NodeCapability>();
   for (const capability of ['CHANNEL_READ', 'PAYMENT_READ', 'INVOICE_CREATE', 'INVOICE_CANCEL', 'PAYMENT_TRACK'] as const) {
     if (session.result.capabilities.has(capability)) capabilities.add(capability);
@@ -89,8 +91,8 @@ export async function controller(node: NodeConfig, config: Config, session: Hand
   const routeControl = session.result.capabilities.has(node.implementation === 'cln' ? 'ASKRENE_LAYER_ROUTING' : 'EXPLICIT_ROUTE_CONTROL');
   if (routeControl) { capabilities.add('ROUTE_QUERY_PINNED'); capabilities.add('SEND_TO_ROUTE'); }
   if (!routeControl) throw new StageFailure(3, 'capability', 'the node does not support explicit circular routes');
-  const findCircularRoute: PreflightAdapter['findCircularRoute'] = async request => {
-    if (node.implementation === 'cln' && 'findCircularRoute' in payment.execution) return payment.execution.findCircularRoute(request);
+  const findCircularRoute: PreflightAdapter['findCircularRoute'] = async (request, ownership) => {
+    if (node.implementation === 'cln' && 'findCircularRoute' in payment.execution) return payment.execution.findCircularRoute(request, ownership);
     const channels = await listChannels();
     const source = channels.find(channel => channel.channelKey === request.sourceChannelKey);
     const target = channels.find(channel => channel.channelKey === request.targetChannelKey);
@@ -102,23 +104,28 @@ export async function controller(node: NodeConfig, config: Config, session: Hand
     const route = await payment.routes.buildCircularRoute({ selfPubkey: node.expectedPubkey, implementation: node.implementation,
       sourceScid: source.scid, targetScid: target.scid, outPeer: source.peerPubkey, inPeer: target.peerPubkey,
       principalMsat: request.principalMsat as Msat, maxFeeMsat: maxFeeMsat as Msat, maxCltvDelta: request.maxCltvDelta,
-      finalCltvDelta: node.implementation === 'lnd' ? LND_FINAL_CLTV_DELTA : 18, blockHeight: session.result.identity.blockHeight });
+      finalCltvDelta: node.implementation === 'lnd' ? LND_FINAL_CLTV_DELTA : 18, blockHeight: session.result.identity.blockHeight,
+      ...(request.excludeChannels === undefined ? {} : { excludeChannels: request.excludeChannels }) });
     if ('kind' in route) return { refusal: route.code };
     return { sourceChannelKey: source.channelKey, targetChannelKey: target.channelKey, outPeer: source.peerPubkey, inPeer: target.peerPubkey,
       // LND snapshots and SendToRouteV2 use packed chan_id; route assessment uses BOLT 7 SCIDs.
       // lnd lnwire/short_channel_id.go packs the same channel identity without losing uint64 precision.
       principalMsat: request.principalMsat, hops: route.hops.map(hop => ({ channelKey: node.implementation === 'lnd' ? scidToChanId(hop.scid) : hop.scid,
-        nodeOut: hop.nodeIdOut, amountOutMsat: hop.amountOutMsat, expiry: hop.cltvOut })),
+        nodeOut: hop.nodeIdOut, amountOutMsat: hop.amountOutMsat, expiry: hop.cltvOut, policy: hop.policy })),
       totalFeeMsat: route.totalFeeMsat, feePpmCeil: (route.totalFeeMsat * 1_000_000n + request.principalMsat - 1n) / request.principalMsat,
       totalTimelockDelta: route.totalTimeLock - route.builtAtHeight + 3, parts: route.parts };
   };
+  const execution = payment.execution;
   const adapter: ExecutionAdapter & PreflightAdapter = {
     handshake: async () => { const info = await session.reader.info(); return { pubkey: info.pubkey, network: info.network, version: info.version, synced: info.syncedToChain }; },
     capabilities: () => capabilities, listChannels, findCircularRoute,
     createInvoice: (amount, preimage, label, expiry) => payment.execution.createInvoice(amount, preimage, label, expiry),
-    sendOnRoute: (route, hash, secret, dispatched) => payment.execution.sendOnRoute(route, hash, secret, dispatched),
+    sendOnRoute: (route, hash, secret, dispatched, label) => node.implementation === 'cln' && 'findCircularRoute' in payment.execution
+      ? payment.execution.sendOnRoute(route, hash, secret, dispatched, label)
+      : payment.execution.sendOnRoute(route, hash, secret, dispatched),
     observePayment: (hash, mode) => payment.execution.observePayment(hash, mode), invoiceState: hash => payment.execution.invoiceState(hash),
     cancelUnpaidInvoice: (hash, label) => payment.execution.cancelUnpaidInvoice(hash, label),
+    ...('removeRoutingLayer' in execution ? { removeRoutingLayer: (layer: string) => execution.removeRoutingLayer(layer) } : {}),
   };
   return { ...payment, adapter };
 }
@@ -135,11 +142,15 @@ function proposalId(id: string): string {
   return id.slice(5);
 }
 
-export async function workflow(command: Command, io: Io, env: Environment, signal: AbortSignal, services: { controller?: typeof controller } = {}): Promise<number> {
+export async function workflow(command: Command, io: Io, env: Environment, signal: AbortSignal,
+  services: { controller?: typeof controller; onSafetyCode?: (code: number) => void } = {}): Promise<number> {
   let db: Database | undefined;
   try {
     const horizon = 'horizon' in command ? duration(command.horizon) : null;
-    if (command.kind === 'actions execute' && !command.requireRegtest) throw new StageFailure(2, 'arguments', '--require-regtest is required');
+    if (command.kind === 'actions execute') {
+      if (!command.requireRegtest) throw new StageFailure(2, 'arguments', '--require-regtest is required');
+      proposalId(command.proposalId);
+    }
     const config = configStage(command.config, command.kind === 'actions execute');
     if (command.kind === 'actions status') {
       if (command.watch) return (await watchActionsStatus({ databasePath: config.database, executionId: command.executionId, pollMs: 250, signal }, line => { io.output.write('stdout', line); })).exitCode;
@@ -183,29 +194,40 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
       }
       if (config.approvalKeys.length === 0) throw new StageFailure(5, 'approval', 'no approval key is configured');
       const approval = verifiedStoredApproval(context, db.commandData.approvals);
-      const node = selectNodes(config, proposal.nodeName)[0];
+      const node = config.nodes.find(entry => entry.name === proposal.nodeName);
       if (node === undefined) throw new StageFailure(5, 'config', 'the proposal node is unavailable');
       const session = await handshake(db, node, resolveConnection(node, command.connection, env));
-      const payment = await (services.controller ?? controller)(node, config, session);
+      if (session.quarantined) throw new StageFailure(5, 'node-quarantined', 'the proposal node is quarantined');
+      const payment = await (services.controller ?? controller)(node, config, session, db);
       const workerId = randomUUID();
       const leaseMs = config.attemptDeadlineMs + 60_000;
       const executionPolicy: ExecutionPolicy = { sha256: context.policy.sha256, network: policy.network, maxFeeMsat: policy.fees.max_fee_msat,
         maxFeePpm: BigInt(policy.fees.max_fee_ppm), exemptFeeMsat: policy.fees.exempt_fee_msat, maxCltvDelta: policy.routing.max_cltv_delta,
         minChannelReserveMsat: policy.amounts.min_channel_reserve_msat, budget: { msat: policy.budget.msat, periodMs: policy.budget.period * 1000 },
         cooldownAfterFailureMs: policy.cooldown_after_failure * 1000, cooldownAfterSuccessMs: policy.cooldown_after_success * 1000,
-        maxInFlight: policy.max_in_flight, maxSnapshotAgeMs: policy.max_snapshot_age * 1000 };
+        maxInFlight: policy.max_in_flight, maxSnapshotAgeMs: policy.max_snapshot_age * 1000, excludeChannels: policy.exclude_channels };
       const ready = await prepareExecution({ db, adapter: payment.adapter, workerId, leaseMs }, { approval, policy: executionPolicy, approvalKeyIds: config.approvalKeys.map(key => key.keyId) });
       if (ready.kind !== 'READY') return refuse(io, command.kind, ready.exit, ready.step, `execution ${ready.executionId ?? '-'}: ${ready.step}`);
+      const alerts = bootstrapAlerts(config);
       const outcome = await dispatchExecution({ db, adapter: payment.adapter, workerId, leaseMs, randomBytes, stopSignal: signal,
-        attemptDeadlineMs: config.attemptDeadlineMs, invoiceExpirySeconds: 300, deltaToleranceMsat: 0n, alert: () => undefined }, { ...ready, approval, policy: executionPolicy });
-      if (outcome.exit !== 0) return refuse(io, command.kind, outcome.exit, outcome.step, outcome.exit === 7 ? OUTCOME_UNKNOWN_MESSAGE : `execution ${outcome.executionId}: ${outcome.step ?? 'error'}`);
+        attemptDeadlineMs: config.attemptDeadlineMs, invoiceExpirySeconds: 300, deltaToleranceMsat: config.deltaToleranceMsat,
+        ...(services.onSafetyCode === undefined ? {} : { onSafetyCode: services.onSafetyCode }),
+        alert: alert => { alerts.raise({ kind: alert.kind === 'INVARIANT_BREACH' ? 'invariant-breach' : alert.kind,
+          subject: alert.executionId, state: alert.code }); } }, { ...ready, approval, policy: executionPolicy });
+      if (outcome.exit !== 0 && outcome.exit !== 9) return refuse(io, command.kind, outcome.exit, outcome.step, outcome.exit === 7 ? OUTCOME_UNKNOWN_MESSAGE : `execution ${outcome.executionId}: ${outcome.step ?? 'error'}`);
       const view = db.executions.view(ready.executionId);
-      const fee = view?.actualFeeMsat;
-      if (fee === null || fee === undefined) throw new Error('a success has no recorded fee');
+      if (view?.status !== 'VERIFIED_SUCCESS') throw new Error('a paid receipt requires verified success');
+      const fee = view.actualFeeMsat;
+      const deltas = db.commandData.executionDeltas(ready.executionId);
       const result = { execution_id: ready.executionId, proposal_id: command.proposalId, status: 'VERIFIED_SUCCESS', principal_msat: context.proposal.principalMsat.toString(),
-        actual_fee_msat: fee.toString(), fee_ppm: Number((fee * 1_000_000n + context.proposal.principalMsat - 1n) / context.proposal.principalMsat),
-        cltv_delta: ready.route.totalTimelockDelta, source_delta_msat: (-(context.proposal.principalMsat + fee)).toString(), target_delta_msat: context.proposal.principalMsat.toString(),
-        delta_status: view?.deltaStatus, journal_ids: db.ledger.journals().filter(journal => journal.executionId === ready.executionId).map(journal => journal.id) };
+        actual_fee_msat: fee?.toString() ?? null, fee_ppm: fee === null ? null : Number((fee * 1_000_000n + context.proposal.principalMsat - 1n) / context.proposal.principalMsat),
+        cltv_delta: ready.route.totalTimelockDelta, source_delta_msat: deltas?.sourceDeltaMsat ?? null, target_delta_msat: deltas?.targetDeltaMsat ?? null,
+        delta_status: view.deltaStatus, journal_ids: db.ledger.journals().filter(journal => journal.executionId === ready.executionId).map(journal => journal.id) };
+      if (outcome.exit === 9) {
+        const warning = `execution ${outcome.executionId}: ${outcome.step ?? 'reconciliation alert'}`;
+        io.output.write('stdout', io.json ? renderEnvelope(envelope(command.kind, result, null, [warning])) : terminalText(`${JSON.stringify(result, null, 2)}\n${warning}\n`));
+        return outcome.exit;
+      }
       return emit(io, command.kind, result);
     }
     if (command.kind === 'liquidity plan' || command.kind === 'liquidity diagnose') {
@@ -228,15 +250,17 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
           io.output.write('stdout', io.json ? result.json : terminalText(`${JSON.stringify((JSON.parse(result.json) as { result: unknown }).result, null, 2)}\n`)); return result.exitCode;
         }
         if (session === null || stored === undefined) throw new StageFailure(5, 'STALE_SNAPSHOT', 'no channel snapshot is available');
-        const payment = await controller(node, config, session);
+        const payment = await controller(node, config, session, db);
+        const planningState = db.commandData.planningState(stored.id, policy.budget.period * 1000);
         const result = await liquidityPlan({ db, node: { id: stored.id, name: node.name, pubkey: node.expectedPubkey, implementation: node.implementation }, channels,
           policy: planningPolicy(policy, horizon), policySha256: policySha256(policy), policyCanonicalJson: canonicalPolicyJson(policy), blockHeight: session.result.identity.blockHeight,
-          finalCltvDelta: node.implementation === 'lnd' ? LND_FINAL_CLTV_DELTA : 18, cooldowns: [], reservations: [], routes: payment.routes, clock: db });
+          finalCltvDelta: node.implementation === 'lnd' ? LND_FINAL_CLTV_DELTA : 18, ...planningState, routes: payment.routes, clock: db });
         io.output.write('stdout', io.json ? result.json : result.text); return result.exitCode;
       }
     }
     throw new StageFailure(2, null, 'the command is unavailable');
   } catch (error) {
+    if (command.kind === 'actions execute' && error instanceof CredentialFileError) return refuse(io, command.kind, 5, 'credentials', error.message);
     if (error instanceof ApprovalError) return refuse(io, command.kind, error.exitCode, error.reason, error.reason);
     if (error instanceof PolicyError) return refuse(io, command.kind, error.exitCode, 'policy', error.message);
     if (error instanceof ConfigError) return refuse(io, command.kind, 2, 'config', error.message);

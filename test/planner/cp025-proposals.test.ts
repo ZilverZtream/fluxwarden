@@ -322,7 +322,7 @@ describe('liquidity plan', () => {
       expect(seen.find(c => c.targetScid === TARGET)).toEqual({
         selfPubkey: NODE_PUBKEY, implementation: 'cln', sourceScid: SOURCE, targetScid: TARGET, outPeer: peerOf(SOURCE), inPeer: peerOf(TARGET),
         // min(300,000, max(5,000, floor(2,500 × 100,000,000 / 10^6) = 250,000))
-        principalMsat: P, maxFeeMsat: 250_000n, maxCltvDelta: 144, finalCltvDelta: 18, blockHeight: HEIGHT,
+        principalMsat: P, maxFeeMsat: 250_000n, maxCltvDelta: 144, finalCltvDelta: 18, blockHeight: HEIGHT, excludeChannels: [],
       });
     } finally { s.db.close(); }
   });

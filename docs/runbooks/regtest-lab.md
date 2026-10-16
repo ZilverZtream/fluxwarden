@@ -15,6 +15,21 @@ Regtest only: the lab never touches mainnet, testnet or signet, and holds no rea
 3. Always finish with `npm run lab:down -- --owner <absolute path>`, also after a failed run, and
    check that `docker ps -a` and `docker volume ls` show nothing of the project.
 
+## CLN rune permissions
+
+New disposable regtest CLN read and execute runes include `method=listhtlcs` among their allowed
+method alternatives, as defined by the [lab credential generator](../../labs/docker/credentials.mjs).
+The pinned [CLN HTLC query](https://github.com/ElementsProject/lightning/blob/v26.06.9/doc/schemas/listhtlcs.json)
+is read-only. FluxWarden makes one bounded history request with `index=created`, `start=0` and
+`limit=500` to identify the actual receiving channel from a paid invoice and its completed incoming
+HTLC. Missing permission or incomplete or ambiguous history leaves that attribution unverified;
+it does not undo proven settlement.
+
+Keep the existing method allowlists, sendpay principal ceiling and call-rate restriction. This
+permission applies to newly provisioned disposable regtest credentials; existing runes are not
+broadened automatically. If an older disposable rune lacks it, provision a replacement explicitly
+and update its configured file path, retaining the other restrictions and owner-only storage.
+
 ## Public demonstration prerequisites
 
 Bootstrap the disposable owner with `npm run lab:up -- --owner <absolute path>` before creating

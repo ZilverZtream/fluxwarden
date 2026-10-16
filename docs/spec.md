@@ -93,11 +93,13 @@ Replace illustrative channel keys with keys returned by the channels command. ve
 
 demand.mode accepts targets or ewma. EWMA uses fixed buckets, alpha in (0,1], positive sample minimum and burst factor, and refuses insufficient history. Diagnosis compares latest spendable and receivable with operator targets; stale, future-dated or missing targeted snapshots refuse the whole diagnosis. Core Lightning values retain NODE_REPORTED confidence and the node's estimation caveat. LND derived figures retain DERIVED_ESTIMATE; gossip capacity does not reveal remote balances.
 
-Planning checks active channels, exclusions, cooldowns, budget and unresolved concurrency before sizing a principal. Candidates are ordered by principal descending, source key and target key. At claim time the budget includes actual fees in the window and worst-case held fees of unresolved attempts. UNKNOWN remains HELD. A failed payment needs a new proposal and approval.
+Planning checks active channels, exclusions, cooldowns, budget and unresolved concurrency before sizing a principal. Principal plus the worst-case permitted fee must leave source spendable at or above the greater of the policy reserve and the source's configured outbound target; an absent outbound target contributes zero. Initial candidates are ordered by principal descending, source key and target key. After route validation, final selection maximizes principal minus route fee with fixed weight_cost = 1; ties use lower fee, source key and target key. At claim time the budget includes actual fees in the window and worst-case held fees of unresolved attempts. UNKNOWN remains HELD. A failed payment needs a new proposal and approval.
 
 ## Commands and options
 
-Top-level `fluxwarden --help` and `fluxwarden --version` need no configuration and exit 0. --json requests one schema-1 document. Missing or unreadable configuration is exit 2 for configured commands. Command-specific help is not a separate interface.
+Top-level `fluxwarden --help` and `fluxwarden --version` need no configuration and exit 0. --json requests one schema-1 document. Missing or unreadable configuration is exit 2 for configured non-execution commands. Invalid arguments or environment settings remain exit 2. Command-specific help is not a separate interface.
+
+For `actions execute`, after valid argument and environment checks, missing, unreadable or malformed required configuration yields `SAFETY_REFUSAL` (exit 5) before credential or node access. An absent selected node, approval public key or execution credential also yields exit 5 before node contact. Configured non-regtest networks, including unknown network labels, yield the network-lock safety refusal.
 
 | Invocation | Behaviour and command-specific options |
 | --- | --- |

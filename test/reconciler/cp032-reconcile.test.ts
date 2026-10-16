@@ -56,7 +56,7 @@ async function world(prefix: string, options: { confirmIntervalMs?: number; fail
     const { executionId } = seedExecution(base, {
       // A previously completed success includes its exact fee, receiver receipt,
       // consumed reservation and terminal journals. A bare success row with
-      // NULL fee is intentionally recoverable under D76, rather than this fixture.
+      // NULL fee is intentionally recoverable under SPEC §6.2, rather than this fixture.
       status: status === 'VERIFIED_SUCCESS' ? 'IN_FLIGHT' : status,
       paymentHash: status === 'CLAIMED' ? null : hash, route, plannedFeeMsat: 150_000n,
       leaseInMs: over.leaseInMs ?? -5_000, submittedAgoMs: status === 'CLAIMED' ? null : (over.submittedAgoMs ?? 300_000),
@@ -142,7 +142,11 @@ it('CP-032/B2 a matching preimage resolves UNKNOWN to VERIFIED_SUCCESS with the 
   expect(row.actual_fee_msat).toBe(150_000n);
   expect(reservationState(w.path, e.executionId)).toEqual({ state: 'CONSUMED', consumed: 150_000n });
   expect(w.node.count('cancelUnpaidInvoice')).toBe(0);
-  expect(report.exit).toBe(0);
+  // SPEC 8.7 and SECURITY INV-07: this fixture has no pre-send balance
+  // baseline. Paid truth remains verified while its channel delta is pending.
+  expect(row.delta_status).toBe('PENDING');
+  expect(report.exit).toBe(9);
+  expect(w.alerts.map(alert => alert.code)).toContain('DELTA_UNVERIFIED');
   expect(report.unresolved).toEqual([]);
 });
 
@@ -291,7 +295,11 @@ it('CP-032/B8 an UNKNOWN older than escalate_after raises stuck-in-flight exactl
   const resolvedOld = w.seed('UNKNOWN', { payer: [succeeded(150_000n, 1, true, w.base.targetKey)] }, { submittedAgoMs: 2 * 3_600_000 });
   const report = await w.run();
   expect(w.alerts.filter(a => a.kind === 'stuck-in-flight')).toEqual([{ kind: 'stuck-in-flight', executionId: old.executionId, code: 'STUCK' }]);
-  expect(w.alerts.some(a => a.executionId === young.executionId || a.executionId === resolvedOld.executionId)).toBe(false);
+  expect(w.alerts.some(a => a.kind === 'stuck-in-flight' && (a.executionId === young.executionId || a.executionId === resolvedOld.executionId))).toBe(false);
+  expect(w.alerts).toContainEqual(expect.objectContaining({ executionId: resolvedOld.executionId, code: 'DELTA_UNVERIFIED' }));
+  expect(rowOf(w.path, old.executionId).status).toBe('UNKNOWN');
+  expect(rowOf(w.path, young.executionId).status).toBe('UNKNOWN');
+  expect(rowOf(w.path, resolvedOld.executionId).status).toBe('VERIFIED_SUCCESS');
   expect(report.exit).toBe(7);
 });
 

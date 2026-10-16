@@ -13,9 +13,25 @@ export interface Outcome {
   readonly warnings: readonly string[];
 }
 
+/** A node-supplied JSON string, with the truncation marker inside its UTF-8 byte bound. */
+export function boundedUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let result = '';
+  let bytes = 0;
+  const marker = '.'.repeat(Math.min(3, maxBytes));
+  for (const character of value) {
+    const size = Buffer.byteLength(character, 'utf8');
+    if (bytes + size > maxBytes - marker.length) break;
+    result += character;
+    bytes += size;
+  }
+  return result + marker;
+}
+
 /** Writes the one --json document of a command and returns its exit code. */
 export function emitJson(io: Io, command: string, outcome: Outcome): number {
-  io.output.write('stdout', renderEnvelope(envelope(command, outcome.result, outcome.error, outcome.warnings)));
+  const error = outcome.error === null ? null : { ...outcome.error, message: boundedUtf8(outcome.error.message, 1024) };
+  io.output.write('stdout', renderEnvelope(envelope(command, outcome.result, error, outcome.warnings)));
   return outcome.code;
 }
 

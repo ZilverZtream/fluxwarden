@@ -6,11 +6,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { minFinalCltvExpiry } from '../core/bolt11-cltv.js';
 import { assertHash } from '../core/encoding.js';
 import { ProtocolError } from '../core/errors.js';
-import type { CancelResult, CircularRoute, InvoiceResult, InvoiceState, PaymentObservation, RouteRequest } from '../core/execution.js';
+import type { CancelResult, CircularRoute, InvoiceResult, InvoiceState, PaymentObservation, RouteOwnership, RouteRequest, RoutingLayerClaim } from '../core/execution.js';
 import type { JsonObject } from '../core/json.js';
 import type { Msat } from '../core/money.js';
 import { isNoRoute, type CandidateRoute } from '../core/route.js';
-import { scidToChanId } from '../core/scid.js';
+import { channelScid, scidToChanId } from '../core/scid.js';
 import { ClnReadApi } from './api.js';
 import { lightningdRefused, type ClnRest } from './rest.js';
 import { ClnRouteApi } from './routes.js';
@@ -96,7 +96,17 @@ export class ClnExecutionAdapter {
    * getroutes between the out-peer of S and the in-peer of T under a fresh layer that is removed on every path, and the
    * circular route around it recomputed from the nodes' own policies.
    */
-  async findCircularRoute(req: RouteRequest): Promise<CircularRoute | { readonly refusal: string }> {
+  async findCircularRoute(req: RouteRequest, ownership?: RouteOwnership): Promise<CircularRoute | { readonly refusal: string }> {
+    const assertOwner = (): void => {
+      if (ownership === undefined) return;
+      const plan = ownership.db.executions.plan(ownership.executionId);
+      if (plan === null || plan.status !== 'PREFLIGHT' || plan.implementation !== 'cln' || plan.nodePubkey !== this.#ownId
+        || plan.sourceChannelKey !== req.sourceChannelKey || plan.targetChannelKey !== req.targetChannelKey
+        || plan.principalMsat !== req.principalMsat || !ownership.db.executions.holds(ownership.executionId, ownership.fenceEpoch)) {
+        throw new ProtocolError('route assessment has no current execution ownership');
+      }
+    };
+    assertOwner();
     const info = parseInfo(await this.#rest.call('getinfo'));
     if (info.id !== this.#ownId) throw new ProtocolError('getinfo names another node');
     const channels = objects(await this.#rest.call('listpeerchannels'), 'channels').map(parsePeerChannel);
@@ -113,7 +123,25 @@ export class ClnExecutionAdapter {
       outPeer, inPeer, principalMsat: req.principalMsat as Msat, maxFeeMsat: req.maxFeeMsat as Msat, maxCltvDelta: req.maxCltvDelta,
       finalCltvDelta: FINAL_CLTV_DELTA, blockHeight: info.blockheight,
     };
-    const answer = await this.#routes.buildCircularRoute(constraints, { layer: `fluxwarden-${randomUUID()}`, excludeScids: [] });
+    const layer = `fluxwarden-${randomUUID()}`;
+    let recorded: RoutingLayerClaim | undefined;
+    let recordAcquired: (() => RoutingLayerClaim) | undefined;
+    const answer = await this.#routes.buildCircularRoute(constraints, { layer,
+      excludeScids: (req.excludeChannels ?? []).flatMap(key => { const scid = channelScid(key); return scid === null ? [] : [scid]; }),
+      ...(ownership === undefined ? {} : { lifecycle: {
+        beforeCreate: () => {
+          assertOwner();
+          recordAcquired = ownership.db.routingLayers.prepareAcquisition(ownership.executionId, ownership.fenceEpoch, this.#ownId, layer);
+        },
+        acquired: () => {
+          if (recordAcquired === undefined) throw new ProtocolError('route acquisition has no prepared ownership receipt');
+          recorded = recordAcquired();
+          // Recording a successful receipt grants no authority for the next native mutation.
+          assertOwner();
+        },
+        removed: () => { if (recorded !== undefined) ownership.db.routingLayers.removedImmediately(recorded, ownership.executionId, ownership.fenceEpoch); },
+      } }),
+    });
     if (isNoRoute(answer)) return { refusal: answer.code };
     const route = circularRoute(answer, req, outPeer, inPeer);
     // V5 with the CLN padding: the delta the HTLC really carries must fit the cap.
@@ -121,12 +149,23 @@ export class ClnExecutionAdapter {
     return route;
   }
 
+  /** A native parameter refusal proves absence only after a successful fresh layer listing. */
+  async removeRoutingLayer(layer: string): Promise<'REMOVED' | 'NOT_FOUND'> {
+    try {
+      await this.#rest.call('askrene-remove-layer', { layer });
+      return 'REMOVED';
+    } catch (error) {
+      if (lightningdRefused(error) && error.code === -32602 && !(await this.#api.listLayers()).some(entry => entry.layer === layer)) return 'NOT_FOUND';
+      throw error;
+    }
+  }
+
   /**
    * Exactly one sendpay, then waitsendpay in chunks of at most waitChunkSeconds until the attempt deadline. Only a
    * complete answer with our preimage and the principal delivered is a success; a failure counts only when
    * listsendpays reports it failed and our invoice is not paid; everything else is AMBIGUOUS.
    */
-  async sendOnRoute(route: CircularRoute, paymentHash: string, paymentSecret: string, onDispatched?: () => void): Promise<PaymentObservation> {
+  async sendOnRoute(route: CircularRoute, paymentHash: string, paymentSecret: string, onDispatched?: () => void, label?: string): Promise<PaymentObservation> {
     const hash = assertHash(paymentHash);
     const secret = assertHash(paymentSecret, 'payment secret');
     const first = route.hops[0];
@@ -159,7 +198,8 @@ export class ClnExecutionAdapter {
     const started = performance.now();
     let answer: JsonObject;
     try {
-      answer = await this.#rest.call('sendpay', { route: hops, payment_hash: hash, payment_secret: secret, amount_msat: amountMsat }, { onWritten: written });
+      answer = await this.#rest.call('sendpay', { route: hops, payment_hash: hash, payment_secret: secret, amount_msat: amountMsat,
+        ...(label === undefined ? {} : { label }) }, { onWritten: written });
     } catch (error) {
       // Only lightningd's own refusal with a code that leaves no HTLC behind may end in a failure; a proxy error,
       // a 500 without a code or a cut leaves the outcome unknown (INV-04).
@@ -338,7 +378,7 @@ function circularRoute(answer: CandidateRoute, req: RouteRequest, outPeer: strin
     outPeer,
     inPeer,
     principalMsat: req.principalMsat,
-    hops: answer.hops.map(hop => ({ channelKey: hop.scid, nodeOut: hop.nodeIdOut, amountOutMsat: hop.amountOutMsat, expiry: hop.cltvOut })),
+    hops: answer.hops.map(hop => ({ channelKey: hop.scid, nodeOut: hop.nodeIdOut, amountOutMsat: hop.amountOutMsat, expiry: hop.cltvOut, policy: hop.policy })),
     totalFeeMsat: fee,
     feePpmCeil: ppmCeil(fee, req.principalMsat),
     totalTimelockDelta: answer.totalTimeLock - answer.builtAtHeight,

@@ -293,12 +293,11 @@ it('CP-029/B3 restart recovery cancels expired-lease CLAIMED/PREFLIGHT rows whos
 const DOOMED_WORKER = `
 const [preflightUrl, persistenceUrl, dbPath] = process.argv.slice(1);
 const revive = (_k, v) => typeof v === 'string' && v.startsWith('bigint:') ? BigInt(v.slice(7)) : v;
-const input = JSON.parse(process.env.FW_INPUT, revive);
 const { openDatabase } = await import(persistenceUrl);
 const { prepareExecution } = await import(preflightUrl);
 const db = openDatabase(dbPath, { readOnly: false });
 const log = name => process.stdout.write('call:' + name + '\\n');
-setInterval(() => {}, 1000);
+const keepAlive = setInterval(() => {}, 1000);
 const adapter = {
   handshake: () => { log('handshake'); return new Promise(() => {}); },
   capabilities: () => { log('capabilities'); return new Set(); },
@@ -308,7 +307,23 @@ const adapter = {
   sendOnRoute: async () => { log('sendOnRoute'); throw new Error('unreachable'); },
   cancelUnpaidInvoice: async () => { log('cancelUnpaidInvoice'); throw new Error('unreachable'); },
 };
-void prepareExecution({ db, adapter, workerId: 'doomed', leaseMs: 500 }, input);
+process.stdout.write('worker-ready\\n');
+try {
+  const serialized = await new Promise((resolve, reject) => {
+    let text = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => { text += chunk; });
+    process.stdin.once('end', () => { resolve(text); });
+    process.stdin.once('error', reject);
+  });
+  const input = JSON.parse(serialized, revive);
+  const outcome = await prepareExecution({ db, adapter, workerId: 'doomed', leaseMs: 500 }, input);
+  process.stdout.write('outcome:' + JSON.stringify({ kind: outcome.kind, exit: outcome.exit, step: outcome.step }) + '\\n');
+  process.exitCode = 1;
+} catch (error) {
+  process.stderr.write('worker-error:' + String(error?.name) + ':' + String(error?.code) + '\\n');
+  process.exitCode = 1;
+} finally { clearInterval(keepAlive); db.close(); }
 `;
 
 it('CP-029/B3 a worker killed in PREFLIGHT leaves nothing sent; after restart its row is CANCELLED and the reservation released (T-07)', async () => {
@@ -317,23 +332,43 @@ it('CP-029/B3 a worker killed in PREFLIGHT leaves nothing sent; after restart it
   const { recoverPreflight } = await loadPreflight();
   const path = scratchDb('killed');
   const base = seedBase(p, path, emptyDatabase);
-  const approval = seedProposal(base, { approvalTtlMs: 1_500 });
   const policy = policyFor(base);
-  const input = JSON.stringify({ approval, policy, approvalKeyIds: APPROVAL_KEYS }, (_k, v: unknown) => typeof v === 'bigint' ? `bigint:${v.toString()}` : v);
+  let approval: VerifiedApproval | undefined;
+  let acquiredFence: bigint | undefined;
   const child = spawn(process.execPath, ['--no-warnings', '--input-type=module', '-e', DOOMED_WORKER,
     pathToFileURL(builtPreflight).href, pathToFileURL(builtPersistence).href, path], {
-    env: { ...childEnv(), FW_INPUT: input }, shell: false, windowsHide: true, stdio: 'pipe',
+    env: childEnv(), shell: false, windowsHide: true, stdio: 'pipe',
   });
   let out = '';
   let err = '';
   try {
     await new Promise<void>((resolve, reject) => {
-      child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString(); if (out.includes('call:handshake')) resolve(); });
+      const rejectSetup: (error: Error) => void = reject;
+      child.stdout.on('data', (chunk: Buffer) => {
+        out += chunk.toString();
+        if (out.includes('worker-ready\n') && approval === undefined) {
+          try {
+            // SPEC §6.5: start the unchanged authority lifetime after imports and native database admission.
+            approval = seedProposal(base, { approvalTtlMs: 1_500 });
+            const input = JSON.stringify({ approval, policy, approvalKeyIds: APPROVAL_KEYS }, (_k, v: unknown) => typeof v === 'bigint' ? `bigint:${v.toString()}` : v);
+            child.stdin.end(input);
+          } catch (error) { rejectSetup(error as Error); }
+        }
+        if (out.includes('outcome:')) reject(new Error(`worker refused before its pending handshake: ${out}`));
+        if (out.includes('call:handshake')) resolve();
+      });
       child.stderr.on('data', (chunk: Buffer) => { err += chunk.toString(); });
-      child.once('exit', status => { reject(new Error(`worker exited ${String(status)} before its handshake: ${err}`)); });
+      child.once('error', reject);
+      child.stdin.once('error', reject);
+      child.once('exit', status => { reject(new Error(`worker exited ${String(status)} before its handshake: ${out} ${err}`)); });
     });
+    if (approval === undefined) throw new Error('worker never received fresh authority');
     const row = execByProposal(path, approval.proposalId);
     expect(row?.status).toBe('PREFLIGHT');
+    expect(row?.worker_id).toBe('doomed');
+    if (row === undefined) throw new Error('worker did not acquire its execution');
+    acquiredFence = row.fence_epoch;
+    expect(reservationsOf(path, row.id).map(r => r.state)).toEqual(['HELD']);
     child.kill('SIGKILL');
     await new Promise<void>(resolve => { if (child.exitCode !== null || child.signalCode !== null) resolve(); else child.once('exit', () => { resolve(); }); });
   } finally { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }
@@ -347,6 +382,7 @@ it('CP-029/B3 a worker killed in PREFLIGHT leaves nothing sent; after restart it
     if (row === undefined) throw new Error('no execution row');
     expect(report.cancelled).toEqual([row.id]);
     expect(row.status).toBe('CANCELLED');
+    expect(row.fence_epoch).toBeGreaterThan(acquiredFence);
     expect(row.payment_hash).toBeNull();
     expect(reservationsOf(path, row.id).map(r => r.state)).toEqual(['RELEASED']);
     expect(fake.calls).toEqual([]);

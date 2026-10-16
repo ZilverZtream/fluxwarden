@@ -1,8 +1,8 @@
 import type { VerifiedApproval } from '../approval/verified.js';
 import { LndError, ProtocolError, TransportError } from '../core/errors.js';
 import {
-  approveRoute, proveRegtest,
-  type ApprovedRoute, type CircularRoute, type ExecutionPolicy, type NodeCapability, type PreflightAdapter,
+  approveRoute, invoiceLabel, proveRegtest,
+  type ApprovedRoute, type CancelResult, type CircularRoute, type ExecutionAdapter, type ExecutionPolicy, type InvoiceState, type NodeCapability, type PreflightAdapter,
 } from '../core/execution.js';
 import type { NormalizedChannel } from '../core/normalize.js';
 import { PersistenceError, type Database, type ExecutionPlan } from '../persistence/index.js';
@@ -178,9 +178,8 @@ export async function prepareExecution(deps: PreflightDeps, input: PreflightInpu
 
     const channels = await adapter.listChannels();
     if (!held()) return lost;
-    const now = db.now();
     const fresh = (channel: NormalizedChannel | undefined): channel is NormalizedChannel =>
-      channel !== undefined && Math.abs(now - channel.observedAt) <= policy.maxSnapshotAgeMs;
+      channel !== undefined && Math.abs(db.now() - channel.observedAt) <= policy.maxSnapshotAgeMs;
     const source = channels.find(channel => channel.channelKey === plan.sourceChannelKey);
     const target = channels.find(channel => channel.channelKey === plan.targetChannelKey);
     if (!fresh(source) || !fresh(target)) return refuse('STALE_SNAPSHOT');
@@ -194,8 +193,10 @@ export async function prepareExecution(deps: PreflightDeps, input: PreflightInpu
       maxFeePpm: policy.maxFeePpm,
       exemptFeeMsat: policy.exemptFeeMsat,
       maxCltvDelta: approval.approvedMaxCltvDelta,
-    });
+      ...(policy.excludeChannels === undefined ? {} : { excludeChannels: policy.excludeChannels }),
+    }, { db, executionId, fenceEpoch: epoch });
     if (!held()) return lost;
+    if (!fresh(source) || !fresh(target)) return refuse('STALE_SNAPSHOT');
     if ('refusal' in answer) return refuse(ROUTE_REFUSALS.has(answer.refusal) ? answer.refusal : 'NO_FEASIBLE_ROUTE');
     const refusal = routeRefusal(answer, plan, source, target, approval, policy);
     if (refusal !== null) return refuse(refusal);
@@ -232,21 +233,55 @@ export async function prepareExecution(deps: PreflightDeps, input: PreflightInpu
 
 /**
  * Restart sweep: every CLAIMED/PREFLIGHT execution whose lease has expired and whose approval or proposal has expired
- * by the database clock is taken over with a fenced lease and cancelled. Nothing was sent for these rows, so no node
- * call is needed. A row another worker takes first is left to that worker.
+ * by the database clock is taken over with a fenced lease. A persisted invoice is looked up and closed using the
+ * admitted adapter for its node before cancellation; paid evidence goes to observation-only recovery instead.
+ * Ambiguous cleanup remains pending. A row another worker takes first is left to that worker.
  */
-export function recoverPreflight(deps: Pick<PreflightDeps, 'db' | 'workerId' | 'leaseMs'>): Promise<{ cancelled: readonly string[] }> {
+export async function recoverPreflight(deps: Pick<PreflightDeps, 'db' | 'workerId' | 'leaseMs'> & {
+  /** Already admitted for the persisted node's identity and regtest network, as in ordinary reconciliation. */
+  readonly adapter?: Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'>;
+  /** Admitted adapters keyed by nodes.id for a multi-node recovery pass. */
+  readonly adapters?: ReadonlyMap<string, Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'>>;
+}): Promise<{ cancelled: readonly string[] }> {
   const { db, workerId, leaseMs } = deps;
   const cancelled: string[] = [];
   try {
     for (const executionId of db.executions.lapsedClaims()) {
+      const hash = db.executions.view(executionId)?.paymentHash ?? null;
+      let adapter: Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'> | undefined;
+      if (hash !== null) {
+        const plan = db.executions.plan(executionId);
+        const node = plan === null ? undefined : db.nodes.list().find(entry => entry.expectedPubkey === plan.nodePubkey && entry.implementation === plan.implementation);
+        adapter = deps.adapters === undefined ? deps.adapter : node === undefined ? undefined : deps.adapters.get(node.id);
+        // Leave the expired lease available to a later pass admitted for this invoice's node.
+        if (node === undefined || adapter === undefined) continue;
+      }
       const held = db.executions.takeOver(executionId, workerId, leaseMs);
       if (held === null) continue;
+      if (hash !== null) {
+        if (adapter === undefined || held.status !== 'PREFLIGHT') continue;
+        let invoice: InvoiceState;
+        try { invoice = await adapter.invoiceState(hash); } catch { continue; }
+        if (invoice === 'SETTLED') {
+          db.executions.recordPaidIntent(executionId, held.fenceEpoch, hash);
+          continue;
+        }
+        if (!db.executions.holds(executionId, held.fenceEpoch)) continue;
+        if (invoice === 'OPEN') {
+          let closed: CancelResult;
+          try { closed = await adapter.cancelUnpaidInvoice(hash, invoiceLabel(executionId)); } catch { continue; }
+          if (closed === 'ALREADY_PAID') {
+            db.executions.recordPaidIntent(executionId, held.fenceEpoch, hash);
+            continue;
+          }
+          if (!db.executions.holds(executionId, held.fenceEpoch)) continue;
+        }
+      }
       db.executions.transition(executionId, held.fenceEpoch, held.status, 'CANCELLED', { errorCode: 'APPROVAL_INVALID' });
       cancelled.push(executionId);
     }
   } catch (error) {
-    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    throw error instanceof Error ? error : new Error(String(error));
   }
-  return Promise.resolve({ cancelled });
+  return { cancelled };
 }

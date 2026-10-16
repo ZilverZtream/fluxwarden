@@ -1,7 +1,8 @@
-import { invoiceLabel, type Alert, type ExecutionAdapter, type ExecutionStatus, type PaymentObservation } from '../core/execution.js';
+import { invoiceLabel, reportedFeeBreach, type Alert, type ExecutionAdapter, type ExecutionStatus, type PaymentObservation } from '../core/execution.js';
 import { ExitCode } from '../core/exit-codes.js';
 import type { NormalizedChannel } from '../core/normalize.js';
 import { PersistenceError, type Database, type DeltaStatus, type TransitionFields, type UnresolvedExecution } from '../persistence/index.js';
+import { cleanupRoutingLayers } from './routing-layers.js';
 
 export interface ReconcileDeps {
   readonly db: Database;
@@ -87,7 +88,9 @@ async function decide(adapter: ExecutionAdapter, row: UnresolvedExecution, hash:
   if (first.kind === 'FAILED' && first.htlcsInFlight === 0 && invoice !== null) {
     if (!judge.failureConfirmed()) return STAY;
     const closed = await read(() => adapter.cancelUnpaidInvoice(hash, label));
-    if (closed === 'CANCELED') return { kind: 'failure', errorCode: first.reason };
+    if (closed === 'CANCELED' || (row.implementation === 'cln' && invoice === 'NOT_FOUND' && closed === 'NOT_FOUND')) {
+      return { kind: 'failure', errorCode: first.reason };
+    }
     if (closed === 'ALREADY_PAID') return paid(await observe());
     return STAY;
   }
@@ -164,13 +167,17 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
           continue;
         }
         if (observed.htlcCount !== 1) { breach = true; raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE'); }
-        if (observed.feeMsat > row.approvedMaxFeeMsat) { breach = true; raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP'); }
+        if (reportedFeeBreach(observed.feeMsat, row)) { breach = true; raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP'); }
+        else if (row.plannedFeeMsat !== null && observed.feeMsat !== row.plannedFeeMsat) {
+          mismatch = true;
+          raise('fee-mismatch', 'FEE_MISMATCH');
+        }
         epoch = db.executions.recoverSettlement(row.executionId, epoch, observed.settledChannelKey, observed.feeMsat);
         if (observed.settledChannelKey === null || adapter === undefined) {
           mismatch = true;
           if (!breach) raise('delta-mismatch', 'DELTA_UNVERIFIED');
         } else {
-          const delta = await verifyDelta(deps, adapter, row.executionId, observed.feeMsat);
+          const delta = await verifyDelta(deps, adapter, row.executionId, observed.settledChannelKey, observed.feeMsat);
           if (delta !== null) epoch = db.executions.recordDelta(row.executionId, epoch, delta);
           if (delta !== 'MATCH') { mismatch = true; if (!breach) raise('delta-mismatch', delta === 'MISMATCH' ? 'DELTA_MISMATCH' : 'DELTA_UNVERIFIED'); }
         }
@@ -200,7 +207,7 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
           ? { feeUnreported: true, deltaStatus: 'PENDING' }
           : { actualFeeMsat: decision.feeMsat, deltaStatus: 'PENDING', settledChannelKey: decision.settledChannelKey });
         if (decision.htlcCount !== null && decision.htlcCount !== 1) { breach = true; raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE'); }
-        if (decision.feeMsat !== null && decision.feeMsat > row.approvedMaxFeeMsat) {
+        if (decision.feeMsat !== null && reportedFeeBreach(decision.feeMsat, row)) {
           breach = true;
           raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP');
         } else if (decision.feeMsat !== null && row.plannedFeeMsat !== null && decision.feeMsat !== row.plannedFeeMsat) {
@@ -209,7 +216,7 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
         }
         if (decision.settledChannelKey === null) { mismatch = true; if (!breach) raise('delta-mismatch', 'DELTA_UNVERIFIED'); }
         if (adapter !== undefined && decision.feeMsat !== null && decision.settledChannelKey !== null) {
-          const delta = await verifyDelta(deps, adapter, row.executionId, decision.feeMsat);
+          const delta = await verifyDelta(deps, adapter, row.executionId, decision.settledChannelKey, decision.feeMsat);
           if (delta !== null) {
             try {
               epoch = db.executions.recordDelta(row.executionId, epoch, delta);
@@ -217,8 +224,8 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
               if (error instanceof PersistenceError && error.code === 'LEASE_LOST') throw new LeaseLost();
               throw error;
             }
-            if (delta === 'MISMATCH') { mismatch = true; raise('delta-mismatch', 'DELTA_MISMATCH'); }
           }
+          if (delta !== 'MATCH') { mismatch = true; raise('delta-mismatch', delta === 'MISMATCH' ? 'DELTA_MISMATCH' : 'DELTA_UNVERIFIED'); }
         }
       } else if (decision.kind === 'failure') {
         write('VERIFIED_FAILURE', { errorCode: decision.errorCode });
@@ -238,6 +245,7 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
     }
   }
 
+  await cleanupRoutingLayers(deps);
   const exit = breach ? ExitCode.INVARIANT_BREACH
     : unresolved.length > 0 ? ExitCode.OUTCOME_UNKNOWN
       : mismatch ? ExitCode.RECONCILIATION_ALERT : ExitCode.SUCCESS;
@@ -248,14 +256,15 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
  * SPEC §8.7 step 5 against the balances recorded before the send, with zero tolerance unless one is configured; null
  * when there is no recorded baseline or no fresh channel list to compare with.
  */
-async function verifyDelta(deps: ReconcileDeps, adapter: ExecutionAdapter, executionId: string, feeMsat: bigint): Promise<DeltaStatus | null> {
+async function verifyDelta(deps: ReconcileDeps, adapter: ExecutionAdapter, executionId: string, settledChannelKey: string, feeMsat: bigint): Promise<DeltaStatus | null> {
   const tolerance = deps.deltaToleranceMsat ?? 0n;
   const baseline = deps.db.executions.baseline(executionId);
   const plan = deps.db.executions.plan(executionId);
   if (baseline === null || plan === null) return null;
+  if (settledChannelKey !== plan.targetChannelKey) return null;
   const channels = await read(() => adapter.listChannels());
   const source = localBalance(channels, plan.sourceChannelKey);
-  const target = localBalance(channels, plan.targetChannelKey);
+  const target = localBalance(channels, settledChannelKey);
   if (source === null || target === null) return null;
   const sourceOff = absolute(source - baseline.sourceLocalMsat + plan.principalMsat + feeMsat);
   const targetOff = absolute(target - baseline.targetLocalMsat - plan.principalMsat);

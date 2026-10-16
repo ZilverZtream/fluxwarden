@@ -23,7 +23,7 @@ export function configStage(path: string, mutating = false): Config {
   } catch (error) {
     // SPEC §5.2 H4 / §11.6 T-01: reject a configured execution network before credential reads.
     if (mutating && error instanceof ConfigNetworkError) throw new StageFailure(ExitCode.SAFETY_REFUSAL, 'network-lock', error.message);
-    if (error instanceof ConfigError) throw new StageFailure(ExitCode.INVALID_INPUT, 'config', error.message);
+    if (error instanceof ConfigError) throw new StageFailure(mutating ? ExitCode.SAFETY_REFUSAL : ExitCode.INVALID_INPUT, 'config', error.message);
     throw error;
   }
 }

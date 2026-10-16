@@ -96,7 +96,7 @@ const V1: readonly string[] = [
     created_at INTEGER NOT NULL
   ) STRICT`,
 
-  `-- MySQL: ids CHAR(26) ascii_bin, nonce CHAR(32) ascii, signature VARCHAR(128) ascii, max_fee_msat BIGINT,
+  `-- MySQL: ids CHAR(26) ascii_bin, nonce CHAR(64) ascii, signature VARCHAR(128) ascii, max_fee_msat BIGINT,
   -- expires_at and created_at DATETIME(6)
   CREATE TABLE approvals (
     id TEXT PRIMARY KEY,
@@ -229,6 +229,44 @@ export const MIGRATIONS: readonly (readonly string[])[] = [V1, [
   '-- MySQL: same; preserve the opening identity when the channel receives a new public key.\nALTER TABLE channels ADD COLUMN opening_channel_key TEXT',
   // MySQL: same one-time backfill UPDATE in the schema migration transaction.
   'UPDATE channels SET opening_channel_key = channel_key WHERE opening_channel_key IS NULL',
+], [
+  `-- MySQL: BEFORE UPDATE trigger that runs SIGNAL SQLSTATE '45000' with the same message
+  CREATE TRIGGER policy_versions_no_update BEFORE UPDATE ON policy_versions BEGIN SELECT RAISE(ABORT, 'policy_versions is append-only'); END`,
+  `-- MySQL: BEFORE DELETE trigger that runs SIGNAL SQLSTATE '45000' with the same message
+  CREATE TRIGGER policy_versions_no_delete BEFORE DELETE ON policy_versions BEGIN SELECT RAISE(ABORT, 'policy_versions is append-only'); END`,
+  `-- MySQL: n/a, record the immutable keys of existing policy versions for SQLite REPLACE protection.
+  INSERT INTO append_only_keys (table_name, key_text) SELECT 'policy_versions', 'id:' || id FROM policy_versions`,
+  `-- MySQL: n/a, record the immutable hashes of existing policy versions for SQLite REPLACE protection.
+  INSERT INTO append_only_keys (table_name, key_text) SELECT 'policy_versions', 'sha:' || policy_sha256 FROM policy_versions`,
+  `-- MySQL: n/a, REPLACE is never used and a duplicate key fails on the PRIMARY KEY or UNIQUE index
+  CREATE TRIGGER policy_versions_no_replace AFTER INSERT ON policy_versions
+  BEGIN SELECT RAISE(ABORT, 'policy_versions is append-only') WHERE EXISTS (SELECT 1 FROM append_only_keys
+    WHERE table_name = 'policy_versions' AND key_text IN ('id:' || NEW.id, 'sha:' || NEW.policy_sha256));
+  INSERT INTO append_only_keys (table_name, key_text) VALUES ('policy_versions', 'id:' || NEW.id), ('policy_versions', 'sha:' || NEW.policy_sha256); END`,
+], [
+  `-- MySQL: ids CHAR(26) ascii_bin, layer VARCHAR(128), epochs BIGINT, state ENUM('PENDING','CLEANED'), times DATETIME(6)
+  CREATE TABLE routing_layers (
+    id TEXT PRIMARY KEY CHECK (length(id) = 26),
+    node_id TEXT NOT NULL REFERENCES nodes(id),
+    layer TEXT NOT NULL CHECK (length(layer) BETWEEN 1 AND 128),
+    execution_id TEXT NOT NULL REFERENCES executions(id),
+    acquired_fence_epoch INTEGER NOT NULL CHECK (acquired_fence_epoch > 0),
+    fence_epoch INTEGER NOT NULL CHECK (fence_epoch > 0),
+    state TEXT NOT NULL CHECK (state IN ('PENDING','CLEANED')),
+    worker_id TEXT,
+    lease_expires_at INTEGER,
+    acquired_at INTEGER NOT NULL,
+    last_attempt_at INTEGER,
+    completed_at INTEGER,
+    UNIQUE (node_id, layer)
+  ) STRICT`,
+  '-- MySQL: same\nCREATE INDEX routing_layers_cleanup ON routing_layers(state, last_attempt_at, acquired_at)',
+  `-- MySQL: BEFORE UPDATE trigger with SIGNAL SQLSTATE '45000'; cleanup bookkeeping may change, ownership may not.
+  CREATE TRIGGER routing_layers_owner_immutable BEFORE UPDATE OF id, node_id, layer, execution_id, acquired_fence_epoch, acquired_at
+    ON routing_layers BEGIN SELECT RAISE(ABORT, 'routing layer ownership is immutable'); END`,
+  `-- MySQL: BEFORE DELETE trigger with SIGNAL SQLSTATE '45000'; conclusive cleanup keeps its ownership evidence.
+  CREATE TRIGGER routing_layers_no_delete BEFORE DELETE ON routing_layers
+    BEGIN SELECT RAISE(ABORT, 'routing layer ownership is durable'); END`,
 ]];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

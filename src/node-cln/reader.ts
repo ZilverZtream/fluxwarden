@@ -32,7 +32,9 @@ class ClnReader implements NodeReader {
 
   /** listsendpays by created index from `cursor` (doc/schemas/listsendpays.json index, start, limit). */
   async paymentsPage(cursor: bigint, pageSize: number): Promise<PaymentsPage> {
-    const payments = objects(await this.#rest.call('listsendpays', { index: 'created', start: Number(cursor), limit: pageSize }), 'payments').map(parseSendPay);
+    const start = Number(cursor);
+    if (!Number.isSafeInteger(start)) throw new RangeError('the payment cursor cannot be represented exactly');
+    const payments = objects(await this.#rest.call('listsendpays', { index: 'created', start, limit: pageSize }), 'payments').map(parseSendPay);
     if (payments.length > pageSize) throw new ProtocolError('payment page longer than requested');
     let next = cursor;
     for (const payment of payments) {

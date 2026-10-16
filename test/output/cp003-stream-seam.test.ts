@@ -5,9 +5,9 @@ import { expect, it } from 'vitest';
 import { capturedSink, outputModule, secretType, sentinelRoot } from '../helpers/output.js';
 
 it('CP-003/B10 successive completed writes cannot assemble a registered credential on one transport', async () => {
-  // Output redaction must hold across successive writes on one transport:
-  // an emitted prefix may remain, but a continuation must never complete the
-  // credential. Assert the joined transport bytes, not individual write chunks.
+  // Output redaction must hold across successive writes on one transport.
+  // Assert joined transport bytes and preserve independent ordinary fragments
+  // when finite output is finalized.
   const bytes = createHash('sha256').update('disposable successive-write credential fixture').digest();
   writeFileSync(join(sentinelRoot(), 'successive-write.bin'), bytes, { mode: 0o600 });
   const Secret = await secretType();
@@ -76,6 +76,7 @@ it('CP-003/B10 successive completed writes cannot assemble a registered credenti
     const second = `${value.slice(split)} / right`;
     await separated.write(first, { stream: 'stdout', exitCode: 0 });
     await separated.write(second, { stream: 'stderr', exitCode: 0 });
+    await separated.finalize();
     expect(stdout.text() === first && stderr.text() === second, `${encoding}: separate transports preserve independent partial messages`).toBe(true);
   }
 });

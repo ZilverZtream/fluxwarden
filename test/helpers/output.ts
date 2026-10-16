@@ -10,6 +10,10 @@ export interface Output {
   redact(text: string): string;
   write(text: string, options?: { stream?: 'stdout' | 'stderr'; exitCode?: number }): Promise<void>;
   json(value: unknown, options?: { exitCode?: number }): Promise<void>;
+  /** Completes finite output: resolves pending partial values independently
+   * per stream, preserves ordinary bytes, and waits for transport backpressure.
+   * write() acknowledges bounded acceptance without waiting for finalization. */
+  finalize(): Promise<void>;
 }
 export interface OutputModule {
   createOutput: (options: { stdout: Writable; stderr: Writable; secrets: readonly SecretValue[] }) => Output;

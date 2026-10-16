@@ -1,4 +1,6 @@
 import type { NormalizedChannel } from './normalize.js';
+import { channelExcluded } from './scid.js';
+import type { HopPolicy } from './route.js';
 
 export type ExecutionStatus =
   | 'CLAIMED' | 'PREFLIGHT' | 'SUBMITTING' | 'IN_FLIGHT' | 'VERIFIED_SUCCESS' | 'VERIFIED_FAILURE' | 'UNKNOWN' | 'CANCELLED';
@@ -67,6 +69,7 @@ export interface ExecutionPolicy {
   readonly cooldownAfterSuccessMs: number;
   readonly maxInFlight: number;
   readonly maxSnapshotAgeMs: number;
+  readonly excludeChannels?: readonly string[];
 }
 
 export interface RouteHop {
@@ -74,6 +77,8 @@ export interface RouteHop {
   readonly nodeOut: string;
   readonly amountOutMsat: bigint;
   readonly expiry: number;
+  /** The forwarding policy, when the route query supplied it. */
+  readonly policy?: HopPolicy | null;
 }
 
 export interface CircularRoute {
@@ -97,6 +102,7 @@ export interface RouteRequest {
   readonly maxFeePpm: bigint;
   readonly exemptFeeMsat: bigint;
   readonly maxCltvDelta: number;
+  readonly excludeChannels?: readonly string[];
 }
 
 export interface NodeHandshake {
@@ -106,12 +112,43 @@ export interface NodeHandshake {
   readonly synced: boolean;
 }
 
-/** The node adapter methods execution uses up to dispatch. Only the last three change node state. */
+export interface RoutingLayerClaim {
+  readonly id: string;
+  readonly fenceEpoch: bigint;
+}
+
+/** Persistence binds a receipt recorder while authority is live; adapters invoke it only on successful acquisition. */
+export interface RoutingLayerOwnership {
+  prepareAcquisition(executionId: string, fenceEpoch: bigint, nodePubkey: string, layer: string): () => RoutingLayerClaim;
+  removedImmediately(claim: RoutingLayerClaim, executionId: string, fenceEpoch: bigint): void;
+}
+
+/** The existing preparation claim and its narrow database ports, without a persistence dependency in core. */
+export interface RouteOwnership {
+  readonly db: {
+    readonly executions: {
+      plan(executionId: string): {
+        readonly status: ExecutionStatus;
+        readonly implementation: 'lnd' | 'cln';
+        readonly nodePubkey: string;
+        readonly sourceChannelKey: string;
+        readonly targetChannelKey: string;
+        readonly principalMsat: bigint;
+      } | null;
+      holds(executionId: string, fenceEpoch: bigint): boolean;
+    };
+    readonly routingLayers: RoutingLayerOwnership;
+  };
+  readonly executionId: string;
+  readonly fenceEpoch: bigint;
+}
+
+/** The node adapter methods execution uses up to dispatch. Only the last three move payment state. */
 export interface PreflightAdapter {
   handshake(): Promise<NodeHandshake>;
   capabilities(): ReadonlySet<NodeCapability>;
   listChannels(): Promise<readonly NormalizedChannel[]>;
-  findCircularRoute(req: RouteRequest): Promise<CircularRoute | { readonly refusal: string }>;
+  findCircularRoute(req: RouteRequest, ownership?: RouteOwnership): Promise<CircularRoute | { readonly refusal: string }>;
   createInvoice(...args: never[]): Promise<unknown>;
   sendOnRoute(...args: never[]): Promise<unknown>;
   cancelUnpaidInvoice(...args: never[]): Promise<unknown>;
@@ -145,15 +182,17 @@ export type CancelResult = 'CANCELED' | 'ALREADY_PAID' | 'NOT_FOUND';
 /**
  * The node adapter methods the executor and the reconciler use from dispatch on. `onDispatched` runs once, as soon as
  * the payment request has been written. `mode` 'sweep' reads the payer side from the node's payment list, never from a
- * live stream.
+ * live stream. The dispatcher supplies the durable execution invoice label for CLN's owned sendpay record.
  */
 export interface ExecutionAdapter {
   listChannels(): Promise<readonly NormalizedChannel[]>;
   createInvoice(amountMsat: bigint, preimage: Uint8Array, label: string, expirySeconds: number): Promise<InvoiceResult>;
-  sendOnRoute(route: CircularRoute, paymentHash: string, paymentSecret: string, onDispatched?: () => void): Promise<PaymentObservation>;
+  sendOnRoute(route: CircularRoute, paymentHash: string, paymentSecret: string, onDispatched?: () => void, label?: string): Promise<PaymentObservation>;
   observePayment(paymentHash: string, mode?: 'track' | 'sweep'): Promise<PaymentObservation>;
   invoiceState(paymentHash: string): Promise<InvoiceState>;
   cancelUnpaidInvoice(paymentHash: string, label: string): Promise<CancelResult>;
+  /** CLN terminal-owned resource cleanup; it never submits or changes a payment. */
+  removeRoutingLayer?(layer: string): Promise<'REMOVED' | 'NOT_FOUND'>;
 }
 
 export type AlertKind = 'INVARIANT_BREACH' | 'fee-mismatch' | 'delta-mismatch' | 'stuck-in-flight';
@@ -220,6 +259,14 @@ function ppmCeil(feeMsat: bigint, principalMsat: bigint): bigint {
   return (feeMsat * 1_000_000n + principalMsat - 1n) / principalMsat;
 }
 
+/** SECURITY §4.2: the exemption waives only ppm, and ceiling division uses the actual principal. */
+export function reportedFeeBreach(feeMsat: bigint, limits: {
+  readonly principalMsat: bigint; readonly approvedMaxFeeMsat: bigint; readonly maxFeePpm: bigint; readonly exemptFeeMsat: bigint;
+}): boolean {
+  return feeMsat < 0n || limits.principalMsat <= 0n || feeMsat > limits.approvedMaxFeeMsat
+    || (feeMsat > limits.exemptFeeMsat && ppmCeil(feeMsat, limits.principalMsat) > limits.maxFeePpm);
+}
+
 /**
  * Blocks the node adds above the route's delta when it sends: CLN sends at height + 1 + cltv_out (Decision D52); an
  * LND route's delta already carries its padding (SPEC §5.1 CircularRoute).
@@ -266,6 +313,7 @@ export function approveRoute(
   const last = hops[hops.length - 1];
   const beforeLast = hops[hops.length - 2];
   const principal = terms.principalMsat;
+  if (hops.some(hop => channelExcluded(hop.channelKey, policy.excludeChannels))) return { refusal: 'NO_FEASIBLE_ROUTE' };
   if (first === undefined || last === undefined || beforeLast === undefined || principal <= 0n) return { refusal: 'NO_FEASIBLE_ROUTE' };
   // V1
   if (route.sourceChannelKey !== terms.sourceChannelKey || first.channelKey !== terms.sourceChannelKey || first.nodeOut !== route.outPeer) return { refusal: 'NO_FEASIBLE_ROUTE' };
@@ -287,6 +335,13 @@ export function approveRoute(
     const hop = hops[i];
     if (previous === undefined || hop === undefined || hop.expiry > previous.expiry) return { refusal: 'CLTV_DELTA_UNSAFE' };
     if (hop.amountOutMsat > previous.amountOutMsat) return { refusal: 'NO_FEASIBLE_ROUTE' };
+    const forwarding = hop.policy;
+    if (forwarding !== undefined && forwarding !== null) {
+      if (forwarding.baseFeeMsat < 0n || forwarding.feePpm < 0n || hop.amountOutMsat <= 0n) return { refusal: 'NO_FEASIBLE_ROUTE' };
+      const expectedFee = forwarding.baseFeeMsat + hop.amountOutMsat * forwarding.feePpm / 1_000_000n;
+      if (previous.amountOutMsat - hop.amountOutMsat !== expectedFee) return { refusal: 'NO_FEASIBLE_ROUTE' };
+      if (hop.amountOutMsat < forwarding.minHtlcMsat || (forwarding.maxHtlcMsat !== null && hop.amountOutMsat > forwarding.maxHtlcMsat)) return { refusal: 'NO_FEASIBLE_ROUTE' };
+    }
   }
   if (last.expiry <= first.expiry - route.totalTimelockDelta) return { refusal: 'CLTV_DELTA_UNSAFE' };
   // V6, V7, V10 final amount.
@@ -295,7 +350,9 @@ export function approveRoute(
   if (last.amountOutMsat !== principal) return { refusal: 'NO_FEASIBLE_ROUTE' };
   const refusal = context === undefined ? null : contextRefusal(route, terms, policy, context);
   if (refusal !== null) return { refusal };
-  const approved = Object.freeze({ ...route, hops: Object.freeze(route.hops.map(hop => Object.freeze({ ...hop }))) }) as ApprovedRoute;
+  const approved = Object.freeze({ ...route, hops: Object.freeze(route.hops.map(hop => Object.freeze({ ...hop,
+    ...(hop.policy == null ? {} : { policy: Object.freeze({ ...hop.policy }) }),
+  }))) }) as ApprovedRoute;
   approvedRoutes.add(approved);
   return { route: approved };
 }

@@ -9,6 +9,7 @@ import { ledgerTransaction, readBalances, readBook, readExecutions, readJournals
 import { executionsRepository, type ExecutionsRepository } from './executions.js';
 import { proposalRepository, type ProposalRepository } from './proposals.js';
 import { commandData, type CommandData } from './command-data.js';
+import { routingLayersRepository, type RoutingLayersRepository } from './routing-layers.js';
 import { postAccountTransfer, postOpening } from '../ledger/post.js';
 import { channelLocalAccount } from '../ledger/accounts.js';
 import { checkReadablePath, prepareWritablePath, secureSideFiles } from './paths.js';
@@ -81,6 +82,7 @@ export interface SnapshotRow {
 
 export interface Database {
   readonly commandData: CommandData;
+  readonly routingLayers: RoutingLayersRepository;
   close(): void;
   /** The journal mode and synchronous level of the live connection. */
   pragmas(): { journalMode: string; synchronous: number };
@@ -364,15 +366,13 @@ function upsertChannelRow(db: DatabaseSync, channel: NormalizedChannel): string 
   // The same channel keeps one row while its key changes over its life on the same node: by key first;
   // else by funding outpoint when either side is in a pending listing (LND keys pending_open, waiting_close
   // and pending_force_closing channels by outpoint, open ones by chan_id; CLN moves from channel_id to
-  // short_channel_id); else a CLN channel to a peer takes over that peer's uncommitted row.
+  // short_channel_id). A shared peer alone cannot prove that a committed channel owns an uncommitted row.
   const transitional = channel.state === 'PENDING' || channel.state === 'CLOSING';
-  const uncommittedKey = `uncommitted:${channel.peerPubkey}`;
   // MySQL: same with FOR UPDATE appended, which locks the row or the gap inside the transaction
   const existing = db.prepare(`SELECT id, channel_key FROM channels WHERE node_id = ? AND (channel_key = ?
-      OR (funding_outpoint = ? AND funding_outpoint <> '' AND (lifecycle_state = 'PENDING' OR ? = 1))
-      OR channel_key = ?)
-    ORDER BY CASE WHEN channel_key = ? THEN 0 WHEN funding_outpoint = ? THEN 1 ELSE 2 END LIMIT 1`)
-    .get(channel.nodeId, channel.channelKey, channel.fundingOutpoint, transitional ? 1 : 0, uncommittedKey, channel.channelKey, channel.fundingOutpoint);
+      OR (funding_outpoint = ? AND funding_outpoint <> '' AND (lifecycle_state = 'PENDING' OR ? = 1)))
+    ORDER BY CASE WHEN channel_key = ? THEN 0 ELSE 1 END LIMIT 1`)
+    .get(channel.nodeId, channel.channelKey, channel.fundingOutpoint, transitional ? 1 : 0, channel.channelKey);
   if (existing !== undefined) {
     const id = textColumn(existing, 'id');
     // MySQL: same, with NOW(6) for the clock
@@ -393,6 +393,14 @@ function upsertChannelRow(db: DatabaseSync, channel: NormalizedChannel): string 
       } finally { active = false; }
     }
     return id;
+  }
+  const singlePendingKey = `uncommitted:${channel.peerPubkey}`;
+  const dualPendingKey = `uncommitted-dual:${channel.peerPubkey}`;
+  if (channel.channelKey !== singlePendingKey && channel.channelKey !== dualPendingKey) {
+    // MySQL: same with FOR UPDATE; the surrounding snapshot transaction rolls back all earlier rows too.
+    const pending = db.prepare(`SELECT id FROM channels WHERE node_id = ? AND lifecycle_state = 'PENDING'
+      AND funding_outpoint = '' AND channel_key IN (?, ?) LIMIT 1`).get(channel.nodeId, singlePendingKey, dualPendingKey);
+    if (pending !== undefined) throw new PersistenceError('AMBIGUOUS_CHANNEL_IDENTITY', 'a committed channel has no proven link to the pending channel identity');
   }
   const id = newUlid();
   // MySQL: same, with NOW(6) for the clock
@@ -439,6 +447,7 @@ function repositories(db: DatabaseSync, readOnly: boolean, unchanged: () => void
 
   return {
     commandData: commandData(db, writable, run),
+    routingLayers: routingLayersRepository(db, writable, run),
     close: () => { if (db.isOpen) db.close(); },
 
     now: () => run(() => dbNow(db)),

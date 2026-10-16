@@ -2,7 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ApprovalRow, ApprovalStore } from '../approval/types.js';
 import type { Msat } from '../core/money.js';
 import type { NormalizedChannel, ChannelState, Confidence } from '../core/normalize.js';
-import { bigintColumn, numberColumn, textColumn, immediate, dbNow } from './sql.js';
+import { bigintColumn, numberColumn, textColumn, immediate, dbNow, DB_NOW } from './sql.js';
 import { ApprovalError } from '../approval/errors.js';
 
 export function commandData(db: DatabaseSync, writable: (what: string) => void, run: <T>(work: () => T) => T) {
@@ -35,6 +35,52 @@ export function commandData(db: DatabaseSync, writable: (what: string) => void, 
   };
   return {
     approvals,
+    /** The same terminal anchors and global fee commitments used by execution admission. */
+    planningState(nodeId: string, periodMs: number) {
+      return run(() => {
+        // MySQL: same
+        const cooldowns = db.prepare(`SELECT e.status, s.channel_key AS source_channel, t.channel_key AS target_channel,
+            coalesce((SELECT min(ev.at) FROM execution_events ev WHERE ev.execution_id = e.id
+              AND ev.to_status = e.status AND (ev.from_status IS NULL OR ev.from_status <> e.status)), e.updated_at) AS at
+          FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id
+          JOIN channels s ON s.id = p.source_channel_id JOIN channels t ON t.id = p.target_channel_id
+          WHERE p.node_id = ? AND e.status IN ('VERIFIED_SUCCESS', 'VERIFIED_FAILURE')`).all(nodeId).map(row => ({
+            outcome: textColumn(row, 'status') === 'VERIFIED_SUCCESS' ? 'VERIFIED_SUCCESS' as const : 'VERIFIED_FAILURE' as const,
+            sourceChannel: textColumn(row, 'source_channel'), targetChannel: textColumn(row, 'target_channel'), at: numberColumn(row, 'at'),
+          }));
+        // MySQL: NOW(6) - INTERVAL ? * 1000 MICROSECOND for the window start
+        const reservations = db.prepare(`SELECT state, reserved_msat, consumed_msat, coalesce((
+            SELECT min(ev.at) FROM execution_events ev WHERE ev.execution_id = r.execution_id
+              AND ev.to_status = 'VERIFIED_SUCCESS' AND ev.from_status <> 'VERIFIED_SUCCESS'
+          ), period_start) AS at FROM budget_reservations r
+          WHERE state = 'HELD' OR (state = 'CONSUMED' AND coalesce((
+            SELECT min(ev.at) FROM execution_events ev WHERE ev.execution_id = r.execution_id
+              AND ev.to_status = 'VERIFIED_SUCCESS' AND ev.from_status <> 'VERIFIED_SUCCESS'
+          ), period_start) > ${DB_NOW} - ?)`).all(periodMs).map(row => ({
+            state: textColumn(row, 'state') === 'HELD' ? 'HELD' as const : 'CONSUMED' as const,
+            reservedMsat: bigintColumn(row, 'reserved_msat'), consumedMsat: row['consumed_msat'] === null ? null : bigintColumn(row, 'consumed_msat'),
+            at: numberColumn(row, 'at'),
+          }));
+        return { cooldowns, reservations };
+      });
+    },
+    /** Actual balance changes retained with the fenced delta-verification event. */
+    executionDeltas(executionId: string): { sourceDeltaMsat: string | null; targetDeltaMsat: string | null } | null {
+      return run(() => {
+        // MySQL: same
+        const row = db.prepare(`SELECT evidence_json FROM execution_events WHERE execution_id = ?
+          AND to_status = 'VERIFIED_SUCCESS' AND (json_extract(evidence_json, '$.sourceDeltaMsat') IS NOT NULL
+            OR json_extract(evidence_json, '$.targetDeltaMsat') IS NOT NULL)
+          ORDER BY id DESC LIMIT 1`).get(executionId);
+        if (row === undefined) return null;
+        const evidence = JSON.parse(textColumn(row, 'evidence_json')) as Record<string, unknown>;
+        const source = evidence['sourceDeltaMsat'];
+        const target = evidence['targetDeltaMsat'];
+        if (source !== null && (typeof source !== 'string' || !/^(0|-?[1-9][0-9]*)$/.test(source))) return null;
+        if (target !== null && (typeof target !== 'string' || !/^(0|-?[1-9][0-9]*)$/.test(target))) return null;
+        return { sourceDeltaMsat: source, targetDeltaMsat: target };
+      });
+    },
     snapshots(nodeId: string): NormalizedChannel[] {
       // MySQL: same
       return run(() => db.prepare(`SELECT c.*, s.* FROM channels c JOIN channel_snapshots s ON s.channel_id = c.id

@@ -101,7 +101,7 @@ export function diagnose(input: DiagnoseInput): Diagnosis {
   const stale: StaleChannel[] = [
     ...channels
       .map(channel => ({ channelKey: channel.channelKey, ageMs: now - channel.observedAt }))
-      .filter(entry => entry.ageMs > policy.max_snapshot_age || entry.ageMs < 0),
+      .filter(entry => !Number.isSafeInteger(entry.ageMs) || entry.ageMs > policy.max_snapshot_age || entry.ageMs < 0),
     ...Object.keys(targets).filter(key => !observed.has(key)).map(channelKey => ({ channelKey, ageMs: null })),
   ].sort((a, b) => compareKeys(a.channelKey, b.channelKey));
   if (stale.length > 0) return { status: 'STALE_SNAPSHOT', nodeName, stale };

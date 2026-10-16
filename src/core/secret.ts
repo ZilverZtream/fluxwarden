@@ -90,10 +90,11 @@ class Automaton {
   readonly #fail: Int32Array;
   readonly length: Int32Array;
   readonly tag: Int32Array;
+  readonly prefix: Int32Array;
 
   constructor(patterns: readonly { text: string; tag: number }[]) {
     const children: Map<number, number>[] = [new Map<number, number>()];
-    const own: number[] = [0], ownTag: number[] = [-1];
+    const own: number[] = [0], ownTag: number[] = [-1], depths: number[] = [0];
     let edges = 0;
     for (const { text, tag } of patterns) {
       let node = 0;
@@ -106,6 +107,7 @@ class Automaton {
           current.set(code, next);
           children.push(new Map<number, number>());
           own.push(0); ownTag.push(-1);
+          depths.push(index + 1);
           edges++;
         }
         node = next;
@@ -123,6 +125,7 @@ class Automaton {
     this.#fail = new Int32Array(count);
     this.length = new Int32Array(count);
     this.tag = new Int32Array(count).fill(-1);
+    this.prefix = Int32Array.from(children.map((edges, index) => edges.size > 0 ? depths[index] ?? 0 : 0));
     const queue: number[] = [];
     for (const [code, child] of children[0] ?? []) { this.#root[code] = child; queue.push(child); this.length[child] = own[child] ?? 0; this.tag[child] = ownTag[child] ?? -1; }
     for (let head = 0; head < queue.length; head++) {
@@ -133,6 +136,7 @@ class Automaton {
         while (fallback !== 0 && !children[fallback]?.has(code)) fallback = this.#fail[fallback] ?? 0;
         const target = fallback === 0 ? this.#root[code] ?? 0 : children[fallback]?.get(code) ?? 0;
         this.#fail[child] = target === child ? 0 : target;
+        this.prefix[child] = Math.max(this.prefix[child] ?? 0, this.prefix[this.#fail[child] ?? 0] ?? 0);
         const inherited = this.length[this.#fail[child] ?? 0] ?? 0;
         if ((own[child] ?? 0) >= inherited) { this.length[child] = own[child] ?? 0; this.tag[child] = ownTag[child] ?? -1; }
         else { this.length[child] = inherited; this.tag[child] = this.tag[this.#fail[child] ?? 0] ?? -1; }
@@ -166,6 +170,8 @@ class Automaton {
 export interface Redactor {
   readonly overlap: number;
   redact(text: string, emittedPrefix?: string): string;
+  /** Start of an unresolved registered-value suffix, or text.length when the text is decidable. */
+  pendingStart(text: string): number;
 }
 
 /** Source spellings of one whitespace character: literal, JSON escape, %XX, form "+", CRLF. */
@@ -227,29 +233,44 @@ function redactor(secrets: readonly Secret[]): Redactor {
     }
     for (const form of new Set(forms.hex.map(value => canonical(value, true)))) if (form) hexPatterns.push({ text: form, tag: marker });
   }
-  if (!markers.length) return { overlap: 0, redact: text => text };
+  if (!markers.length) return { overlap: 0, redact: text => text, pendingStart: text => text.length };
   const text = new Automaton(textPatterns), hex = new Automaton(hexPatterns);
   const textStarts = new Int32Array(text.maxLength), hexStarts = new Int32Array(hex.maxLength);
-  function scan(source: string, view: View, found: number[]): void {
+  function scan(source: string, view: View, found?: number[]): number {
     let textState = 0, hexState = 0, textCount = 0, hexCount = 0;
     const plus = view === 'form' ? 1 : 0;
     decode(source, view, (code, start, end) => {
       textState = text.next(textState, code);
       textStarts[textCount++ % text.maxLength] = start;
       const textLength = text.length[textState] ?? 0;
-      if (textLength) found.push(textStarts[(textCount - textLength) % text.maxLength] ?? start, end, text.tag[textState] ?? 0, plus);
+      if (textLength) found?.push(textStarts[(textCount - textLength) % text.maxLength] ?? start, end, text.tag[textState] ?? 0, plus);
       // Hex is matched case-insensitively, also when bytes are separated by colons.
       if (code === 0x3a) return;
       hexState = hex.next(hexState, code >= 0x41 && code <= 0x5a ? code + 32 : code);
       hexStarts[hexCount++ % hex.maxLength] = start;
       const hexLength = hex.length[hexState] ?? 0;
-      if (hexLength) found.push(hexStarts[(hexCount - hexLength) % hex.maxLength] ?? start, end, -1 - (hex.tag[hexState] ?? 0), 0);
+      if (hexLength) found?.push(hexStarts[(hexCount - hexLength) % hex.maxLength] ?? start, end, -1 - (hex.tag[hexState] ?? 0), 0);
     });
+    const textPrefix = text.prefix[textState] ?? 0, hexPrefix = hex.prefix[hexState] ?? 0;
+    return Math.min(textPrefix === 0 ? source.length : textStarts[(textCount - textPrefix) % text.maxLength] ?? source.length,
+      hexPrefix === 0 ? source.length : hexStarts[(hexCount - hexPrefix) % hex.maxLength] ?? source.length);
   }
   return {
     // Layout may separate the denoted characters arbitrarily; this bound covers escapes
     // (up to six source characters each) with line breaks and indentation between them.
     overlap: 8 * Math.max(text.maxLength, hex.maxLength) + 256,
+    pendingStart(source) {
+      let start = scan(source, 'plain');
+      for (const view of ['json', 'percent', 'form'] as const) {
+        if (view === 'json' ? !source.includes('\\') : !source.includes('%') && (view !== 'form' || !source.includes('+'))) continue;
+        // An incomplete escape may become a credential character in the next write. Keep it with any preceding
+        // undecidable prefix, without interpreting a partial escape as ordinary punctuation.
+        const tail = view === 'json' ? /\\(?:u[0-9a-fA-F]{0,3})?$/.exec(source) : /%[0-9a-fA-F]?$/.exec(source);
+        const end = tail?.index ?? source.length;
+        start = Math.min(start, scan(source.slice(0, end), view), end);
+      }
+      return start;
+    },
     redact(source, emittedPrefix = '') {
       const whole = emittedPrefix + source, boundary = emittedPrefix.length;
       const found: number[] = [];

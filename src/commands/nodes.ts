@@ -5,7 +5,7 @@ import { nodeText } from '../output/index.js';
 import type { ConnectionFlags } from '../cli/args.js';
 import { resolveConnection, type Environment } from '../cli/connect.js';
 import { handshake, networkName, nodeFailure, quarantineWarning } from './handshake.js';
-import { emitJson, iso, refuse, table, writeWarnings, type Io } from './report.js';
+import { boundedUtf8, emitJson, iso, refuse, table, writeWarnings, type Io } from './report.js';
 import { configStage, connectionStage, databaseStage, StageFailure } from './stages.js';
 
 /** Stored node rows, one per configured node; no node is contacted (NL2). */
@@ -104,7 +104,7 @@ export async function nodesInspect(io: Io, request: InspectRequest): Promise<num
       return emitJson(io, command, {
         code, warnings, error: null,
         result: {
-          name: node.name, implementation: node.implementation, alias: done.alias.length > 256 ? `${done.alias.slice(0, 256)}...` : done.alias,
+          name: node.name, implementation: node.implementation, alias: boundedUtf8(done.alias, 256),
           pubkey: identity.pubkey, network: networkName(node, identity.network), version: identity.version, synced: identity.syncedToChain,
           block_height: identity.blockHeight, capabilities: request.capabilities ? sorted : null,
         },

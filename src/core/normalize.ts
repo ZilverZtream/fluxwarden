@@ -342,7 +342,7 @@ function uncommittedClnChannel(channel: JsonObject, ctx: NormalizeContext, p: Pr
   if (toUs > total) throw new ProtocolError('to_us_msat exceeds total_msat');
   return {
     nodeId: ctx.nodeId,
-    channelKey: `uncommitted:${peerPubkey}`,
+    channelKey: `${state === 'DUALOPEND_OPEN_INIT' ? 'uncommitted-dual' : 'uncommitted'}:${peerPubkey}`,
     scid: null,
     peerPubkey,
     fundingOutpoint: '',

@@ -10,6 +10,7 @@ import { pipeline } from 'node:stream/promises';
 import { Worker, isMainThread, workerData } from 'node:worker_threads';
 
 const INFLATED_LIMIT = 128 * 1024 * 1024;
+const SCAN_CHUNK_BYTES = 256 * 1024;
 const INFLATION_HEARTBEAT_MS = 100;
 const INFLATION_STALL_MS = 2_000;
 
@@ -126,26 +127,35 @@ function lineTails(text) {
   return tails.join('');
 }
 export function groupedBase64Runs(text, shape, minimumLength = 0) {
+  const runs = [];
+  visitGroupedBase64(text, shape, minimumLength, (start, end) => runs.push(text.slice(start, end)));
+  return runs;
+}
+
+function visitGroupedBase64(text, shape, minimumLength, visit) {
   // A grouped run requires an actual separator immediately followed by a word.
   // This native syntax check avoids walking every ordinary ungrouped character.
   const pair = shape === 'dash' ? /-[A-Za-z0-9+/_]/
     : shape === 'underscore' ? /_[A-Za-z0-9+/]/
       : /[^A-Za-z0-9+/_=\s\\-][A-Za-z0-9+/_-]/;
-  if (!pair.test(text)) return [];
+  if (!pair.test(text)) return;
   const wordMask = shape === 'dash' ? 1 : shape === 'underscore' ? 2 : 4;
   const separatorMask = shape === 'dash' ? 16 : shape === 'underscore' ? 32 : 8;
   const word = at => (base64Classes[text.charCodeAt(at)] & wordMask) !== 0;
   const separator = at => (base64Classes[text.charCodeAt(at)] & separatorMask) !== 0;
-  const runs = [];
   let at = 0;
   while (at < text.length) {
     if (!word(at)) { at++; continue; }
     const start = at;
     while (at < text.length && word(at)) at++;
-    let end = at, groups = 1;
+    const firstLength = at - start;
+    let end = at, groups = 1, lastLength = firstLength, regular = firstLength % 4 === 0;
     while (end + 1 < text.length && separator(end) && word(end + 1)) {
+      if (lastLength !== firstLength) regular = false;
       end++;
+      const groupStart = end;
       while (end < text.length && word(end)) end++;
+      lastLength = end - groupStart;
       groups++;
     }
     if (groups === 1) continue;
@@ -155,11 +165,11 @@ export function groupedBase64Runs(text, shape, minimumLength = 0) {
     // character count bounds even the largest phase-zero decode; shorter
     // runs cannot hold any complete literal from the current source set.
     // Traverse the same greedy run and padding before deciding to emit it.
-    if (Math.floor((end - start - (groups - 1) + padding) * 3 / 4) >= minimumLength)
-      runs.push(text.slice(start, end + padding));
+    const length = end - start - (groups - 1) + padding;
+    if (Math.floor(length * 3 / 4) >= minimumLength)
+      visit(start, end + padding, length, regular && lastLength <= firstLength);
     at = end + padding;
   }
-  return runs;
 }
 
 function filesUnder(path, rejectLinks = false) {
@@ -374,7 +384,102 @@ function preparedSource(source) {
   };
 }
 
-function preparedData(data, minimumLength = 0) {
+function preparedBase64Runs(text, joined, tails, minimumLength, base64MayMatch) {
+  const runs = new Set();
+  const decisions = new Map();
+  let decisionBytes = 0;
+  let workspace;
+  const kept = (code, shape) => shape === 'dash' ? code !== 45 : shape === 'underscore' ? code !== 95
+    : shape !== 'other' || (base64Classes[code] & 4) !== 0 || code === 61;
+  const canonical = code => code === 45 ? 43 : code === 95 ? 47 : code;
+  const normalize = (view, start, end, shape) => {
+    const run = view.slice(start, end);
+    return shape === 'dash' ? run.replaceAll('-', '') : shape === 'underscore' ? run.replaceAll('_', '')
+      : shape === 'other' ? run.replace(/[^A-Za-z0-9+/_=-]/g, '') : run;
+  };
+  const allows = (view, start, end, shape, length) => {
+    if (base64MayMatch.maximumLength === 0) return true;
+    // Canonical ASCII spans use one reusable buffer, not one encoded string
+    // per predicate miss. Long spans keep every boundary through prefix overlap.
+    if (base64MayMatch.bytes) {
+      workspace ??= Buffer.allocUnsafe(SCAN_CHUNK_BYTES);
+      if (length > workspace.length) {
+        const overlap = base64MayMatch.maximumLength - 1;
+        let used = 0;
+        for (let at = start; at < end; at++) {
+          const code = view.charCodeAt(at);
+          if (!kept(code, shape)) continue;
+          workspace[used++] = canonical(code);
+          if (used === workspace.length) {
+            if (base64MayMatch.bytes(workspace.subarray(0, used))) return true;
+            workspace.copy(workspace, 0, used - overlap, used);
+            used = overlap;
+          }
+        }
+        return base64MayMatch.bytes(workspace.subarray(0, used));
+      }
+      let hash = 2166136261, used = 0;
+      for (let at = start; at < end; at++) {
+        const code = view.charCodeAt(at);
+        if (!kept(code, shape)) continue;
+        const byte = canonical(code);
+        workspace[used++] = byte;
+        hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+      }
+      const value = workspace.subarray(0, used), cached = decisions.get(hash);
+      if (Buffer.isBuffer(cached?.value) && cached.value.equals(value)) return cached.allowed;
+      const allowed = base64MayMatch.bytes(value);
+      // Hash collisions only select a complete logical-value comparison. Keep
+      // the existing conservative quota; collisions and full quotas stay uncached.
+      const size = used * 2 + 128;
+      if (!cached && decisionBytes + size <= SCAN_CHUNK_BYTES) {
+        decisions.set(hash, { value: Buffer.from(value), allowed });
+        decisionBytes += size;
+      }
+      return allowed;
+    }
+    let hash = 2166136261;
+    for (let at = start; at < end; at++) {
+      const code = view.charCodeAt(at);
+      if (kept(code, shape)) hash = Math.imul(hash ^ canonical(code), 16777619) >>> 0;
+    }
+    const cached = decisions.get(hash);
+    if (cached?.value.length === length) {
+      let index = 0, equal = true;
+      for (let at = start; at < end; at++) {
+        const code = view.charCodeAt(at);
+        if (kept(code, shape) && canonical(code) !== cached.value.charCodeAt(index++)) { equal = false; break; }
+      }
+      if (equal && index === length) return cached.allowed;
+    }
+    const value = normalize(view, start, end, shape).replaceAll('-', '+').replaceAll('_', '/');
+    const allowed = base64MayMatch(value);
+    const size = value.length * 2 + 128;
+    // Hashes only select a complete-string comparison. A collision or a full
+    // per-window budget receives the original uncached predicate instead.
+    if (!cached && decisionBytes + size <= SCAN_CHUNK_BYTES) {
+      decisions.set(hash, { value, allowed });
+      decisionBytes += size;
+    }
+    return allowed;
+  };
+  const admit = (view, start, end, shape, length, regular = true) => {
+    if (!regular || !(Math.floor(length * 3 / 4) >= minimumLength) || !allows(view, start, end, shape, length)) return;
+    // Group regularity never changes a cached source-predicate decision.
+    runs.add(normalize(view, start, end, shape));
+  };
+  for (const view of new Set([text, joined, tails])) {
+    const pattern = /[A-Za-z0-9+/_-]{16,}={0,2}/g;
+    for (let match; (match = pattern.exec(view)) !== null;) admit(view, match.index, pattern.lastIndex, 'raw', match[0].length);
+  }
+  for (const shape of ['dash', 'underscore', 'other']) {
+    visitGroupedBase64(text, shape, minimumLength, (start, end, length, regular) =>
+      admit(text, start, end, shape, length, shape !== 'other' || regular));
+  }
+  return [...runs].flatMap(run => [0, 1, 2, 3].map(phase => Buffer.from(run.slice(phase), 'base64url')));
+}
+
+function preparedData(data, minimumLength = 0, base64MayMatch = () => true, literalWorkspace) {
   // Exact duplicate views share immutable buffers within this decoded window.
   const buffers = new Map();
   const buffer = text => {
@@ -403,31 +508,21 @@ function preparedData(data, minimumLength = 0) {
   const compactLower = compact === text ? lower : compact.toLowerCase();
   const percentLower = percent === text ? lower
     : percent === compact ? compactLower : percent.toLowerCase();
-  let separated, decimal;
-  // Native byte searches retain exact UTF-8 representations of the recovered
-  // strings. Keep only the decimal/hex parser text on the JavaScript heap;
-  // several full-size normalized strings otherwise exhaust it on real logs.
-  return { data, recovered: recovered.map(buffer), text,
-    lower: buffer(lower), compact: buffer(compact),
-    compactLower: buffer(compactLower),
-    percent: buffer(percent), percentLower: buffer(percentLower),
-    splitViews: [buffer(joined), buffer(tails)],
+  let separated, decimal, base64Runs;
+  // Stream literal views through the same byte matcher. Detailed checks can
+  // still materialize every original UTF-8 buffer after a candidate is admitted.
+  return { data, text, literalWorkspace,
+    literalTexts: () => [...recovered, lower, compact, compactLower, percent, percentLower, joined, tails],
+    get recovered() { return recovered.map(buffer); },
+    get lower() { return buffer(lower); },
+    get compact() { return buffer(compact); },
+    get compactLower() { return buffer(compactLower); },
+    get percent() { return buffer(percent); },
+    get percentLower() { return buffer(percentLower); },
+    get splitViews() { return [buffer(joined), buffer(tails)]; },
     hexStreams: () => separated ??= hexStreams(text),
     decimalStream: () => decimal ??= decimalStream(text),
-    base64Runs: [...new Set([
-      ...[...new Set([text, joined, tails])].flatMap(view => view.match(/[A-Za-z0-9+/_-]{16,}={0,2}/g) ?? []),
-      ...groupedBase64Runs(text, 'dash', minimumLength).map(run => run.replaceAll('-', '')),
-      ...groupedBase64Runs(text, 'underscore', minimumLength).map(run => run.replaceAll('_', '')),
-      ...groupedBase64Runs(text, 'other', minimumLength).filter(run => {
-        // Only regular groups (equal, multiple of four) as real grouping produces.
-        const lengths = run.replace(/=+$/, '').split(/[^A-Za-z0-9+/_-]/).map(group => group.length);
-        return lengths[0] % 4 === 0 && lengths.slice(0, -1).every(length => length === lengths[0]) && lengths.at(-1) <= lengths[0];
-      }).map(run => run.replace(/[^A-Za-z0-9+/_=-]/g, '')),
-    // Even an unpadded phase-zero decode cannot exceed this byte count.
-    // Shorter runs cannot contain any complete source or text-encoding literal;
-    // keep every phase of every run that can reach the source-derived floor.
-    ])].filter(run => Math.floor(run.length * 3 / 4) >= minimumLength)
-      .flatMap(run => [0, 1, 2, 3].map(phase => Buffer.from(run.slice(phase), 'base64url'))) };
+    get base64Runs() { return base64Runs ??= preparedBase64Runs(text, joined, tails, minimumLength, base64MayMatch); } };
 }
 
 function alternateEncoding(data, source, state = preparedSource(source), input = preparedData(data)) {
@@ -459,82 +554,109 @@ function alternateEncoding(data, source, state = preparedSource(source), input =
 }
 
 const MATCHER_SHIFT_BYTES = 1 << 20;
-function preparedMatcherGroup(states) {
-  const matcher = values => {
-    const literals = [...new Map(values.map(bytes => [bytes.toString('hex'), bytes])).values()];
-    const minimumLength = literals.reduce((size, bytes) => Math.min(size, bytes.length), Infinity);
-    const width = Math.min(32, Math.max(8, minimumLength));
-    const short = literals.filter(bytes => bytes.length < width);
-    const blockKey = word => Math.imul(word, 0x9e3779b1) >>> 12;
-    // A rare final block permits long conservative skips. Frequency is only
-    // an anchor-selection heuristic; hash collisions cannot suppress a match.
-    const prefixes = new Map();
-    const selectAnchors = () => {
-      const frequency = new Uint16Array(MATCHER_SHIFT_BYTES);
-      for (const bytes of literals) {
-        for (let at = width - 4; at + 4 <= bytes.length; at++) {
-          const key = blockKey(bytes.readUInt32LE(at));
-          if (frequency[key] < 65535) frequency[key]++;
-        }
-      }
-      for (const bytes of literals.filter(bytes => bytes.length >= width)) {
-        let offset = 0, best = Infinity;
-        for (let at = 0; at + width <= bytes.length; at++) {
-          const score = frequency[blockKey(bytes.readUInt32LE(at + width - 4))];
-          if (score < best) { best = score; offset = at; }
-          if (score === 1) break;
-        }
-        const key = bytes.readUInt32LE(offset);
-        if (!prefixes.has(key)) prefixes.set(key, []);
-        prefixes.get(key).push({ bytes, offset });
-      }
-    };
-    selectAnchors();
-    // Wu-Manber's conservative block shifts (bubiche/wu_manber,
-    // wu_manber.hpp preProcess/scan), with anchors bounded by the shortest
-    // literal. Four-byte hash collisions only reduce shifts; every admitted
-    // position still receives exact complete-literal validation.
-    const shifts = new Uint8Array(MATCHER_SHIFT_BYTES).fill(width - 3);
-    for (const candidates of prefixes.values()) for (const { bytes, offset } of candidates) {
-      for (let at = 0; at <= width - 4; at++) {
-        const block = blockKey(bytes.readUInt32LE(offset + at));
-        shifts[block] = Math.min(shifts[block], width - 4 - at);
+function preparedLiteralMatcher(values, minimumWidth = 8) {
+  const literals = [...new Map(values.map(bytes => [bytes.toString('hex'), bytes])).values()];
+  const minimumLength = literals.reduce((size, bytes) => Math.min(size, bytes.length), Infinity);
+  const maximumLength = literals.reduce((size, bytes) => Math.max(size, bytes.length), 0);
+  const width = Math.min(32, Math.max(minimumWidth, minimumLength));
+  const short = literals.filter(bytes => bytes.length < width);
+  const blockKey = word => Math.imul(word, 0x9e3779b1) >>> 12;
+  // A rare final block permits long conservative skips. Frequency is only
+  // an anchor-selection heuristic; hash collisions cannot suppress a match.
+  const prefixes = new Map();
+  const selectAnchors = () => {
+    const frequency = new Uint16Array(MATCHER_SHIFT_BYTES);
+    for (const bytes of literals) {
+      for (let at = width - 4; at + 4 <= bytes.length; at++) {
+        const key = blockKey(bytes.readUInt32LE(at));
+        if (frequency[key] < 65535) frequency[key]++;
       }
     }
-    // Only freshly prepared, immutable view buffers reach this matcher.
-    const checked = new WeakMap();
-    const check = bytes => {
-      for (const value of short) if (bytes.includes(value)) return true;
-      // Recover each possible literal start from its interior anchor, then
-      // compare the complete bytes. Short values were searched independently.
-      for (let at = 0; at + width <= bytes.length;) {
-        const shift = shifts[blockKey(bytes.readUInt32LE(at + width - 4))];
-        if (shift) { at += shift; continue; }
-        const key = bytes.readUInt32LE(at);
-        const candidates = prefixes.get(key);
-        if (candidates) for (const { bytes: value, offset } of candidates) {
-          if (bytes.readUInt32LE(at + width - 4) !== value.readUInt32LE(offset + width - 4)) continue;
-          const start = at - offset;
-          if (start >= 0 && start + value.length <= bytes.length &&
-              bytes.compare(value, 0, value.length, start, start + value.length) === 0) return true;
-        }
-        // A zero shift admits a candidate and advances just one byte, keeping
-        // overlapping anchors and their original literal starts reachable.
-        at++;
+    for (const bytes of literals.filter(bytes => bytes.length >= width)) {
+      let offset = 0, best = Infinity;
+      for (let at = 0; at + width <= bytes.length; at++) {
+        const score = frequency[blockKey(bytes.readUInt32LE(at + width - 4))];
+        if (score < best) { best = score; offset = at; }
+        if (score === 1) break;
       }
-      return false;
-    };
-    const match = bytes => {
-      // No full literal can fit in a shorter buffer. In particular, avoid
-      // retaining WeakMap entries for the many tiny decoded grouping runs.
-      if (bytes.length < minimumLength) return false;
-      if (!checked.has(bytes)) checked.set(bytes, check(bytes));
-      return checked.get(bytes);
-    };
-    match.minimumLength = minimumLength;
-    return match;
+      const key = bytes.readUInt32LE(offset);
+      if (!prefixes.has(key)) prefixes.set(key, []);
+      prefixes.get(key).push({ bytes, offset });
+    }
   };
-  const encoded = matcher(states.flatMap(state => [
+  selectAnchors();
+  // Wu-Manber's conservative block shifts (bubiche/wu_manber,
+  // wu_manber.hpp preProcess/scan), with anchors bounded by the shortest
+  // literal. Four-byte hash collisions only reduce shifts; every admitted
+  // position still receives exact complete-literal validation.
+  const shifts = new Uint8Array(MATCHER_SHIFT_BYTES).fill(width - 3);
+  for (const candidates of prefixes.values()) for (const { bytes, offset } of candidates) {
+    for (let at = 0; at <= width - 4; at++) {
+      const block = blockKey(bytes.readUInt32LE(offset + at));
+      shifts[block] = Math.min(shifts[block], width - 4 - at);
+    }
+  }
+  // Only freshly prepared, immutable view buffers reach this matcher.
+  const checked = new WeakMap();
+  const check = bytes => {
+    for (const value of short) if (bytes.includes(value)) return true;
+    // Recover each possible literal start from its interior anchor, then
+    // compare the complete bytes. Short values were searched independently.
+    for (let at = 0; at + width <= bytes.length;) {
+      const shift = shifts[blockKey(bytes.readUInt32LE(at + width - 4))];
+      if (shift) { at += shift; continue; }
+      const key = bytes.readUInt32LE(at);
+      const candidates = prefixes.get(key);
+      if (candidates) for (const { bytes: value, offset } of candidates) {
+        if (bytes.readUInt32LE(at + width - 4) !== value.readUInt32LE(offset + width - 4)) continue;
+        const start = at - offset;
+        if (start >= 0 && start + value.length <= bytes.length &&
+            bytes.compare(value, 0, value.length, start, start + value.length) === 0) return true;
+      }
+      // A zero shift admits a candidate and advances just one byte, keeping
+      // overlapping anchors and their original literal starts reachable.
+      at++;
+    }
+    return false;
+  };
+  const match = bytes => {
+    // No full literal can fit in a shorter buffer. In particular, avoid
+    // retaining WeakMap entries for the many tiny decoded grouping runs.
+    if (bytes.length < minimumLength) return false;
+    if (!checked.has(bytes)) checked.set(bytes, check(bytes));
+    return checked.get(bytes);
+  };
+  // Mutable invocation-owned workspaces must bypass immutable-buffer memoization.
+  match.mutable = bytes => bytes.length >= minimumLength && check(bytes);
+  match.minimumLength = minimumLength;
+  match.text = (text, workspace) => {
+    // Search the identical UTF-8 byte sequence without retaining a complete
+    // encoded view. Small views and very long literals keep the direct path.
+    if (!workspace || !maximumLength || text.length <= maximumLength || maximumLength >= SCAN_CHUNK_BYTES / 2)
+      return match(Buffer.from(text));
+    const bytes = workspace();
+    let from = 0, retained = 0;
+    while (from < text.length) {
+      // Three bytes per UTF-16 code unit bounds UTF-8, including replacement
+      // bytes for unpaired surrogates. Keep valid pairs together so slicing
+      // cannot introduce replacement bytes absent from Buffer.from(text).
+      let end = Math.min(text.length, from + Math.floor((bytes.length - retained) / 3));
+      if (end < text.length && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff &&
+          text.charCodeAt(end) >= 0xdc00 && text.charCodeAt(end) <= 0xdfff) end--;
+      const length = retained + bytes.write(text.slice(from, end), retained, bytes.length - retained, 'utf8');
+      // The reusable workspace is mutable: bypass the immutable-buffer cache.
+      if (check(bytes.subarray(0, length))) return true;
+      retained = Math.min(maximumLength - 1, length);
+      bytes.copy(bytes, 0, length - retained, length);
+      from = end;
+    }
+    return false;
+  };
+  return match;
+}
+
+function preparedMatcherGroup(states) {
+  const encoded = preparedLiteralMatcher(states.flatMap(state => [
     state.source,
     ...state.variants.map(variant => variant.bytes), state.utf16le, state.utf16be,
     ...state.shortBase64TextForms,
@@ -545,8 +667,12 @@ function preparedMatcherGroup(states) {
     // This filter may admit a match across parser boundaries; the detailed
     // checks below still enforce all boundaries and choose the encoding.
     if (encoded(input.data)) return true;
-    if ([...input.recovered, input.lower, input.compact, input.compactLower,
-      input.percent, input.percentLower, ...input.splitViews].some(encoded)) return true;
+    const checkedTexts = new Set();
+    for (const text of input.literalTexts()) {
+      if (checkedTexts.has(text)) continue;
+      checkedTexts.add(text);
+      if (encoded.text(text, input.literalWorkspace)) return true;
+    }
     if (input.hexStreams().some(stream => encoded(stream.bytes)) ||
         input.decimalStream().some(stream => encoded(stream.bytes))) return true;
     return input.base64Runs.some(encoded);
@@ -559,47 +685,94 @@ function preparedMatcher(states) {
   return preparedMatcherGroup(states);
 }
 
+function preparedBase64Filter(states) {
+  const admitAll = () => true;
+  admitAll.bytes = admitAll;
+  admitAll.maximumLength = 0;
+  if (!states.length) return admitAll;
+  const patterns = new Set();
+  for (const state of states) for (const bytes of [state.source, ...state.textForms]) {
+    const prefix = bytes.subarray(0, 24);
+    for (let phase = 0; phase < 3; phase++) {
+      const encoded = Buffer.concat([Buffer.alloc(phase), prefix]).toString('base64');
+      const from = Math.ceil(phase * 8 / 6), to = Math.floor((phase + prefix.length) * 8 / 6);
+      const anchor = encoded.slice(from, to);
+      // A short source might provide no complete, independently determined
+      // sextet. In that case every run still receives all four decoding passes.
+      if (!anchor) return admitAll;
+      patterns.add(anchor);
+    }
+  }
+  // Any decoded occurrence contains these interior sextets of its first bytes,
+  // regardless of the enclosing byte phase or the decoder's starting offset.
+  // Group separators were already removed. Each sextet accepts either alphabet;
+  // full decoding and exact complete-source checks still decide every match.
+  const prefixes = preparedLiteralMatcher([...patterns].map(pattern => Buffer.from(pattern)), 4);
+  const matches = run => prefixes(Buffer.from(run.replaceAll('-', '+').replaceAll('_', '/')));
+  matches.bytes = prefixes.mutable;
+  matches.maximumLength = [...patterns].reduce((length, pattern) => Math.max(length, pattern.length), 0);
+  return matches;
+}
+
 function preparedSyntaxFilter(states) {
-  const quote = text => [...text].map(char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`).join('');
+  if (!states.length) return () => true;
   const patterns = new Set();
   for (const state of states) {
     for (const bytes of [state.source, ...state.variants.map(form => form.bytes), state.utf16le, state.utf16be,
-      ...state.shortBase64TextForms]) patterns.add(quote(bytes.subarray(0, 8).toString('latin1')));
+      ...state.shortBase64TextForms]) patterns.add(bytes.subarray(0, 32).toString('latin1'));
     for (const bytes of [state.source, ...state.textForms]) {
-      const prefix = bytes.subarray(0, 6);
-      patterns.add(quote(prefix.toString('hex')));
-      patterns.add(quote([...prefix].map(byte => String(byte)).join('')));
+      const prefix = bytes.subarray(0, 24);
+      patterns.add(prefix.toString('hex'));
+      patterns.add([...prefix].map(byte => String(byte)).join(''));
       // Drop the leading sextets influenced by an unknown enclosing prefix.
       // Every remaining sextet depends solely on registered bytes. Include all
       // three byte phases and grouped/wrapped forms, then verify full values.
       for (let phase = 0; phase < 3; phase++) {
         const encoded = Buffer.concat([Buffer.alloc(phase), prefix]).toString('base64');
         const from = Math.ceil(phase * 8 / 6), to = Math.floor((phase + prefix.length) * 8 / 6);
-        patterns.add(quote(encoded.slice(from, to)));
+        patterns.add(encoded.slice(from, to));
       }
     }
   }
   // Escape syntaxes are decoded by the authoritative recognizers. A marker
   // admits the entire window rather than trying to enumerate their depths.
   const marker = /[\\%]|&#/;
-  // Keep the same literal alternatives and case-insensitive regexp semantics.
-  // Node 22's registry-sized search is slow; its equivalent smaller expressions
-  // avoid that cost. Newer engines search the complete expression efficiently.
-  // Both strategies keep every alternative and every normalized view.
-  const literals = [...patterns], regexes = [];
-  const batchSize = parseInt(process.versions.node, 10) === 22 ? 128 : Math.max(1, literals.length);
-  for (let at = 0; at < literals.length; at += batchSize) {
-    regexes.push(new RegExp(literals.slice(at, at + batchSize).join('|'), 'i'));
-  }
-  const matches = text => regexes.some(regex => regex.test(text));
+  if (patterns.has('')) return () => true;
+  // Every case-insensitive Latin-1 literal match also survives uppercasing both
+  // strings. Expanding characters can admit extra prefixes; complete parsers
+  // still decide hits. Every complete value contains its full chosen prefix;
+  // longer prefixes permit larger conservative byte-search skips.
+  const prefixes = preparedLiteralMatcher([...patterns].map(pattern => Buffer.from(pattern.toUpperCase())), 4);
+  const matches = text => prefixes(Buffer.from(text.toUpperCase()));
   return bytes => {
     const text = bytes.toString('latin1');
     // These are deliberately permissive prefix views: removing even invalid
     // separators can only admit extra candidates. Full parsers decide matches.
     return marker.test(text) || matches(text) || matches(text.replace(/[^A-Za-z0-9+/]/g, '')) ||
+      matches(text.replace(/[^A-Za-z0-9+/_-]/g, '').replaceAll('-', '+').replaceAll('_', '/')) ||
       matches(text.replace(/0x/gi, '').replace(/[^0-9a-f]/gi, '')) ||
       matches(text.replace(/[^0-9]/g, ''));
   };
+}
+
+function replaceCredential(text, value, foldedHex) {
+  if (!value) return text;
+  // UTF-8 replaces each lone surrogate with one replacement character. Compare
+  // that view, whose code-unit positions are unchanged, but copy ordinary spans
+  // from the original string. Hex folding also preserves every position.
+  const comparable = foldedHex ? text.replace(/[A-F]/g, letter => letter.toLowerCase()) : text.toWellFormed();
+  const needle = foldedHex ? value.toLowerCase() : value;
+  let at = comparable.indexOf(needle);
+  if (at < 0) return text;
+  const parts = [];
+  let from = 0;
+  do {
+    parts.push(text.slice(from, at), '[redacted]');
+    from = at + needle.length;
+    at = comparable.indexOf(needle, from);
+  } while (at >= 0);
+  parts.push(text.slice(from));
+  return parts.join('');
 }
 
 function safePath(path, sources, state = preparedRedactor(sources)) {
@@ -611,8 +784,8 @@ function safePath(path, sources, state = preparedRedactor(sources)) {
         (name === path || !state.possibleLeak(preparedData(Buffer.from(name), state.possibleLeak.minimumLength)))) return path;
   }
   let safe = path;
-  for (const { value, regex } of state.encoded) {
-    safe = regex ? safe.replace(regex, '[redacted]') : safe.replaceAll(value, '[redacted]');
+  for (const { value, foldedHex } of state.encoded) {
+    safe = replaceCredential(safe, value, foldedHex);
   }
   // Recognize the filename independently: hex-looking directory prefixes can
   // share separators with its encoding and change the byte alignment.
@@ -641,8 +814,7 @@ function preparedCredential(source) {
   const state = { ...preparedSource(source),
     variants: forms.map(([encoding, value]) => ({ encoding, value,
       lower: value.toLowerCase(), bytes: Buffer.from(value, 'utf8') })),
-    redactions: forms.map(([encoding, value]) => ({ value,
-      regex: encoding.startsWith('hex-') ? new RegExp(value, 'gi') : null })),
+    redactions: forms.map(([encoding, value]) => ({ value, foldedHex: encoding.startsWith('hex-') })),
     size: source.length * 256 + 4096 };
   const limit = 64 * 1_048_576;
   if (state.size <= limit) {
@@ -669,12 +841,14 @@ function preparedSnapshot(sources) {
   const states = sources.map(preparedCredential);
   const state = { states, possibleLeak: sources.length ? preparedMatcher(states) : null,
     syntax: preparedSyntaxFilter(states),
+    base64MayMatch: preparedBase64Filter(states),
     redactor: preparedRedactor(sources),
     cleanInputs: new Map(), cleanInputBytes: 0,
     // Include buffers, string encodings, regex alternatives and per-source
-    // overhead conservatively, plus both matchers' fixed byte-shift tables.
+    // overhead conservatively, plus both full and both prefix matchers' fixed
+    // byte-shift tables.
     // Oversized snapshots receive uncached checks.
-    size: (sources.length ? 2 * MATCHER_SHIFT_BYTES : 0) +
+    size: (sources.length ? 4 * MATCHER_SHIFT_BYTES : 0) +
       sources.reduce((size, source) => size + source.length * 256 + 4096, key.length * 2) };
   const limit = 64 * 1_048_576;
   if (state.size <= limit) {
@@ -841,6 +1015,54 @@ export function sentinelRedactor(options) {
   };
 }
 
+const DECLARATION_CACHE_ENTRIES = 8;
+const DECLARATION_CACHE_BYTES = 1_048_576;
+const declarationCache = new Map();
+let declarationCacheBytes = 0;
+
+function declaredOutputs(testTmp) {
+  const declared = new Set(), declaredHashes = new Set();
+  if (!testTmp || !existsSync(join(testTmp, 'declared-out.txt'))) return { declared, declaredHashes };
+  // Read every current byte before consulting the cache. Removal, unreadable
+  // files and same-size replacements must retain their ordinary behaviour.
+  const bytes = readFileSync(join(testTmp, 'declared-out.txt'));
+  const directory = resolve(testTmp);
+  const cached = declarationCache.get(directory);
+  if (cached?.bytes.equals(bytes)) {
+    declarationCache.delete(directory);
+    declarationCache.set(directory, cached);
+    return cached.parsed;
+  }
+  if (cached) {
+    declarationCache.delete(directory);
+    declarationCacheBytes -= cached.size;
+  }
+  let cacheable = true;
+  for (const line of bytes.toString('utf8').split(/\r?\n/)) {
+    const entry = line.trim();
+    // Drive-relative entries can depend on another drive's current directory.
+    if (/^[a-z]:(?![\\/])/i.test(entry)) cacheable = false;
+    if (/^sha256:[0-9a-f]{64}$/.test(entry)) declaredHashes.add(entry.slice(7));
+    else if (entry) declared.add(resolve(testTmp, entry));
+  }
+  const parsed = { declared, declaredHashes };
+  // Account for retained input bytes, decoded text possibly held by substrings,
+  // resolved strings and collection entries. Large manifests still receive the
+  // complete parser without being retained.
+  const size = bytes.length * 3 + directory.length * 2 + 256 +
+    [...declared, ...declaredHashes].reduce((total, value) => total + value.length * 2 + 96, 0);
+  if (cacheable && size <= DECLARATION_CACHE_BYTES) {
+    while (declarationCache.size >= DECLARATION_CACHE_ENTRIES || declarationCacheBytes + size > DECLARATION_CACHE_BYTES) {
+      const oldest = declarationCache.keys().next().value;
+      declarationCacheBytes -= declarationCache.get(oldest).size;
+      declarationCache.delete(oldest);
+    }
+    declarationCache.set(directory, { bytes, parsed, size });
+    declarationCacheBytes += size;
+  }
+  return parsed;
+}
+
 /**
  * @typedef {SentinelOptions & {
  *   paths?: string[], commandOutput?: string, testTmp?: string, evidenceDir?: string
@@ -857,6 +1079,8 @@ export function findLeaks({ sentinels, sentinelDir, paths = [], commandOutput = 
   if (!sources.length) throw new Error('no nonempty sentinel registered');
   const snapshot = preparedSnapshot(sources);
   const { states, possibleLeak, redactor } = snapshot;
+  let literalBytes;
+  const literalWorkspace = () => literalBytes ??= Buffer.allocUnsafe(SCAN_CHUNK_BYTES);
   const hit = (location, encoding) => ({ path: safePath(location, sources, redactor), encoding });
 
   // Reject links before reading any artifact, including the output manifest.
@@ -868,16 +1092,8 @@ export function findLeaks({ sentinels, sentinelDir, paths = [], commandOutput = 
   })));
   // A declared output is named by its path, or by `sha256:<hex>` of its resolved path when the
   // path itself holds a credential (a test of path redaction), so the manifest never carries it.
-  const declared = new Set();
-  const declaredHashes = new Set();
+  const { declared, declaredHashes } = declaredOutputs(testTmp);
   const pathHash = path => createHash('sha256').update(path, 'utf8').digest('hex');
-  if (testTmp && existsSync(join(testTmp, 'declared-out.txt'))) {
-    for (const line of readFileSync(join(testTmp, 'declared-out.txt'), 'utf8').split(/\r?\n/)) {
-      const entry = line.trim();
-      if (/^sha256:[0-9a-f]{64}$/.test(entry)) declaredHashes.add(entry.slice(7));
-      else if (entry) declared.add(resolve(testTmp, entry));
-    }
-  }
   const included = candidates.filter(({ path }) => {
     const absolute = resolve(path);
     const fromEvidence = evidenceDir ? relative(resolve(evidenceDir), absolute) : null;
@@ -891,9 +1107,9 @@ export function findLeaks({ sentinels, sentinelDir, paths = [], commandOutput = 
   const inspect = (location, data, name = '') => {
     // Artifact decoding is independent of the credential population. Prepare
     // it once, while still comparing every exact registered credential.
-    const input = preparedData(data, possibleLeak.minimumLength);
+    const input = preparedData(data, possibleLeak.minimumLength, snapshot.base64MayMatch, literalWorkspace);
     const nameData = name ? Buffer.from(name) : null;
-    const nameInput = nameData ? preparedData(nameData, possibleLeak.minimumLength) : null;
+    const nameInput = nameData ? preparedData(nameData, possibleLeak.minimumLength, snapshot.base64MayMatch, literalWorkspace) : null;
     if (!possibleLeak(input) && (!nameInput || !possibleLeak(nameInput))) return null;
     const lowerName = name.toLowerCase();
     for (const state of states) {
@@ -917,31 +1133,31 @@ export function findLeaks({ sentinels, sentinelDir, paths = [], commandOutput = 
     let previous = Buffer.alloc(0);
     let suffixes = [];
     let pendingTokens = [];
-    let prefix = Buffer.alloc(0);
-    const lengths = [];
     const cacheLimit = 4 * 1_048_576;
+    const stateSize = () => previous.length + suffixes.reduce((size, bytes) => size + bytes.length, 0) +
+      pendingTokens.reduce((size, text) => size + text.length * 2, 0);
     // Names are scanned even for empty files, and never combined with content.
     const named = inspect(location, Buffer.alloc(0), name);
     if (named) return named;
     for (const chunk of chunks) {
-      // Complete prefix bytes and read boundaries identify a deterministic
-      // clean parser state within this exact, freshly reread source snapshot.
-      // Names are always checked separately; hashes only index exact equality.
-      let key = null;
-      if (prefix && prefix.length + chunk.length <= 1_048_576) {
-        prefix = Buffer.concat([prefix, chunk]);
-        lengths.push(chunk.length);
-        key = createHash('sha256').update(prefix).update(lengths.join(',')).digest('hex');
+      // The complete incoming recognizer state and freshly read chunk identify
+      // a deterministic transition within this exact source snapshot. Names
+      // are checked separately; hashes only index complete byte comparisons.
+      let key = null, before = null;
+      if (stateSize() <= cacheLimit / 2) {
+        before = serialize({ previous, suffixes, pendingTokens });
+        key = createHash('sha256').update(before).update(chunk).digest('hex');
         const cached = snapshot.cleanInputs.get(key);
-        if (cached?.prefix.equals(prefix) && cached.lengths.length === lengths.length &&
-            cached.lengths.every((length, at) => length === lengths[at])) {
+        if (cached?.before.equals(before) && cached.chunk.equals(chunk)) {
           // Node.js/node lib/v8.js serialization preserves byte buffers and
           // every string code unit, including unmatched UTF-16 surrogates.
           ({ previous, suffixes, pendingTokens } = deserialize(inflateSync(cached.state,
             { maxOutputLength: cacheLimit })));
+          snapshot.cleanInputs.delete(key);
+          snapshot.cleanInputs.set(key, cached);
           continue;
         }
-      } else prefix = null;
+      }
       const data = Buffer.concat([previous, chunk]);
       if (syntax(data)) {
         const found = inspect(location, data);
@@ -997,19 +1213,27 @@ export function findLeaks({ sentinels, sentinelDir, paths = [], commandOutput = 
         }
       }
       previous = Buffer.from(data.subarray(-overlap));
-      if (key && snapshot.cleanInputs.size < 256 &&
-          snapshot.cleanInputBytes + prefix.length + lengths.length * 8 + 256 <= cacheLimit) {
-        // Only bounded states are cacheable. Larger states still receive all
-        // recognition passes, without retaining input-size-proportional data.
-        const stateBytes = previous.length + suffixes.reduce((size, bytes) => size + bytes.length, 0) +
-          pendingTokens.reduce((size, text) => size + text.length * 2, 0);
-        if (stateBytes <= cacheLimit / 2) {
+      if (key && stateSize() <= cacheLimit / 2) {
+        // Cache only clean transitions and bounded states. Copy the complete
+        // chunk because file reads reuse their buffer. Recurring log content
+        // can then reuse work without trusting file metadata or a digest alone.
+        if (before.length + chunk.length + 256 <= cacheLimit) {
           const encoded = serialize({ previous, suffixes, pendingTokens });
           if (encoded.length <= cacheLimit) {
             const state = deflateSync(encoded);
-            const size = prefix.length + state.length + lengths.length * 8 + 256;
-            if (snapshot.cleanInputBytes + size <= cacheLimit) {
-              snapshot.cleanInputs.set(key, { prefix, lengths: [...lengths], state });
+            const size = before.length + chunk.length + state.length + 256;
+            if (size <= cacheLimit) {
+              const replaced = snapshot.cleanInputs.get(key);
+              if (replaced) {
+                snapshot.cleanInputs.delete(key);
+                snapshot.cleanInputBytes -= replaced.size;
+              }
+              while (snapshot.cleanInputs.size >= 256 || snapshot.cleanInputBytes + size > cacheLimit) {
+                const oldest = snapshot.cleanInputs.keys().next().value;
+                snapshot.cleanInputBytes -= snapshot.cleanInputs.get(oldest).size;
+                snapshot.cleanInputs.delete(oldest);
+              }
+              snapshot.cleanInputs.set(key, { before, chunk: Buffer.from(chunk), state, size });
               snapshot.cleanInputBytes += size;
             }
           }
@@ -1028,12 +1252,12 @@ export function findLeaks({ sentinels, sentinelDir, paths = [], commandOutput = 
     return null;
   };
   function* bufferChunks(data) {
-    for (let at = 0; at < data.length; at += 256 * 1024) yield data.subarray(at, at + 256 * 1024);
+    for (let at = 0; at < data.length; at += SCAN_CHUNK_BYTES) yield data.subarray(at, at + SCAN_CHUNK_BYTES);
   }
   function* fileChunks(path) {
     const fd = openSync(path, 'r');
     try {
-      const bytes = Buffer.allocUnsafe(256 * 1024);
+      const bytes = Buffer.allocUnsafe(SCAN_CHUNK_BYTES);
       for (let length; (length = readSync(fd, bytes, 0, bytes.length, null)) !== 0;) yield bytes.subarray(0, length);
     } finally { closeSync(fd); }
   }
