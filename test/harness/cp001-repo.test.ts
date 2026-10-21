@@ -1,7 +1,7 @@
 // Repository configuration and documentation, checked through public files and commands.
 // Expected values follow the public package identity, toolchain, documentation and reporting policy.
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
@@ -173,23 +173,42 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     'windows-latest 24.x core-1 1/2', 'windows-latest 24.x core-2 2/2', 'windows-latest 24.x native <unset>',
   ]);
 
-  // CI step order: checkout, setup-node, npm ci, lint, build, product, harness, no-pending.
+  const captureCommand = (run: string): string => run.replace(
+    /^node scripts\/ci-capture\.mjs --root "\$PWD" --capture-dir "\$FLUXWARDEN_CI_CAPTURE_DIR" -- /, '');
+  const jobPrefix = /^node scripts\/ci-job\.mjs(?: --harness| \$\{\{ matrix\.shard == 'core-1' && '--harness' \|\| '' \}\})? -- /;
+  const commandsOf = (step: { [key: string]: Yaml }): string[] => captureCommand(typeof step['run'] === 'string' ? step['run'].trim() : '')
+    .replace(jobPrefix, '').split(/\s+--next\s+/);
+  const commandOf = (step: { [key: string]: Yaml }): string => {
+    const commands = commandsOf(step);
+    return commands.find(command => /^npm test\s/.test(command)) ?? commands[0] ?? '';
+  };
+  // Product, optional harness and no-pending remain ordered inside the finite
+  // job invocation. Its public command is exercised below, including failures.
   const kind = (s: { [key: string]: Yaml }): string | null => {
     const uses = s['uses'];
     if (uses === CHECKOUT) return 'checkout';
     if (uses === SETUP_NODE) return 'setup-node';
-    const run = typeof s['run'] === 'string' ? s['run'].trim() : '';
+    const run = commandOf(s);
     if (/^npm ci(\s|$)/.test(run)) return 'npm ci';
     if (/^npm run lint(\s|$)/.test(run)) return 'lint';
     if (/^npm run build(\s|$)/.test(run)) return 'build';
     if (/^npm (run )?test(\s|$)/.test(run)) return 'product';
     if (/^npm run test:harness(\s|$)/.test(run)) return 'harness';
-    if (/^node scripts\//.test(run)) return 'no-pending';
+    if (/^node scripts\/no-pending\.mjs\s/.test(run)) return 'no-pending';
     return null;
   };
   const active = (step: { [key: string]: Yaml }, combo: Record<string, string>): boolean => {
     if (step['if'] === undefined) return true;
     const condition = String(step['if']).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+    if (condition.includes('always()')) {
+      const run = String(step['run'] ?? '').trim();
+      const verification = /^node scripts\/ci-capture\.mjs verify --root "\$PWD" --capture-dir "\$FLUXWARDEN_CI_CAPTURE_DIR"$/.test(run);
+      const upload = typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@');
+      expect(verification || upload, 'only capture finalization/upload runs unconditionally after failure').toBe(true);
+      expect(condition).toBe(verification ? 'always()' : "always() && steps.capture-verify.outcome == 'success'");
+      expect(step['continue-on-error'], 'finalization cannot waive a failure').toBeUndefined();
+      return true;
+    }
     return condition.split(/\s*\|\|\s*/).some(alternative => alternative.split(/\s*&&\s*/).every(term => {
       const equal = /^matrix\.(os|shard) == '([^']+)'$/.exec(term);
       if (equal) return combo[equal[1] ?? ''] === equal[2];
@@ -198,6 +217,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
       throw new Error(`unsupported CI shard condition: ${condition}`);
     }));
   };
+  for (const step of steps) if (String(step['if'] ?? '').includes('always()')) active(step, combos[0] ?? {});
   for (const s of steps.filter(s => kind(s) !== null)) {
     if (['checkout', 'setup-node', 'npm ci', 'lint', 'build'].includes(kind(s) ?? '')) {
       expect(s['if'], `${String(kind(s))} must not be conditional`).toBeUndefined();
@@ -205,7 +225,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     expect(s['continue-on-error'], `${String(kind(s))} must not be allowed to fail`).toBeUndefined();
   }
   const reportOf = (ordered: { [key: string]: Yaml }[], k: string): string => {
-    const run = String(ordered.find(s => kind(s) === k)?.['run']);
+    const run = commandOf(ordered.find(s => kind(s) === k) ?? {});
     expect(run, `${k} uses a JSON reporter`).toMatch(/--reporter[= ]json\b/);
     const file = /--outputFile(?:\.json)?[= ](\S+)/.exec(run)?.[1];
     if (file === undefined) throw new Error(`${k} names no JSON output file`);
@@ -217,9 +237,21 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     const core = combo['shard'] === 'core' || combo['shard'] === 'core-1' || combo['shard'] === 'core-2';
     const harness = combo['shard'] === 'core' || combo['shard'] === 'core-1';
     expect(ordered.map(kind), JSON.stringify(combo)).toEqual([
-      'checkout', 'setup-node', 'npm ci', 'lint', 'build', 'product', ...(harness ? ['harness'] : []), 'no-pending',
+      'checkout', 'setup-node', 'product',
     ]);
-    const productRun = String(ordered.find(s => kind(s) === 'product')?.['run']);
+    const productStep = ordered.find(s => kind(s) === 'product') ?? {};
+    const wrapped = String(productStep['run']);
+    expect(captureCommand(wrapped), 'one transparent finite wrapper encloses the job').not.toBe(wrapped);
+    const job = captureCommand(subst(wrapped, combo)).replace(/\$\{\{ matrix\.shard == 'core-1' && '--harness' \|\| '' \}\}/g,
+      combo['shard'] === 'core-1' ? '--harness' : '').replace(/\s+/g, ' ');
+    expect(job.startsWith(`node scripts/ci-job.mjs ${harness ? '--harness ' : ''}-- npm ci --ignore-scripts --next `), 'capture starts before install and retains each shard harness selection').toBe(true);
+    const stages = commandsOf(productStep);
+    expect(stages.slice(0, -1), 'all original preparation stages are inside capture in their original order').toEqual([
+      'npm ci --ignore-scripts', 'npm run lint', 'npm run build', 'node scripts/ci-database-check.mjs',
+      ...(windows && core ? ['node scripts/ci-windows-core.mjs'] : []),
+    ]);
+    expect(stages.at(-1), 'product follows all captured preparation stages').toBe(commandOf(productStep));
+    const productRun = commandOf(productStep);
     expect(productRun, 'no title or additional subset filtering').not.toMatch(/--(?:testNamePattern|exclude|include|dir|project|changed|related)\b|(?:^|\s)-t(?:\s|$)/);
     expect(productRun.match(/--maxWorkers(?:=|\s+)\S+/g), 'bounded worker allocation').toEqual([`--maxWorkers=${windows ? '1' : '2'}`]);
     if (windows) expect(productRun.match(/--fileParallelism(?:=|\s+)\S+/g), 'Windows files run serially').toEqual(['--fileParallelism=false']);
@@ -231,11 +263,56 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
       expect(productRun).not.toMatch(/--shard\b/);
       expect(productRun).not.toMatch(/--config\b/);
     }
-    const noPending = String(ordered.find(s => kind(s) === 'no-pending')?.['run']);
-    expect(noPending).toMatch(/^node scripts\/no-pending\.mjs\s/);
-    expect(noPending).toContain(reportOf(ordered, 'product'));
-    if (harness) expect(noPending).toContain(reportOf(ordered, 'harness'));
-    else expect(noPending).not.toContain('vitest-harness.json');
+    expect(reportOf(ordered, 'product'), 'the active product report remains in scanned evidence').toBe('$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json');
+  }
+
+  // Execute the real public job runner with a finite owned npm fixture. The
+  // reports use the existing no-pending fixture shape; no test code or selector
+  // is substituted into the actual CI workflow.
+  const jobRoot = scratchDir('ci-job-contract'), jobEvidence = join(jobRoot, 'evidence');
+  mkdirSync(jobEvidence);
+  mkdirSync(join(jobRoot, 'scripts'));
+  copyFileSync(join(repoRoot, 'scripts/no-pending.mjs'), join(jobRoot, 'scripts/no-pending.mjs'));
+  writeFileSync(join(jobRoot, 'package.json'), JSON.stringify({ name: 'owned-ci-job-control', version: '1.0.0', type: 'module',
+    scripts: { lint: 'node record.mjs lint', build: 'node record.mjs build', test: 'node record.mjs product', 'test:harness': 'node record.mjs harness' } }));
+  writeFileSync(join(jobRoot, 'package-lock.json'), JSON.stringify({ name: 'owned-ci-job-control', version: '1.0.0', lockfileVersion: 3,
+    packages: { '': { name: 'owned-ci-job-control', version: '1.0.0' } } }));
+  writeFileSync(join(jobRoot, 'scripts/ci-database-check.mjs'), "process.argv[2] = 'database'; await import('../record.mjs');\n");
+  writeFileSync(join(jobRoot, 'record.mjs'), `import { appendFileSync, copyFileSync, existsSync, writeFileSync } from 'node:fs'; import { join } from 'node:path';
+const kind = process.argv[2], mode = process.env['CONTROL_' + kind.toUpperCase()];
+if (kind === 'lint' && existsSync('node_modules/install-canary')) process.exit(11);
+appendFileSync(process.env.CONTROL_TRACE, kind + '\\n');
+writeFileSync(process.env.CONTROL_TRACE + '.' + kind, JSON.stringify(process.argv.slice(3)));
+copyFileSync(join(process.env.CONTROL_REPORTS, mode === 'skip' ? 'skipped.json' : 'all-passed-a.json'), join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-' + kind + '.json'));
+process.exitCode = mode === 'fail' ? 7 : 0;
+`);
+  for (const [harness, product, harnessResult, expected, trace, preparation] of [
+    [true, 'pass', 'pass', 0, ['lint', 'build', 'database', 'product', 'harness'], 'pass'], [false, 'pass', 'pass', 0, ['product'], 'pass'],
+    [true, 'fail', 'pass', 7, ['product'], 'pass'], [true, 'pass', 'fail', 7, ['product', 'harness'], 'pass'],
+    [true, 'skip', 'pass', 1, ['product', 'harness'], 'pass'], [true, 'pass', 'skip', 1, ['product', 'harness'], 'pass'],
+    [true, 'pass', 'pass', 7, ['lint'], 'fail'],
+  ] as const) {
+    const traceFile = join(jobRoot, `trace-${String(harness)}-${product}-${harnessResult}-${preparation}.log`);
+    const fullOrder = harness && product === 'pass' && harnessResult === 'pass';
+    if (fullOrder) {
+      mkdirSync(join(jobRoot, 'node_modules'), { recursive: true });
+      writeFileSync(join(jobRoot, 'node_modules/install-canary'), 'owned stale install canary');
+    }
+    const result = spawnSync(process.execPath, [join(repoRoot, 'scripts/ci-job.mjs'), ...(harness ? ['--harness'] : []), '--',
+      ...(fullOrder ? ['npm', 'ci', '--ignore-scripts', '--next', 'npm', 'run', 'lint', '--next', 'npm', 'run', 'build',
+        '--next', 'node', 'scripts/ci-database-check.mjs', '--next'] : []),
+      'npm', 'test', '--', '--reporter=default', '--reporter=json', `--outputFile.json=${join(jobEvidence, 'vitest-product.json')}`], {
+      cwd: jobRoot, env: { ...childEnv(), FLUXWARDEN_EVIDENCE_DIR: jobEvidence, CONTROL_PRODUCT: product,
+        CONTROL_HARNESS: harnessResult, CONTROL_LINT: preparation, CONTROL_TRACE: traceFile, CONTROL_REPORTS: join(repoRoot, 'test/fixtures/no-pending') },
+      encoding: 'utf8', windowsHide: true, timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, 'actual runner preserves child failure and rejects nonpassing reports').toBe(expected);
+    expect(readFileSync(traceFile, 'utf8').trim().split('\n'), 'product precedes the selected harness').toEqual(trace);
+    if (harness && product === 'pass' && preparation === 'pass') {
+      const args: unknown = JSON.parse(readFileSync(traceFile + '.harness', 'utf8'));
+      expect(args, 'harness report is included in the same final no-pending acceptance').toContain(`--outputFile.json=${join(jobEvidence, 'vitest-harness.json')}`);
+    }
   }
 
   // Approved Windows split: the native commands and the generated core configuration must partition
@@ -261,22 +338,17 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   const nativeProduct = steps.find(s => kind(s) === 'product' && active(s, nativeCombo));
   const nativeArgs = String(nativeProduct?.['run']).match(/\btest\/[\w./-]+\.test\.ts\b/g) ?? [];
   expect(nativeArgs).toEqual(nativeFiles);
-  const configuration = steps.filter(s => active(s, coreCombo)).find(s => typeof s['run'] === 'string' && s['run'].includes('FLUXWARDEN_CI_CORE_CONFIG='));
-  expect(configuration).toBeDefined();
-  if (configuration === undefined || coreProduct === undefined) throw new Error('core configuration and product steps are required');
-  expect(configuration['continue-on-error']).toBeUndefined();
-  expect(steps.indexOf(configuration), 'configure core before running it').toBeLessThan(steps.indexOf(coreProduct));
-  const configurationSource = /<<'NODE'\s*\n([^]*?)\nNODE\s*$/.exec(String(configuration['run']))?.[1];
-  if (configurationSource === undefined) throw new Error('core configuration preparation is missing');
-  const scratch = scratchDir('ci-shard-config'), githubEnv = join(scratch, 'github-env');
-  const configured = spawnSync(process.execPath, ['--input-type=module'], {
-    cwd: repoRoot, env: { ...childEnv(), RUNNER_TEMP: scratch, GITHUB_ENV: githubEnv }, input: configurationSource,
+  if (coreProduct === undefined) throw new Error('core product step is required');
+  expect(map(coreProduct['env'], 'core environment')['FLUXWARDEN_CI_CORE_CONFIG']).toBe('${{ env.TEMP }}/vitest-windows-core.config.mjs');
+  expect(commandsOf(coreProduct).slice(-2, -1), 'configuration precedes the core product inside capture').toEqual(['node scripts/ci-windows-core.mjs']);
+  const scratch = scratchDir('ci-shard-config'), coreConfig = join(scratch, 'vitest-windows-core.config.mjs');
+  const configured = spawnSync(process.execPath, [join(repoRoot, 'scripts/ci-windows-core.mjs')], {
+    cwd: repoRoot, env: { ...childEnv(), TEMP: scratch, FLUXWARDEN_CI_CORE_CONFIG: coreConfig },
     encoding: 'utf8', windowsHide: true, timeout: 10000,
   });
   expect(configured.error).toBeUndefined();
   expect(configured.status, configured.stderr).toBe(0);
-  const coreConfig = /^FLUXWARDEN_CI_CORE_CONFIG=(.+)$/m.exec(readFileSync(githubEnv, 'utf8'))?.[1];
-  if (coreConfig === undefined) throw new Error('core configuration path was not published');
+  expect(existsSync(coreConfig), 'actual extracted stage creates the selected core configuration').toBe(true);
   expect(dirname(coreConfig)).toBe(scratch);
   expect(String(coreProduct['run'])).toContain('--config="$FLUXWARDEN_CI_CORE_CONFIG"');
   const productFiles = (args: readonly string[] = []): string[] => {
@@ -340,7 +412,17 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
     const invocation = script === 'test:chaos'
       ? /^npm run test:chaos(?:\s+--)?(?:\s+--(?:reporter|outputFile(?:\.json)?)(?:=|\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s]+))*$/
       : /^npm run test:lab$/;
-    expect(runs.some(r => invocation.test(r.trim()) && !/[;&|`\r\n]/.test(r.trim())), `${name} runs npm run ${script}`).toBe(true);
+    const wrapped = runs.find(r => r.includes(`npm run ${script}`)) ?? '';
+    const stream = captureCommand(wrapped.trim()).replace(/^node scripts\/ci-job\.mjs --commands-only -- /, '');
+    const stages = stream.split(/\s+--next\s+|\s+--finally\s+/);
+    expect(captureCommand(wrapped.trim()), `${name} capture encloses installation`).not.toBe(wrapped.trim());
+    expect(stages.slice(0, 2), `${name} preserves captured install/build order`).toEqual(['npm ci --ignore-scripts', 'npm run build']);
+    expect(invocation.test(stages[2] ?? '') && !/[;&|`\r\n]/.test(wrapped.trim()), `${name} retains the exact selected test command`).toBe(true);
+    expect(stages.length, `${name} has only its original selected stages`).toBe(name === 'chaos' ? 4 : 3);
+    if (name === 'chaos') {
+      expect(stream, 'unchanged evidence scanner is an explicit failure finalizer').toContain(' --finally node scripts/leak-check.mjs ');
+      expect(stages[3]).toBe('node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"');
+    }
   }
 });
 

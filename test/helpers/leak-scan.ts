@@ -65,7 +65,8 @@ export async function productLeakScan(): Promise<{ sources: number; inventory: n
  * Positive control: a fresh live sentinel, registered in the sentinel directory and
  * hex-encoded into a scratch file, is found with the same registry and sentinel options.
  * The planted file is declared by exact path for concurrent scans, so this scan uses its
- * own scratch root where nothing is declared. Both files are removed afterwards.
+ * own scratch root where nothing is declared. The planted output is removed afterwards;
+ * the original private input remains registered for the final invocation scan.
  */
 export function liveSentinelDetected(leakScanner: Scanner, options: ScanOptions): boolean {
   const directory = mkdtempSync(join(options.testTmp, 'live-control-'));
@@ -80,6 +81,5 @@ export function liveSentinelDetected(leakScanner: Scanner, options: ScanOptions)
     return hit !== null && resolve(hit.path) === resolve(planted);
   } finally {
     rmSync(directory, { recursive: true, force: true });
-    rmSync(source, { force: true });
   }
 }
