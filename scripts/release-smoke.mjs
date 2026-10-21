@@ -54,9 +54,14 @@ export function inspectTarball(path) {
 }
 
 function run(executable, args, cwd, env, options = {}) {
-  const result = spawnSync(executable, args, { cwd, env, encoding: 'utf8', windowsHide: true, timeout: 120_000, ...options });
+  const result = spawnSync(executable, args, { cwd, env, windowsHide: true, timeout: 120_000, ...options });
+  // Preserve complete observed child streams before validation or scratch cleanup.
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.stderr.write('\n' + JSON.stringify({ stage: 'release-smoke-child', status: result.status, signal: result.signal,
+    errorCode: result.error?.code ?? null }) + '\n');
   if (result.error) throw result.error;
-  return result;
+  return { ...result, stdout: result.stdout?.toString('utf8') ?? '', stderr: result.stderr?.toString('utf8') ?? '' };
 }
 
 async function smoke(tarball) {
