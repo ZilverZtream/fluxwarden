@@ -28,7 +28,9 @@ export const T = '105x1x0'; // channel 5, CLN-R <-> CLN-M
 export const HEIGHT = 812;
 export const PRINCIPAL = 100_000_000n;
 export const FEE = 202_101n;
-export const PAYMENT_SECRET = '9c'.repeat(32);
+// A deterministic synthetic 32-byte secret, derived at runtime rather than
+// embedding a repeated invalid-UTF8 byte population in compiled fixture code.
+export const PAYMENT_SECRET = createHash('sha256').update('FluxWarden CLN rebalance payment secret fixture v1').digest('hex');
 
 /** Balances before the rebalance (msat). */
 export const BEFORE = {

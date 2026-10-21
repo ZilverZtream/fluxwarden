@@ -5,13 +5,14 @@
 // no network, shared dependency tree, substituted npm return, or product hooks.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it, onTestFinished } from 'vitest';
 import { asRecord, childEnv, repoRoot } from '../helpers/cli.js';
 import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { testRoot } from '../helpers/env.js';
+import { assertStrictWindowsOwnerOnly, readWindowsSecurity } from '../helpers/windows-security.js';
 
 const sha = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex');
 const npm = join(dirname(process.execPath), process.platform === 'win32'
@@ -349,3 +350,92 @@ it('CP-044/DEPENDENCY-SETUP recorder failures expose stable safe classification 
   });
   expect(diagnostics[0], 'same failure class is independent of private path and OS error text').toBe(diagnostics[1]);
 });
+
+// Adopted Windows CI ordering: authentic setup precedes Opening, and the actual
+// database smoke then runs inside capture. Existing setup INPUT identities must
+// survive that stage; recreating their ACLs after Opening is a mutation too.
+if (process.platform === 'win32') it('CP-044/DEPENDENCY-SETUP Windows database preflight preserves the original authenticated setup namespace', async () => {
+  const permission = await import(pathToFileURL(join(repoRoot, 'scripts/private-scratch.mjs')).href) as {
+    createPrivateDirectory: (parent: string, prefix: string) => Promise<string>;
+    assertPrivateDirectories: (paths: string[]) => Promise<void>;
+  };
+  const base = testRoot('FLUXWARDEN_TEST_TMP');
+  const parent = await permission.createPrivateDirectory(base, 'fluxwarden-ci-');
+  const root = await permission.createPrivateDirectory(base, 'db-');
+  const names = ['TEMP', 'TMP', 'FLUXWARDEN_TEST_TMP', 'FLUXWARDEN_SENTINEL_DIR', 'FLUXWARDEN_EVIDENCE_DIR', 'FLUXWARDEN_CI_CAPTURE_DIR'] as const;
+  const roots: string[] = [];
+  for (const prefix of ['ci-temp-', 'ci-tmp-', 'ci-tests-', 'ci-sentinels-', 'ci-evidence-', 'ci-capture-']) {
+    roots.push(await permission.createPrivateDirectory(parent, prefix));
+  }
+  await permission.assertPrivateDirectories([parent, root, ...roots]);
+  const env = { ...childEnv(), ...Object.fromEntries(names.map((name, index) => [name, roots[index]])),
+    FLUXWARDEN_CI_OWNED_ROOT: parent, npm_config_offline: 'true' };
+  const evidence = roots[4] ?? '', capture = roots[5] ?? '';
+  const proof = join(root, 'command-proof');
+  mkdirSync(proof);
+  let sequence = 0;
+  const run = (command: string, args: string[]) => {
+    const result = spawnSync(command, args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 60_000 });
+    const id = String(sequence++);
+    writeFileSync(join(proof, `${id}.stdout`), result.stdout);
+    writeFileSync(join(proof, `${id}.stderr`), result.stderr);
+    writeFileSync(join(proof, `${id}.status.json`), JSON.stringify({ status: result.status, signal: result.signal,
+      error: result.error?.name ?? null }));
+    return result;
+  };
+  const seed = randomBytes(32), source = join(root, 'test/control.bin');
+  const built = files(join(repoRoot, 'dist'));
+  expect(built.length, 'the real database smoke uses the already built current product').toBeGreaterThan(0);
+  const support = ['private-scratch.mjs', 'leak-check.mjs', ...readdirSync(join(repoRoot, 'scripts')).filter(name => /^ci-.*\.mjs$/.test(name))];
+  const inputs = [...built.map(path => ({ from: path, to: join(root, 'dist', path.slice(join(repoRoot, 'dist').length + 1)) })),
+    ...support.map(name => ({ from: join(repoRoot, 'scripts', name), to: join(root, 'scripts', name) }))];
+  declareFixturePaths([source, ...inputs.map(input => input.to)]);
+  writeFileSync(join(proof, 'original-inputs.json'), JSON.stringify(inputs.map(input => ({ path: input.to, sha256: sha(readFileSync(input.from)) }))));
+  cpSync(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  mkdirSync(join(root, 'scripts'));
+  for (const name of support) copyFileSync(join(repoRoot, 'scripts', name), join(root, 'scripts', name));
+  expect(inputs.every(input => sha(readFileSync(input.from)) === sha(readFileSync(input.to))), 'fixture executes exact original built product and public tools').toBe(true);
+  mkdirSync(join(root, 'test'));
+  writeFileSync(source, seed, { mode: 0o600 });
+  writeFileSync(join(root, 'test/sentinels.json'), JSON.stringify(['test/control.bin']));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'owned-windows-database-preflight', version: '1.0.0', private: true, type: 'module' }));
+  writeFileSync(join(root, 'package-lock.json'), JSON.stringify({ name: 'owned-windows-database-preflight', version: '1.0.0', lockfileVersion: 3,
+    packages: { '': { name: 'owned-windows-database-preflight', version: '1.0.0' } } }));
+  writeFileSync(join(root, '.gitignore'), 'node_modules/\ncommand-proof/\n');
+  for (const args of [['init', '--quiet'], ['config', 'core.longpaths', 'true'], ['add', '--', '.gitignore', 'package.json', 'package-lock.json', 'test', 'scripts', 'dist'],
+    ['-c', 'user.name=Database preflight fixture', '-c', 'user.email=fixture@invalid', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'owned database preflight']]) {
+    expect(run('git', args).status, 'real immutable fixture identity is established before setup').toBe(0);
+  }
+  declareFixtureCapture(capture, [seed], []);
+  const installed = run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-install.mjs'), '--root', root]));
+  expect(installed.error).toBeUndefined();
+  expect(installed.status, 'real offline trusted setup completes before Opening').toBe(0);
+  const retained = [join(evidence, 'npm-install.stdout.log'), join(evidence, 'npm-install.stderr.log'), join(evidence, 'npm-install.json')];
+  expect(retained.every(existsSync), 'both original setup channels and execution status pre-exist Opening').toBe(true);
+  const namespace = (directory: string): string[] => [directory, ...readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? namespace(path) : [path];
+  })];
+  const original = namespace(evidence).sort();
+  const snapshot = () => original.map(path => {
+    const info = lstatSync(path, { bigint: true });
+    return { path, device: String(info.dev), inode: String(info.ino), mode: String(info.mode),
+      sddl: readWindowsSecurity(path, env).sddl,
+      ...(info.isFile() ? { sha256: sha(readFileSync(path)), bytes: String(info.size), mtime: String(info.mtimeNs), ctime: String(info.ctimeNs) } : {}) };
+  });
+  const before = snapshot();
+  for (const path of [parent, ...roots]) assertStrictWindowsOwnerOnly(readWindowsSecurity(path, env), 'directory');
+  const result = run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-capture.mjs'), '--root', root, '--capture-dir', capture, '--',
+    process.execPath, join(root, 'scripts/ci-job.mjs'), '--commands-only', '--', 'node', join(root, 'scripts/ci-install.mjs'), 'verify', '--root', root,
+    '--next', 'node', join(root, 'scripts/ci-database-check.mjs')]));
+  expect(result.error).toBeUndefined();
+  const receipt = asRecord(JSON.parse(readFileSync(join(capture, 'receipt.json'), 'utf8')) as unknown, 'database preflight receipt');
+  expect(asRecord(receipt['result'], 'result')['exitCode'], 'actual database preflight completes its ownership and durability smoke checks').toBe(0);
+  const after = snapshot();
+  writeFileSync(join(proof, 'setup-namespace-comparison.json'), JSON.stringify({ before, after, result: receipt['result'] }));
+  for (const path of [parent, ...roots]) assertStrictWindowsOwnerOnly(readWindowsSecurity(path, env), 'directory');
+  expect(after, 'database preflight preserves authentic setup bytes, physical identities and original Windows security descriptors').toEqual(before);
+  expect(result.status, 'the completed original database smoke also has valid Closing evidence').toBe(0);
+  expect(receipt['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: true });
+  expect(run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-capture.mjs'), 'verify', '--root', root, '--capture-dir', capture])).status).toBe(0);
+}, 75_000);

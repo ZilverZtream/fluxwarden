@@ -3,7 +3,7 @@ import { rm } from 'node:fs/promises';
 import { basename, dirname, join, parse, relative, resolve } from 'node:path';
 import { createPrivateDirectory, assertPrivateDirectories } from './private-scratch.mjs';
 import { openDatabase } from '../dist/persistence/index.js';
-import { currentUserSid, readSecurityDescriptors, restrictToOwner } from '../dist/platform/owner-only.js';
+import { currentUserSid, readSecurityDescriptors, isOwnerOnlySecurityDescriptor } from '../dist/platform/owner-only.js';
 const parent = resolve(process.env.FLUXWARDEN_TEST_TMP);
 const privateDirectories = [];
 function diagnose(stage) {
@@ -21,15 +21,20 @@ if (process.platform === 'win32') {
   if (!ownedRoot || !/^fluxwarden-ci-[A-Za-z0-9]{6}$/.test(basename(ownedRoot))) throw new Error('the newly created CI root is required');
   privateDirectories.push(resolve(ownedRoot), parent, resolve(process.env.FLUXWARDEN_SENTINEL_DIR), resolve(process.env.FLUXWARDEN_EVIDENCE_DIR), resolve(process.env.TEMP), resolve(process.env.TMP), resolve(process.env.FLUXWARDEN_CI_CAPTURE_DIR));
   if (privateDirectories.slice(1).some(path => dirname(path) !== privateDirectories[0])) throw new Error('private CI children escaped their newly created root');
-  diagnose('private CI ownership before restriction');
+  diagnose('private CI ownership before validation');
   await assertPrivateDirectories(privateDirectories);
   try {
-    for (const directory of privateDirectories) restrictToOwner(directory, 'directory', {});
+    // Preparation secures these roots before installation and capture Opening. Reapplying an
+    // inheritable ACL here mutates retained setup metadata even when its access list is unchanged.
+    const sid = currentUserSid();
+    if (readSecurityDescriptors(privateDirectories).some(descriptor => !isOwnerOnlySecurityDescriptor(descriptor.sddl, descriptor.ownerSid, sid, 'directory'))) {
+      throw new Error('private CI ownership validation failed');
+    }
   } catch (error) {
-    diagnose('private CI ownership restriction failed');
+    diagnose('private CI ownership validation failed');
     throw error;
   }
-  diagnose('private CI ownership after restriction');
+  diagnose('private CI ownership after validation');
   await assertPrivateDirectories(privateDirectories);
 }
 const scratch = await createPrivateDirectory(parent, 'ci-database-smoke-');

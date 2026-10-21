@@ -3,8 +3,8 @@
 // reporter fixture proves truthful failure evidence, never real chaos coverage.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, childEnv, readText, repoRoot } from '../helpers/cli.js';
@@ -17,6 +17,29 @@ function files(directory: string): string[] {
     const path = join(directory, entry.name);
     return entry.isDirectory() ? files(path) : entry.isFile() ? [path] : [];
   });
+}
+
+function copyPhysicalToolInputs(source: string, destination: string): void {
+  const root = realpathSync.native(source);
+  const validate = (path: string, ancestors: ReadonlySet<string>): void => {
+    const info = lstatSync(path), target = realpathSync.native(path), within = relative(root, target);
+    if (isAbsolute(within) || within === '..' || within.startsWith(`..${sep}`)) {
+      throw new Error('fixture tool input resolves outside the original dependency root');
+    }
+    if (info.isSymbolicLink() && ['.vite', '.vite-temp'].some(name => within === name || within.startsWith(`${name}${sep}`))) {
+      throw new Error('generated cache cannot supply fixture tool input through a link');
+    }
+    const physical = info.isSymbolicLink() ? statSync(path) : info;
+    if (physical.isDirectory()) {
+      if (ancestors.has(target)) throw new Error('fixture tool input contains a directory link cycle');
+      const next = new Set(ancestors).add(target);
+      for (const name of readdirSync(path)) validate(join(path, name), next);
+    } else if (!physical.isFile()) throw new Error('fixture tool input must resolve to a regular file or directory');
+  };
+  // Resolve and validate the complete pinned graph before cp follows any link.
+  // Keep every copied byte as a regular artifact for the outer Closing scan.
+  validate(root, new Set());
+  cpSync(root, destination, { recursive: true, dereference: true });
 }
 
 it('CP-033/034 without a live plan the chaos command selects its existing fake-node matrix and excludes live references', () => {
@@ -202,7 +225,7 @@ cp.spawn = function(command, args, options) {
   // This is an owned copy, with no post-start junction or blanket exemption.
   writeFileSync(join(tests, 'dependency-input.json'), JSON.stringify({ source: join(repoRoot, 'node_modules'),
     lockSha256: createHash('sha256').update(readFileSync(join(repoRoot, 'package-lock.json'))).digest('hex') }));
-  cpSync(join(repoRoot, 'node_modules'), dependencies, { recursive: true, dereference: false, verbatimSymlinks: true });
+  copyPhysicalToolInputs(join(repoRoot, 'node_modules'), dependencies);
   const observedArgv = [...argv];
   observedArgv.splice(separator + 2, 0, '--import', pathToFileURL(observer).href);
   const result = spawnSync(process.execPath, [...ownedCaptureToolArgs(observedArgv.slice(1))], {

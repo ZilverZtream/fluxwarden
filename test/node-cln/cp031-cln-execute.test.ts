@@ -24,7 +24,7 @@ Route of SPEC §4.4 / §5.4 C6: CLN-M pays out over channel 2 to LND-R, LND-R fo
 channel 5 back to CLN-M. P = 100,000,000; CLN-R charges 1000 + 1000 ppm and has CLTV delta 34; LND-R charges 1000 + 1000 ppm
 and has CLTV delta 80; final CLTV 18. Hop amounts 100,202,101 / 100,101,000 / 100,000,000; deltas 132 / 52 / 18; fee 202,101.
 */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -57,7 +57,9 @@ const HEIGHT = 812;
 const P = 100_000_000n;
 const PREIMAGE = randomBytes(32);
 const HASH = sha256(PREIMAGE);
-const SECRET = '9c'.repeat(32);
+// Independent deterministic protocol input; its full bytes are not a compiled
+// literal. The original invoice/sendpay equality assertions still bind it.
+const SECRET = createHash('sha256').update('FluxWarden CLN execute payment secret fixture v1').digest('hex');
 
 const ROUTE: CircularRoute & { readonly hops: readonly (CircularRoute['hops'][number] & { readonly policy: HopPolicy | null })[] } = {
   sourceChannelKey: CH2, targetChannelKey: CH5, outPeer: LND_R, inPeer: CLN_R, principalMsat: P,
