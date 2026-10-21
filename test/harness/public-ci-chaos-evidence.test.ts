@@ -3,13 +3,13 @@
 // reporter fixture proves truthful failure evidence, never real chaos coverage.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, childEnv, readText, repoRoot } from '../helpers/cli.js';
 import { testRoot } from '../helpers/env.js';
-import { declareFixtureCapture, declareFixturePaths } from '../helpers/capture-fixture.js';
+import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { parseYaml } from '../helpers/yaml.js';
 
 function files(directory: string): string[] {
@@ -68,6 +68,7 @@ it('CP-036/B5 the actual chaos workflow command records real assertion outcomes 
   if (!Array.isArray(stepsValue)) throw new Error('chaos steps required');
   const steps = stepsValue.map(step => asRecord(step, 'step'));
   const run = steps.findIndex(step => typeof step['run'] === 'string' && /\bnpm run test:chaos\b/.test(step['run']));
+  const install = steps.findIndex(step => typeof step['run'] === 'string' && /^node scripts\/ci-install\.mjs --root "\$PWD"$/.test(step['run'].trim()));
   const scan = steps.findIndex(step => typeof step['run'] === 'string' && /scripts\/leak-check\.mjs/.test(step['run']));
   const verify = steps.findIndex(step => typeof step['run'] === 'string' && /scripts\/ci-capture\.mjs verify\b/.test(step['run']));
   const uploads = steps.map((step, index) => ({ step, index })).filter(({ step }) => typeof step['uses'] === 'string' &&
@@ -75,6 +76,9 @@ it('CP-036/B5 the actual chaos workflow command records real assertion outcomes 
   expect(uploads, 'one original evidence-directory upload remains separate from the safe receipt').toHaveLength(1);
   const upload = uploads[0]?.index ?? -1;
   expect(run, 'actual chaos command exists').toBeGreaterThanOrEqual(0);
+  expect(install, 'trusted frozen-lock setup precedes candidate validation').toBeGreaterThanOrEqual(0);
+  expect(run).toBeGreaterThan(install);
+  expect(steps[run]?.['if'], 'original installer failure still enters evidence capture').toBe('always()');
   expect(verify, 'complete invocation verification follows generation').toBeGreaterThan(run);
   expect(scan, 'evidence scan belongs to the same complete captured command').toBe(run);
   expect(upload, 'upload follows complete invocation verification').toBeGreaterThan(verify);
@@ -97,8 +101,8 @@ it('CP-036/B5 the actual chaos workflow command records real assertion outcomes 
   const fixture = join(scratch, 'r');
   mkdirSync(join(fixture, 'test/chaos'), { recursive: true });
   for (const file of ['package.json', '.gitignore', 'vitest.config.ts', 'vitest.chaos.config.ts']) copyFileSync(join(repoRoot, file), join(fixture, file));
-  const support = ['ci-capture.mjs', 'ci-capture-files.mjs', 'ci-capture-preload.mjs', 'ci-job.mjs',
-    'ci-test-driver.mjs', 'ci-database-check.mjs', 'ci-windows-core.mjs', 'leak-check.mjs', 'private-scratch.mjs', 'no-pending.mjs'];
+  const support = [...readdirSync(join(repoRoot, 'scripts')).filter(name => /^ci-.*\.mjs$/.test(name)),
+    'leak-check.mjs', 'private-scratch.mjs', 'no-pending.mjs'];
   mkdirSync(join(fixture, 'scripts'));
   for (const name of support) copyFileSync(join(repoRoot, 'scripts', name), join(fixture, 'scripts', name));
   expect(createHash('sha256').update(readFileSync(join(fixture, 'scripts/leak-check.mjs'))).digest('hex'), 'the executed scanner is copied without modification')
@@ -118,24 +122,19 @@ it('reporter passing control', () => { expect(2 + 2).toBe(4); });
 it('reporter failing control', () => { expect('observed result').toBe('required result'); });
 `);
   const dependencies = join(fixture, 'node_modules');
-  // A real npm ci runs offline against this dependency-free owned package. A
-  // stale regular directory proves install precedes build; only the bounded
-  // build control then borrows the declared pinned development dependencies.
+  // Real trusted setup installs the dependency-free owned package offline. The
+  // stale canary proves setup precedes build. Pinned test-tool inputs are copied
+  // into this owned checkout before capture authenticates its original read-set.
   const pkg = asRecord(JSON.parse(readFileSync(join(fixture, 'package.json'), 'utf8')) as unknown, 'fixture package');
   asRecord(pkg['scripts'], 'fixture scripts')['build'] = 'node build-control.mjs';
   pkg['devDependencies'] = {};
   writeFileSync(join(fixture, 'package.json'), JSON.stringify(pkg));
   writeFileSync(join(fixture, 'package-lock.json'), JSON.stringify({ name: pkg['name'], version: pkg['version'], lockfileVersion: 3,
     packages: { '': { name: pkg['name'], version: pkg['version'] } } }));
-  writeFileSync(join(fixture, 'build-control.mjs'), `import { existsSync, lstatSync, readdirSync, rmdirSync, symlinkSync, unlinkSync } from 'node:fs'; import { join, resolve } from 'node:path';
+  writeFileSync(join(fixture, 'build-control.mjs'), `import { existsSync, lstatSync } from 'node:fs'; import { join, resolve } from 'node:path';
 const modules = resolve('node_modules');
 if (modules !== join(process.cwd(), 'node_modules') || existsSync(join(modules, 'install-canary'))) throw new Error('offline install did not finish before build');
-if (existsSync(modules)) {
- if (!lstatSync(modules).isDirectory() || lstatSync(modules).isSymbolicLink()) throw new Error('owned regular dependency directory required');
- for (const name of readdirSync(modules)) unlinkSync(join(modules, name));
- rmdirSync(modules);
-}
-symlinkSync(${JSON.stringify(realpathSync(join(repoRoot, 'node_modules')))}, modules, process.platform === 'win32' ? 'junction' : 'dir');
+if (!lstatSync(modules).isDirectory() || lstatSync(modules).isSymbolicLink()) throw new Error('original owned regular dependencies required');
 `);
   const observer = join(fixture, 'observe-processes.mjs'), trace = join(tests, 'processes.jsonl');
   // Observe actual external command starts/exits without substituting a command,
@@ -166,10 +165,10 @@ cp.spawn = function(command, args, options) {
   expect(argv.slice(0, 2)).toEqual(['node', 'scripts/ci-capture.mjs']);
   const separator = argv.indexOf('--');
   expect(argv.slice(2, separator), 'the wrapper is bound to this fixture identity and private capture').toEqual(['--root', fixture, '--capture-dir', capture]);
-  expect(argv.slice(separator + 1, separator + 8), 'the full captured job begins with the original offline-safe installation command')
-    .toEqual(['node', 'scripts/ci-job.mjs', '--commands-only', '--', 'npm', 'ci', '--ignore-scripts']);
+  expect(argv.slice(separator + 1, separator + 10), 'the captured job checks the original trusted installer result before validation')
+    .toEqual(['node', 'scripts/ci-job.mjs', '--commands-only', '--', 'node', 'scripts/ci-install.mjs', 'verify', '--root', fixture]);
   const buildIndex = argv.indexOf('--next'), testIndex = argv.indexOf('--next', buildIndex + 1), finalIndex = argv.indexOf('--finally');
-  expect(argv.slice(buildIndex + 1, testIndex), 'build follows install').toEqual(['npm', 'run', 'build']);
+  expect(argv.slice(buildIndex + 1, testIndex), 'build follows original installation verification').toEqual(['npm', 'run', 'build']);
   expect(argv.slice(testIndex + 1, testIndex + 4), 'the same selected chaos command follows build').toEqual(['npm', 'run', 'test:chaos']);
   expect(argv.slice(finalIndex), 'the unchanged scanner is an explicit final stage with original source/evidence arguments').toEqual([
     '--finally', 'node', 'scripts/leak-check.mjs', '--sentinels', 'test/sentinels.json', '--sentinel-dir', sentinels, evidence,
@@ -190,19 +189,35 @@ cp.spawn = function(command, args, options) {
   }
   mkdirSync(dependencies);
   writeFileSync(join(dependencies, 'install-canary'), 'owned stale install canary');
+  const installed = spawnSync(process.execPath, [...ownedCaptureToolArgs([join(fixture, 'scripts/ci-install.mjs'), '--root', fixture])], {
+    cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+  });
+  expect(installed.error).toBeUndefined();
+  expect(installed.status, 'real trusted offline npm setup succeeds before validation').toBe(0);
+  const installerStatus = asRecord(JSON.parse(readFileSync(join(evidence, 'npm-install.json'), 'utf8')) as unknown, 'original installer status');
+  expect(installerStatus['status'] ?? installerStatus['exitCode'], 'installer metadata independently records successful setup').toBe(0);
+  expect(installerStatus['complete']).toBe(true);
+  expect(existsSync(join(dependencies, 'install-canary')), 'real npm ci removes the stale install input').toBe(false);
+  // Declare the original pinned source and lock identity before copying bytes.
+  // This is an owned copy, with no post-start junction or blanket exemption.
+  writeFileSync(join(tests, 'dependency-input.json'), JSON.stringify({ source: join(repoRoot, 'node_modules'),
+    lockSha256: createHash('sha256').update(readFileSync(join(repoRoot, 'package-lock.json'))).digest('hex') }));
+  cpSync(join(repoRoot, 'node_modules'), dependencies, { recursive: true, dereference: false, verbatimSymlinks: true });
   const observedArgv = [...argv];
   observedArgv.splice(separator + 2, 0, '--import', pathToFileURL(observer).href);
-  const result = (() => {
-    try {
-      return spawnSync(process.execPath, [...observedArgv.slice(1)], {
-        cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 15_000,
-      });
-    } finally { if (existsSync(dependencies) && lstatSync(dependencies).isSymbolicLink()) unlinkSync(dependencies); }
-  })();
+  const result = spawnSync(process.execPath, [...ownedCaptureToolArgs(observedArgv.slice(1))], {
+    cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 60_000,
+  });
   expect(result.error, result.stderr).toBeUndefined();
   const reports = existsSync(uploaded) ? files(uploaded).filter(path => path.endsWith('.json')) : [];
   expect(reports.length, 'the actual chaos command must create a JSON test report before scan/upload; mkdir alone leaves no uploadable evidence').toBeGreaterThan(0);
-  const report = asRecord(JSON.parse(readFileSync(reports[0] ?? '', 'utf8')) as unknown, 'chaos test report');
+  const outputIndex = argv.findIndex(arg => /^--outputFile(?:\.json)?(?:=|$)/.test(arg));
+  const outputArgument = argv[outputIndex] ?? '';
+  const output = outputArgument.includes('=') ? outputArgument.slice(outputArgument.indexOf('=') + 1) : argv[outputIndex + 1];
+  expect(output, 'the actual chaos command names its own reporter output').toBeTruthy();
+  const reportPath = resolve(fixture, output ?? '');
+  expect(reports, 'the actual reporter output belongs to the scanned upload directory').toContain(reportPath);
+  const report = asRecord(JSON.parse(readFileSync(reportPath, 'utf8')) as unknown, 'chaos test report');
   expect(result.status, 'a reported assertion failure must remain a failing command').toBe(1);
   const observations = readFileSync(trace, 'utf8').trim().split('\n').map(line => asRecord(JSON.parse(line) as unknown, 'executed command'));
   const chaosFailure = observations.findIndex(row => row['event'] === 'close' && Array.isArray(row['args']) && row['args'].includes('test:chaos') && row['code'] === 1);
@@ -222,4 +237,4 @@ cp.spawn = function(command, args, options) {
   const assertions = asRecord(results[0], 'test file')['assertionResults'];
   if (!Array.isArray(assertions)) throw new Error('actual assertion results required');
   expect(assertions.map(value => asRecord(value, 'assertion')['status']).sort()).toEqual(['failed', 'passed']);
-}, 20_000);
+}, 75_000);

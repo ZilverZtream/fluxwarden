@@ -12,7 +12,7 @@ import { asRecord, childEnv, readText, repoRoot } from '../helpers/cli.js';
 import { testRoot } from '../helpers/env.js';
 import { liveSentinelDetected, scanner } from '../helpers/leak-scan.js';
 import { parseYaml } from '../helpers/yaml.js';
-import { declareFixtureCapture, declareFixturePaths } from '../helpers/capture-fixture.js';
+import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 
 const captureCli = join(repoRoot, 'scripts/ci-capture.mjs');
 const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex');
@@ -83,8 +83,8 @@ function fixture() {
   const identity = { commit: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}') };
   const child = join(temp, 'command.mjs');
   const invoke = (verify = false, extraArgs: string[] = []) => spawnSync(process.execPath,
-    [...extraArgs, captureCli, ...(verify ? ['verify'] : []), '--root', root, '--capture-dir', capture,
-      ...(verify ? [] : ['--', process.execPath, child])],
+    [...ownedCaptureToolArgs([...extraArgs, captureCli, ...(verify ? ['verify'] : []), '--root', root, '--capture-dir', capture,
+      ...(verify ? [] : ['--', process.execPath, child])])],
     { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
   const script = (body: string, exitCode = 0) => { writeFileSync(child, `
 import { readFileSync, writeFileSync, appendFileSync, rmSync, mkdirSync } from 'node:fs';
@@ -227,6 +227,27 @@ it('CP-044/CI-CAPTURE original registered source loss or replacement and candida
     expect(existsSync(join(f.capture, 'receipt.json')), 'incomplete invocation retains a safe receipt').toBe(true);
     expect(asRecord(f.receipt()['result'], 'result')['complete']).toBe(false);
   }
+});
+
+it('CP-044/CI-CAPTURE initial checkout identity includes a tracked deletion already staged before capture', () => {
+  const f = fixture(), deleted = join(f.root, 'candidate.txt');
+  const git = (...args: string[]) => spawnSync('git', args, {
+    cwd: f.root, env: f.env, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+  });
+  expect(git('rm', '--quiet', '--', 'candidate.txt').status).toBe(0);
+  expect(existsSync(deleted), 'tracked deletion is present on disk before Opening').toBe(false);
+  const tree = git('write-tree');
+  expect(tree.status).toBe(0);
+  const expectedTree = tree.stdout.trim();
+  expect(expectedTree, 'Git independently identifies the changed initial checkout tree').not.toBe(f.identity.tree);
+  const result = f.invoke();
+  expect(result.error).toBeUndefined();
+  expect(result.status, 'an unchanged staged checkout is valid without an invented clean-index precondition').toBe(0);
+  const identity = asRecord(f.receipt()['identity'], 'actual checkout identity');
+  expect(identity['before'], 'Opening describes the actual checkout including its staged deletion')
+    .toMatchObject({ commit: f.identity.commit, tree: expectedTree });
+  expect(identity['after'], 'unchanged Closing read-set has the same actual checkout identity').toEqual(identity['before']);
+  expect(existsSync(deleted), 'the deleted path is not recreated to match historical HEAD').toBe(false);
 });
 
 it('CP-044/CI-CAPTURE recheck refuses expanded source declarations and missing failure channels', () => {

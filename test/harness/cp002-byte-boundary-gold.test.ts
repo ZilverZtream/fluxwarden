@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { childEnv, repoRoot } from '../helpers/cli.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 import { testRoot } from '../helpers/env.js';
 
 interface Options { root: string; sentinels: string; sentinelDir: string; testTmp: string; evidenceDir: string; paths: string[]; commandOutput?: string }
@@ -38,7 +39,7 @@ async function fixture(label: string) {
   const scanner = await import(pathToFileURL(join(repoRoot, 'scripts/leak-check.mjs')).href) as Scanner;
   const scratch = await import(pathToFileURL(join(repoRoot, 'scripts/private-scratch.mjs')).href) as Scratch;
   const root = await scratch.createPrivateDirectory(testRoot('FLUXWARDEN_TEST_TMP'), 'byte-boundary-');
-  const sentinelDir = await scratch.createPrivateDirectory(testRoot('FLUXWARDEN_SENTINEL_DIR'), 'byte-boundary-');
+  const sentinelDir = await scratch.createPrivateDirectory(root, 'sources-');
   const evidenceDir = await scratch.createPrivateDirectory(testRoot('FLUXWARDEN_EVIDENCE_DIR'), 'byte-boundary-');
   const sentinels = join(root, 'registry.json'), target = join(root, 'payload.bin');
   const sources: string[] = [];
@@ -52,7 +53,10 @@ async function fixture(label: string) {
     scanner, options, target,
     register(bytes: Buffer, name = 'source.bin') {
       const file = join(sentinelDir, name);
-      if (!sources.includes(file)) sources.push(file);
+      if (!sources.includes(file)) {
+        sources.push(file);
+        declareFixturePaths([file]);
+      }
       writeFileSync(file, bytes, { mode: 0o600 });
       record({ event: 'registration', label, path: file, bytes: bytes.length, sha256: fingerprint(bytes) });
       return file;
@@ -77,7 +81,7 @@ async function fixture(label: string) {
     },
     cleanup() {
       for (const file of [target, sentinels, ...sources]) rmSync(file, { force: true });
-      for (const directory of [root, sentinelDir, evidenceDir]) rmdirSync(directory);
+      for (const directory of [sentinelDir, root, evidenceDir]) rmdirSync(directory);
       record({ event: 'closed', label, roots: [root, sentinelDir, evidenceDir], allRemoved: [root, sentinelDir, evidenceDir].every(directory => !existsSync(directory)) });
     },
   };

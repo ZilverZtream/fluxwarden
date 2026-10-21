@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { repoRoot } from '../helpers/cli.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 import { testRoot } from '../helpers/env.js';
 
 type Hit = { path: string; encoding: string } | null;
@@ -56,7 +57,7 @@ async function fixture() {
   const scanner = await loadScanner();
   const parent = testRoot('FLUXWARDEN_TEST_TMP');
   const root = mkdtempSync(join(parent, 'encoding-'));
-  const sentinelDir = mkdtempSync(join(testRoot('FLUXWARDEN_SENTINEL_DIR'), 'encoding-'));
+  const sentinelDir = mkdtempSync(join(root, 'sources-'));
   const sentinels = join(root, 'registry.json'), target = join(root, 'payload.bin');
   const sourceFiles: string[] = [];
   const sources: Buffer[] = [];
@@ -71,6 +72,7 @@ async function fixture() {
       const path = join(sentinelDir, `${String(sourceFiles.length)}.bin`);
       sourceFiles.push(path);
       sources.push(bytes);
+      declareFixturePaths([path]);
       writeFileSync(path, bytes, { mode: 0o600 });
     },
     clean(value: Buffer, label: string) {
@@ -104,7 +106,7 @@ async function fixture() {
     cleanup() {
       // Remove only the exact files and empty directories allocated here.
       for (const path of [target, sentinels, ...sourceFiles]) rmSync(path, { force: true });
-      rmdirSync(root); rmdirSync(sentinelDir);
+      rmdirSync(sentinelDir); rmdirSync(root);
     },
   };
 }

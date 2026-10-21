@@ -44,8 +44,8 @@ jobs:
           FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
         run: |
           node --input-type=module <<'NODE'
-          import { appendFile } from 'node:fs/promises';
-          import { win32 } from 'node:path';
+          import { appendFile, writeFile } from 'node:fs/promises';
+          import { win32, join } from 'node:path';
           import { createPrivateDirectory, assertPrivateDirectories, realDirectory } from './scripts/private-scratch.mjs';
           let parent = process.env.FLUXWARDEN_CI_TMP_PARENT;
           if (process.platform === 'win32') {
@@ -63,27 +63,34 @@ jobs:
             roots.push([name, await createPrivateDirectory(parent, prefix)]);
           }
           await assertPrivateDirectories([...(process.platform === 'win32' ? [parent] : []), ...roots.map(([, directory]) => directory)]);
+          const temp = roots.find(([name]) => name === 'TEMP')[1], evidence = roots.find(([name]) => name === 'FLUXWARDEN_EVIDENCE_DIR')[1];
+          for (const [name, filename] of [['NPM_CONFIG_USERCONFIG', 'npm-user.npmrc'], ['NPM_CONFIG_GLOBALCONFIG', 'npm-global.npmrc']]) {
+            const path = join(temp, filename); await writeFile(path, '', { flag: 'wx', mode: 0o600 }); roots.push([name, path]);
+          }
+          roots.push(['NPM_CONFIG_CACHE', await createPrivateDirectory(temp, 'npm-validation-cache-')], ['NPM_CONFIG_LOGS_DIR', await createPrivateDirectory(evidence, 'npm-validation-logs-')], ['NPM_CONFIG_UPDATE_NOTIFIER', 'false']);
           await appendFile(process.env.GITHUB_ENV, [
             ...(process.platform === 'win32' ? [['FLUXWARDEN_CI_OWNED_ROOT', parent]] : []), ...roots,
           ].map(([name, directory]) => `${name}=${directory}\n`).join(''));
           NODE
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
       # The hosted Linux runners have two CPUs; four workers contend in timing-bound proofs.
       - name: Test Linux product
-        if: matrix.os == 'ubuntu-latest' && matrix.shard == 'core'
-        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --harness -- npm ci --ignore-scripts --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.shard == 'core'
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --harness -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
       # Separate Windows VMs keep native process and owner-lifecycle proofs from competing with core tests.
       - name: Test Windows core product
         env:
           FLUXWARDEN_CI_CORE_CONFIG: ${{ env.TEMP }}/vitest-windows-core.config.mjs
-        if: matrix.os == 'windows-latest' && startsWith(matrix.shard, 'core-')
+        if: always() && matrix.os == 'windows-latest' && startsWith(matrix.shard, 'core-')
         run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs ${{ matrix.shard == 'core-1' && '--harness' || '' }} -- npm ci --ignore-scripts --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next node scripts/ci-windows-core.mjs --next npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=1 --fileParallelism=false
+          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs ${{ matrix.shard == 'core-1' && '--harness' || '' }} -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next node scripts/ci-windows-core.mjs --next npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=1 --fileParallelism=false
           --shard=${{ matrix.coreShard }}
           --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
       - name: Test Windows native product
-        if: matrix.os == 'windows-latest' && matrix.shard == 'native'
+        if: always() && matrix.os == 'windows-latest' && matrix.shard == 'native'
         run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- npm ci --ignore-scripts --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=1 --fileParallelism=false
+          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=1 --fileParallelism=false
           test/labs/cp006-cp008-owner-lifecycle.test.ts
           test/persistence/cp015-concurrency.test.ts
           test/chaos/t01-t12.test.ts
@@ -126,14 +133,23 @@ jobs:
           FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
         run: |
           node --input-type=module <<'NODE'
-          import { appendFile } from 'node:fs/promises';
+          import { appendFile, writeFile } from 'node:fs/promises';
+          import { join } from 'node:path';
           import { createPrivateDirectory, assertPrivateDirectories } from './scripts/private-scratch.mjs';
           const roots = [];
           for (const name of ['TEMP', 'TMP', 'FLUXWARDEN_TEST_TMP', 'FLUXWARDEN_SENTINEL_DIR', 'FLUXWARDEN_EVIDENCE_DIR', 'FLUXWARDEN_CI_CAPTURE_DIR']) roots.push([name, await createPrivateDirectory(process.env.FLUXWARDEN_CI_TMP_PARENT, 'lab-' + name.toLowerCase() + '-')]);
           await assertPrivateDirectories(roots.map(([, path]) => path));
+          const temp = roots.find(([name]) => name === 'TEMP')[1], evidence = roots.find(([name]) => name === 'FLUXWARDEN_EVIDENCE_DIR')[1];
+          for (const [name, filename] of [['NPM_CONFIG_USERCONFIG', 'npm-user.npmrc'], ['NPM_CONFIG_GLOBALCONFIG', 'npm-global.npmrc']]) {
+            const path = join(temp, filename); await writeFile(path, '', { flag: 'wx', mode: 0o600 }); roots.push([name, path]);
+          }
+          roots.push(['NPM_CONFIG_CACHE', await createPrivateDirectory(temp, 'npm-validation-cache-')], ['NPM_CONFIG_LOGS_DIR', await createPrivateDirectory(evidence, 'npm-validation-logs-')], ['NPM_CONFIG_UPDATE_NOTIFIER', 'false']);
           await appendFile(process.env.GITHUB_ENV, roots.map(([name, path]) => name + '=' + path + '\n').join(''));
           NODE
-      - run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- npm ci --ignore-scripts --next npm run build --next npm run test:lab
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - if: always()
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run build --next npm run test:lab
       - name: Verify complete invocation custody
         if: always()
         id: capture-verify
@@ -165,14 +181,23 @@ jobs:
           FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
         run: |
           node --input-type=module <<'NODE'
-          import { appendFile } from 'node:fs/promises';
+          import { appendFile, writeFile } from 'node:fs/promises';
+          import { join } from 'node:path';
           import { createPrivateDirectory, assertPrivateDirectories } from './scripts/private-scratch.mjs';
           const roots = [];
           for (const name of ['TEMP', 'TMP', 'FLUXWARDEN_TEST_TMP', 'FLUXWARDEN_SENTINEL_DIR', 'FLUXWARDEN_EVIDENCE_DIR', 'FLUXWARDEN_CI_CAPTURE_DIR']) roots.push([name, await createPrivateDirectory(process.env.FLUXWARDEN_CI_TMP_PARENT, 'chaos-' + name.toLowerCase() + '-')]);
           await assertPrivateDirectories(roots.map(([, path]) => path));
+          const temp = roots.find(([name]) => name === 'TEMP')[1], evidence = roots.find(([name]) => name === 'FLUXWARDEN_EVIDENCE_DIR')[1];
+          for (const [name, filename] of [['NPM_CONFIG_USERCONFIG', 'npm-user.npmrc'], ['NPM_CONFIG_GLOBALCONFIG', 'npm-global.npmrc']]) {
+            const path = join(temp, filename); await writeFile(path, '', { flag: 'wx', mode: 0o600 }); roots.push([name, path]);
+          }
+          roots.push(['NPM_CONFIG_CACHE', await createPrivateDirectory(temp, 'npm-validation-cache-')], ['NPM_CONFIG_LOGS_DIR', await createPrivateDirectory(evidence, 'npm-validation-logs-')], ['NPM_CONFIG_UPDATE_NOTIFIER', 'false']);
           await appendFile(process.env.GITHUB_ENV, roots.map(([name, path]) => name + '=' + path + '\n').join(''));
           NODE
-      - run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- npm ci --ignore-scripts --next npm run build --next npm run test:chaos -- --reporter=default --reporter=json --outputFile.json "$FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json" --finally node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - if: always()
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run build --next npm run test:chaos -- --reporter=default --reporter=json --outputFile.json "$FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json" --finally node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
 
       - name: Verify complete invocation custody
         if: always()

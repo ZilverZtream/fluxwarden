@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, childEnv, repoRoot, runNpmScript } from '../helpers/cli.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 import '../helpers/env.js';
 
 type Hit = { path: string; encoding: string } | null;
@@ -138,10 +139,11 @@ it('CP-002/B8 short binary values and distinct shared-prefix sentinels are detec
   const scanner = await import(pathToFileURL(join(repoRoot, 'scripts/leak-check.mjs')).href) as Scanner;
   const scratch = await import(pathToFileURL(join(repoRoot, 'scripts/private-scratch.mjs')).href) as Scratch;
   const base = process.env['FLUXWARDEN_TEST_TMP'];
-  const sources = process.env['FLUXWARDEN_SENTINEL_DIR'];
-  if (!base || !sources) throw new Error('test temporary and sentinel directories are required');
+  if (!base) throw new Error('test temporary directory is required');
   const root = await scratch.createPrivateDirectory(base, 'small-values-');
-  const sentinelDir = await scratch.createPrivateDirectory(sources, 'small-values-');
+  // This recognizer's complete unit population belongs to its local context,
+  // independently of the invocation's actual runtime credential registry.
+  const sentinelDir = await scratch.createPrivateDirectory(root, 'sources-');
   const sentinels = join(root, 'sentinels.json');
   writeFileSync(sentinels, '[]');
   const prefix = Buffer.from('!!!!!!!!');
@@ -155,6 +157,7 @@ it('CP-002/B8 short binary values and distinct shared-prefix sentinels are detec
     ['shared-second', Buffer.concat([prefix, Buffer.alloc(24, '$')])],
   ];
   const sourceFiles = population.map(([label]) => join(sentinelDir, `${label}.bin`));
+  declareFixturePaths(sourceFiles);
   const target = join(root, 'payload.bin');
   const options = { root, sentinels, sentinelDir };
   const variants = population.map(([label, bytes]) => ({ label, variants: forms(bytes) }));

@@ -114,9 +114,13 @@ for (const failure of [false, true]) {
       assertPrivateDirectories: (paths: string[]) => Promise<void>;
     };
     await scratch.assertPrivateDirectories(roots);
+    // Windows Vitest workers can inherit an uppercase alias. Node's child env
+    // normalization would choose it before the owned lowercase bridge override.
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) if (key.toLowerCase() === 'npm_execpath') Reflect.deleteProperty(env, key);
     const result = spawnSync(process.execPath, [join(repoRoot, 'scripts/release-smoke.mjs'), tarball], {
       cwd: repoRoot, windowsHide: true, timeout: 10_000,
-      env: { ...process.env, NODE_OPTIONS: '', NODE_DEBUG: '', npm_execpath: bridge,
+      env: { ...env, NODE_OPTIONS: '', NODE_DEBUG: '', npm_execpath: bridge,
         TEMP: roots[0], TMP: roots[1], FLUXWARDEN_TEST_TMP: roots[2],
         FLUXWARDEN_SENTINEL_DIR: roots[3], FLUXWARDEN_EVIDENCE_DIR: roots[4],
         FW_RETENTION_ORACLE: oracle, FW_RETENTION_FAILURE: failure ? 'yes' : 'no' },

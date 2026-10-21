@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, binPath, childEnv, isRecord, readJson, readText, repoRoot, runNpmScript, scratchDir } from '../helpers/cli.js';
 import { parseYaml, type Yaml } from '../helpers/yaml.js';
+import { ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 
 // Toolchain versions recorded from the reference package on 2026-10-11.
 const PINS: Record<string, string> = {
@@ -189,6 +190,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     if (uses === CHECKOUT) return 'checkout';
     if (uses === SETUP_NODE) return 'setup-node';
     const run = commandOf(s);
+    if (/^node scripts\/ci-install\.mjs --root "\$PWD"$/.test(run)) return 'npm ci';
     if (/^npm ci(\s|$)/.test(run)) return 'npm ci';
     if (/^npm run lint(\s|$)/.test(run)) return 'lint';
     if (/^npm run build(\s|$)/.test(run)) return 'build';
@@ -199,15 +201,21 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   };
   const active = (step: { [key: string]: Yaml }, combo: Record<string, string>): boolean => {
     if (step['if'] === undefined) return true;
-    const condition = String(step['if']).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+    let condition = String(step['if']).trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
     if (condition.includes('always()')) {
       const run = String(step['run'] ?? '').trim();
       const verification = /^node scripts\/ci-capture\.mjs verify --root "\$PWD" --capture-dir "\$FLUXWARDEN_CI_CAPTURE_DIR"$/.test(run);
       const upload = typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@');
-      expect(verification || upload, 'only capture finalization/upload runs unconditionally after failure').toBe(true);
-      expect(condition).toBe(verification ? 'always()' : "always() && steps.capture-verify.outcome == 'success'");
+      const failedSetupCapture = /^node scripts\/ci-job\.mjs\b/.test(captureCommand(run))
+        && commandsOf(step)[0] === 'node scripts/ci-install.mjs verify --root "$PWD"';
+      expect(verification || upload || failedSetupCapture, 'only finalization, safe upload or a capture gated by original installer verification runs after failure').toBe(true);
       expect(step['continue-on-error'], 'finalization cannot waive a failure').toBeUndefined();
-      return true;
+      if (!failedSetupCapture) {
+        expect(condition).toBe(verification ? 'always()' : "always() && steps.capture-verify.outcome == 'success'");
+        return true;
+      }
+      expect(condition, 'failure capture preserves the original matrix selector').toMatch(/^always\(\)\s*&&\s+/);
+      condition = condition.replace(/^always\(\)\s*&&\s+/, '');
     }
     return condition.split(/\s*\|\|\s*/).some(alternative => alternative.split(/\s*&&\s*/).every(term => {
       const equal = /^matrix\.(os|shard) == '([^']+)'$/.exec(term);
@@ -237,17 +245,17 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     const core = combo['shard'] === 'core' || combo['shard'] === 'core-1' || combo['shard'] === 'core-2';
     const harness = combo['shard'] === 'core' || combo['shard'] === 'core-1';
     expect(ordered.map(kind), JSON.stringify(combo)).toEqual([
-      'checkout', 'setup-node', 'product',
+      'checkout', 'setup-node', 'npm ci', 'product',
     ]);
     const productStep = ordered.find(s => kind(s) === 'product') ?? {};
     const wrapped = String(productStep['run']);
     expect(captureCommand(wrapped), 'one transparent finite wrapper encloses the job').not.toBe(wrapped);
     const job = captureCommand(subst(wrapped, combo)).replace(/\$\{\{ matrix\.shard == 'core-1' && '--harness' \|\| '' \}\}/g,
       combo['shard'] === 'core-1' ? '--harness' : '').replace(/\s+/g, ' ');
-    expect(job.startsWith(`node scripts/ci-job.mjs ${harness ? '--harness ' : ''}-- npm ci --ignore-scripts --next `), 'capture starts before install and retains each shard harness selection').toBe(true);
+    expect(job.startsWith(`node scripts/ci-job.mjs ${harness ? '--harness ' : ''}-- node scripts/ci-install.mjs verify --root "$PWD" --next `), 'capture starts with the original installer failure gate and retains each shard harness selection').toBe(true);
     const stages = commandsOf(productStep);
     expect(stages.slice(0, -1), 'all original preparation stages are inside capture in their original order').toEqual([
-      'npm ci --ignore-scripts', 'npm run lint', 'npm run build', 'node scripts/ci-database-check.mjs',
+      'node scripts/ci-install.mjs verify --root "$PWD"', 'npm run lint', 'npm run build', 'node scripts/ci-database-check.mjs',
       ...(windows && core ? ['node scripts/ci-windows-core.mjs'] : []),
     ]);
     expect(stages.at(-1), 'product follows all captured preparation stages').toBe(commandOf(productStep));
@@ -298,10 +306,10 @@ process.exitCode = mode === 'fail' ? 7 : 0;
       mkdirSync(join(jobRoot, 'node_modules'), { recursive: true });
       writeFileSync(join(jobRoot, 'node_modules/install-canary'), 'owned stale install canary');
     }
-    const result = spawnSync(process.execPath, [join(repoRoot, 'scripts/ci-job.mjs'), ...(harness ? ['--harness'] : []), '--',
+    const result = spawnSync(process.execPath, [...ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-job.mjs'), ...(harness ? ['--harness'] : []), '--',
       ...(fullOrder ? ['npm', 'ci', '--ignore-scripts', '--next', 'npm', 'run', 'lint', '--next', 'npm', 'run', 'build',
         '--next', 'node', 'scripts/ci-database-check.mjs', '--next'] : []),
-      'npm', 'test', '--', '--reporter=default', '--reporter=json', `--outputFile.json=${join(jobEvidence, 'vitest-product.json')}`], {
+      'npm', 'test', '--', '--reporter=default', '--reporter=json', `--outputFile.json=${join(jobEvidence, 'vitest-product.json')}`])], {
       cwd: jobRoot, env: { ...childEnv(), FLUXWARDEN_EVIDENCE_DIR: jobEvidence, CONTROL_PRODUCT: product,
         CONTROL_HARNESS: harnessResult, CONTROL_LINT: preparation, CONTROL_TRACE: traceFile, CONTROL_REPORTS: join(repoRoot, 'test/fixtures/no-pending') },
       encoding: 'utf8', windowsHide: true, timeout: 10_000,
@@ -413,10 +421,12 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
       ? /^npm run test:chaos(?:\s+--)?(?:\s+--(?:reporter|outputFile(?:\.json)?)(?:=|\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s]+))*$/
       : /^npm run test:lab$/;
     const wrapped = runs.find(r => r.includes(`npm run ${script}`)) ?? '';
+    expect(runs.indexOf('node scripts/ci-install.mjs --root "$PWD"'), `${name} performs trusted setup before validation capture`).toBeGreaterThanOrEqual(0);
+    expect(runs.indexOf('node scripts/ci-install.mjs --root "$PWD"')).toBeLessThan(runs.indexOf(wrapped));
     const stream = captureCommand(wrapped.trim()).replace(/^node scripts\/ci-job\.mjs --commands-only -- /, '');
     const stages = stream.split(/\s+--next\s+|\s+--finally\s+/);
-    expect(captureCommand(wrapped.trim()), `${name} capture encloses installation`).not.toBe(wrapped.trim());
-    expect(stages.slice(0, 2), `${name} preserves captured install/build order`).toEqual(['npm ci --ignore-scripts', 'npm run build']);
+    expect(captureCommand(wrapped.trim()), `${name} capture encloses installer verification and validation`).not.toBe(wrapped.trim());
+    expect(stages.slice(0, 2), `${name} checks original setup before the original build`).toEqual(['node scripts/ci-install.mjs verify --root "$PWD"', 'npm run build']);
     expect(invocation.test(stages[2] ?? '') && !/[;&|`\r\n]/.test(wrapped.trim()), `${name} retains the exact selected test command`).toBe(true);
     expect(stages.length, `${name} has only its original selected stages`).toBe(name === 'chaos' ? 4 : 3);
     if (name === 'chaos') {

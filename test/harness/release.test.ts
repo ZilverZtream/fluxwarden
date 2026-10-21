@@ -455,7 +455,16 @@ it('CP-036/B5 the chaos job runs only on dispatch, scans its evidence for leaks 
   const scan = firstIndex(all, /\bscripts\/leak-check\.mjs\b/);
   const upload = all.findIndex(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
   expect(run, 'chaos run').toBeGreaterThanOrEqual(0);
-  expect(scan, 'leak scan after the run').toBeGreaterThan(run);
+  if (scan === run) {
+    const command = runText(all[run]);
+    const chaosCommand = command.indexOf('npm run test:chaos');
+    const finalStage = command.indexOf('--finally');
+    const scannerCommand = command.indexOf('scripts/leak-check.mjs');
+    expect(command, 'one finite capture contains the actual ordered job commands').toMatch(/scripts\/ci-capture\.mjs\b.*\s--\s+node scripts\/ci-job\.mjs\b/);
+    expect(finalStage, 'scanner is an unconditional final command after chaos, including a failed chaos exit').toBeGreaterThan(chaosCommand);
+    expect(scannerCommand, 'the actual unchanged scanner follows the final-stage delimiter').toBeGreaterThan(finalStage);
+    expect(command.slice(finalStage), 'final stage executes the unchanged scanner directly').toMatch(/^--finally node scripts\/leak-check\.mjs\b/);
+  } else expect(scan, 'separate leak scan step follows the run').toBeGreaterThan(run);
   expect(upload, 'upload after the scan').toBeGreaterThan(scan);
   const uploadStep = all[upload] ?? {};
   expect(String(uploadStep['uses'])).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
@@ -464,7 +473,8 @@ it('CP-036/B5 the chaos job runs only on dispatch, scans its evidence for leaks 
   expect(uploaded.length).toBeGreaterThan(0);
   // Lab runtime state holds credential paths and node material; it is never uploaded.
   expect(uploaded).not.toMatch(/\.runtime|labs\/?$|\bsentinels?\b/);
-  expect(runText(all[scan]), 'the scan covers the uploaded path').toContain(uploaded.split(/\r?\n/)[0] ?? '');
+  const evidenceVariable = (value: string): string => value.replace(/\$\{\{\s*env\.FLUXWARDEN_EVIDENCE_DIR\s*\}\}/g, '$FLUXWARDEN_EVIDENCE_DIR');
+  expect(evidenceVariable(runText(all[scan])), 'the scan covers the uploaded path').toContain(evidenceVariable(uploaded.split(/\r?\n/)[0] ?? ''));
 });
 
 function releaseSections(text: string): { version: string; date: string; body: string }[] {
