@@ -1,4 +1,5 @@
-import { existsSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import type { ExecutionRecord, LedgerBook, StoredJournal, Transaction } from '../core/ledger.js';
@@ -236,8 +237,8 @@ interface Reader {
 /**
  * Opens a read-only connection that creates no file. A database without a -wal file was closed cleanly, so its
  * main file holds every committed transaction and is read as immutable: SQLite then opens no -wal or -shm.
- * Only a checkpoint can change the main file, so each read is followed by a check of its size and modification
- * time; a change means a writer ran meanwhile and the read fails as BUSY. With a -wal file present the
+ * Only a checkpoint can change the main file, so each read is followed by a check of its metadata and content;
+ * a change means a writer ran meanwhile and the read fails as BUSY. With a -wal file present the
  * ordinary read-only connection requires an existing -shm file: otherwise SQLite could create it while reading
  * the schema. Side-file presence is checked before opening, within the already validated trusted ancestry.
  */
@@ -255,8 +256,44 @@ function openReader(absolute: string, timeout: number): Reader {
       return { db: new DatabaseSync(absolute, options), unchanged: () => undefined };
     }
     const fingerprint = (): string => {
-      const stat = statSync(absolute, { bigint: true });
-      return `${stat.size.toString()}:${stat.mtimeNs.toString()}:${String(existsSync(wal))}`;
+      const fd = openSync(absolute, 'r');
+      try {
+        const stat = fstatSync(fd, { bigint: true });
+        const identity = () => {
+          const held = fstatSync(fd, { bigint: true }), named = lstatSync(absolute, { bigint: true });
+          if (!held.isFile() || held.nlink !== 1n || !named.isFile() || named.isSymbolicLink()
+            || named.dev !== held.dev || named.ino !== held.ino || held.dev !== stat.dev || held.ino !== stat.ino
+            || held.size !== stat.size || held.mtimeNs !== stat.mtimeNs || held.ctimeNs !== stat.ctimeNs) {
+            throw new PersistenceError('BUSY', 'the database changed while it was read; retry');
+          }
+        };
+        identity();
+        // Node.js/node doc/api/fs.md readSync: fixed-size reads keep memory bounded.
+        // Same-size checkpoints can share a filesystem timestamp; immutable SQLite
+        // readers need content identity too before returning their cached snapshot.
+        const chunk = Buffer.allocUnsafe(65_536);
+        const content = (): string => {
+          const digest = createHash('sha256');
+          let position = 0n;
+          while (position < stat.size) {
+            const remaining = stat.size - position;
+            const length = Number(remaining > BigInt(chunk.length) ? BigInt(chunk.length) : remaining);
+            const count = readSync(fd, chunk, 0, length, position);
+            if (count === 0) throw new PersistenceError('BUSY', 'the database changed while it was read; retry');
+            digest.update(chunk.subarray(0, count));
+            position += BigInt(count);
+          }
+          identity();
+          return digest.digest('hex');
+        };
+        const digest = content();
+        // A concurrent rewrite must not establish the initial cached identity
+        // from a single partial view, even when filesystem timestamps coincide.
+        if (content() !== digest) {
+          throw new PersistenceError('BUSY', 'the database changed while it was read; retry');
+        }
+        return `${stat.size.toString()}:${stat.mtimeNs.toString()}:${String(existsSync(wal))}:${digest}`;
+      } finally { closeSync(fd); }
     };
     const before = fingerprint();
     const url = pathToFileURL(absolute);

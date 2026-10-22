@@ -85,5 +85,10 @@ export function capturedSink(): { sink: Writable; text(): string } {
 }
 
 export function registryIsNonempty(directory: string): boolean {
-  return readdirSync(directory).some(file => readFileSync(join(directory, file)).byteLength > 0);
+  return readdirSync(directory, { withFileTypes: true }).some(entry => {
+    const path = join(directory, entry.name);
+    // Suites register sentinels in private subdirectories of the shared root.
+    // Follow regular directories only; links cannot supply sentinel evidence.
+    return entry.isDirectory() ? registryIsNonempty(path) : entry.isFile() && readFileSync(path).byteLength > 0;
+  });
 }
