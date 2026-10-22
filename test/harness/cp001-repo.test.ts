@@ -119,8 +119,8 @@ it('CP-001/B10 .gitattributes exists, .gitignore lists the four paths and LICENS
 it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned actions, step order and dispatch-only lab jobs', () => {
   const wf = map(parseYaml(readText('.github/workflows/ci.yml')), 'workflow');
   const on = map(wf['on'], 'on');
-  expect(Object.keys(on).sort()).toEqual(['pull_request', 'push', 'workflow_dispatch']);
-  expect(map(on['push'], 'on.push')['branches']).toEqual(['main']);
+  expect(Object.keys(on).sort()).toEqual(['pull_request', 'workflow_dispatch']);
+  expect(on['push']).toBeUndefined();
   expect(wf['permissions']).toEqual({ contents: 'read' });
 
   const jobs = map(wf['jobs'], 'jobs');

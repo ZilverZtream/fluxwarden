@@ -1,13 +1,11 @@
 name: CI
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
-# A newer push to a pull request or feature branch cancels the run it supersedes;
-# every run on main completes, so each main commit keeps its own result.
+# A newer pull request or dispatched feature-branch run cancels the run it supersedes;
+# dispatched runs on main complete, so each validated main commit keeps its own result.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}

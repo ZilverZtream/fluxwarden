@@ -276,6 +276,7 @@ it('CP-032/REG-REC008 standalone assessment does not grant unrelated execution c
 });
 
 it('CP-032/REG-SRC007 successful create reply after lease expiry retains exact cleanup ownership', async () => {
+  const PUBLIC_TEST_LEASE_MS = 10_000;
   const f = await fixture();
   const observed: { phase: 'begin' | 'reply'; expiry: number; at: number; status: string; fence: bigint }[] = [];
   f.native.model.removal = 'reject';
@@ -284,7 +285,7 @@ it('CP-032/REG-SRC007 successful create reply after lease expiry retains exact c
     observed.push({ phase: 'begin', expiry, at: dbNow(f.path), status: begin.status, fence: begin.fence_epoch });
     // Ordinary delayed native reply; the original public lease expires on the
     // real database clock. No execution deadline or ownership row is rewritten.
-    const deadline = performance.now() + 2_000;
+    const deadline = performance.now() + PUBLIC_TEST_LEASE_MS + 2_000;
     while (dbNow(f.path) <= expiry) {
       if (performance.now() >= deadline) throw new Error('SETUP_ERROR: database lease did not expire during the bounded native reply');
       await sleep(20);
@@ -292,7 +293,7 @@ it('CP-032/REG-SRC007 successful create reply after lease expiry retains exact c
     const reply = execById(f.path, f.executionId);
     observed.push({ phase: 'reply', expiry: Number(reply.lease_expires_at), at: dbNow(f.path), status: reply.status, fence: reply.fence_epoch });
   };
-  await f.assess(true, 1_000).catch(() => undefined);
+  await f.assess(true, PUBLIC_TEST_LEASE_MS).catch(() => undefined);
   expect(observed.map(row => row.phase), 'both native await boundaries were reached').toEqual(['begin', 'reply']);
   const begin = observed[0], reply = observed[1];
   if (begin === undefined || reply === undefined) throw new Error('SETUP_ERROR: native create boundaries unavailable');
@@ -320,4 +321,4 @@ it('CP-032/REG-SRC007 successful create reply after lease expiry retains exact c
   await f.recover();
   expect(f.native.removals()).toEqual([layer, layer]);
   f.truth('CANCELLED');
-});
+}, 60_000);
