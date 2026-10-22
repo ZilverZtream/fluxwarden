@@ -18,6 +18,7 @@ import { askrene, type LayerState } from './askrene.js';
 import { startFakeCln, type ClnContext, type ClnHandler, type FakeCln } from './fake-cln.js';
 import { accountEvent, channelDirection, clnInvoice, CLN_PUBKEY, getinfo, getroutesAnswer, pathHop, peerChannel, sendpay } from './responses.js';
 import { syntheticInvoice } from '../../helpers/cp004-invoice.js';
+import { declareFixturePaths } from '../../helpers/capture-fixture.js';
 
 export const SELF = CLN_PUBKEY; // CLN-M
 export const LND_R = `02${'71'.repeat(32)}`; // out-peer over channel 2
@@ -117,6 +118,7 @@ const hashParam = (context: ClnContext): string | null => typeof context.params[
 export async function startRebalanceCln(dir: string, open: FakeServer[], over: Partial<Pick<RebalanceState, 'network' | 'id' | 'sendpay' | 'bkprFeeMsat'>> & { identity?: Identity; tls?: TlsMaterial } = {}): Promise<RebalanceCln> {
   const rune = randomBytes(48).toString('base64url');
   const runeFile = join(dir, `${randomBytes(4).toString('hex')}.rune`);
+  declareFixturePaths([runeFile]);
   writeFileSync(runeFile, `${rune}\n`, { mode: 0o600 });
   const layers = askrene();
   const state: RebalanceState = {

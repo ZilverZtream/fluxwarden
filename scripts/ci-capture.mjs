@@ -5,14 +5,16 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrivateDirectory, assertPrivateDirectories } from './private-scratch.mjs';
 import { findLeaks, sentinelRedactor } from './leak-check.mjs';
 import { variables, hash, inside, files, directories, registered, equivalents, retain, anchor, ancestry, binding, namespace } from './ci-capture-files.mjs';
+import { secretOutputs, unexpectedSecretMatches } from './ci-secret-output.mjs';
 
 const script = fileURLToPath(import.meta.url);
 const write = (path, value) => fs.writeFileSync(path, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
 const read = path => JSON.parse(fs.readFileSync(path, 'utf8'));
 const digest = path => hash(fs.readFileSync(path));
+const secretContext = (row, redact) => ({ path: redact(row.path), ...(redact(row.path) !== row.path ? { pathSha256: hash(row.path) } : {}), sha256: row.sha256, keyId: row.keyId, authorizationSha256: row.authorizationSha256 });
 function diagnostic(phase, result, reasons) {
   process.stderr.write(JSON.stringify({ stage: 'ci-capture', phase, exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 1,
-    complete: result.complete === true, leakFree: result.leakFree === true, reasons }) + '\n');
+    complete: result.complete === true, leakFree: result.leakFree === true, policySatisfied: result.policySatisfied === true, reasons }) + '\n');
 }
 function git(root, args, env = process.env, input) {
   const result = spawnSync('git', ['-C', root, ...args], { env, input, encoding: 'utf8', windowsHide: true });
@@ -98,9 +100,13 @@ function parentBindings(paths) {
 function records(capture, config) {
   return files(join(capture, 'private', 'records')).map(path => {
     const row = read(path);
-    if (!same(Object.keys(row), ['path', 'sha256', 'purpose']) || typeof row.path !== 'string' || resolve(row.path) !== row.path || !/^[0-9a-f]{64}$/.test(row.sha256) || !['INPUT', 'EGRESS'].includes(row.purpose) ||
+    if (!same(Object.keys(row), ['path', 'sha256', 'purpose']) || typeof row.path !== 'string' || resolve(row.path) !== row.path || !/^[0-9a-f]{64}$/.test(row.sha256) || !['INPUT', 'EGRESS', 'SECRET_OUTPUT'].includes(row.purpose) ||
         path !== join(capture, 'private', 'records', hash(JSON.stringify(row)) + '.json') ||
         row.purpose === 'INPUT' && !config.registered.includes(row.path) && !inside(config.sentinelDir, row.path)) throw new Error('capture invalid original context');
+    if (row.purpose === 'SECRET_OUTPUT') {
+      const producer = read(join(capture, 'private', 'authorizations', 'secret-output-' + hash(row.path) + '.json'));
+      if (producer.purpose !== 'SECRET_OUTPUT' || producer.file?.sha256 !== row.sha256 || producer.environment?.codeLoadingValidated !== true) throw new Error('capture invalid generated source');
+    }
     return row;
   }).sort((a, b) => a.path.localeCompare(b.path) || a.sha256.localeCompare(b.sha256));
 }
@@ -118,7 +124,10 @@ function captureEgress(capture, retained) {
   const typedCopies = new Map();
   for (const row of retained) {
     typedCopies.set(join(capture, 'private', 'bytes', row.sha256), row.sha256);
-    if (row.purpose === 'INPUT') typedCopies.set(join(capture, 'private', 'sources', row.sha256), row.sha256);
+    if (row.purpose === 'INPUT' || row.purpose === 'SECRET_OUTPUT') {
+      typedCopies.set(join(capture, 'private', 'sources', row.sha256), row.sha256);
+      for (const bytes of equivalents(fs.readFileSync(join(capture, 'private', 'bytes', row.sha256)))) typedCopies.set(join(capture, 'private', 'bytes', hash(bytes)), hash(bytes));
+    }
   }
   return files(capture).filter(path => {
     if (typedCopies.has(path)) {
@@ -150,25 +159,34 @@ function authorizedDeclaration(capture, config, declared, path) {
   const observed = read(ledger);
   return observed.pathSha256 === key && observed.purpose === 'INPUT' && /^[0-9a-f]{64}$/.test(observed.declarationSha256);
 }
-function scan(capture, config, retained) {
+function scan(capture, config, retained, approved = []) {
   const options = { root: config.root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources') };
   // Keep the scanner's exact declaration and evidence-priority semantics on the
   // original paths. Private byte copies provide custody, never source credit.
   const paths = [...new Set([...retained.filter(record => record.purpose !== 'INPUT').map(record => record.path), ...captureEgress(capture, retained)])];
-  if (findLeaks({ ...options, paths, testTmp: config.testTmp, evidenceDir: config.evidenceDir })) return false;
+  const authorized = new Set(approved.map(row => row.path));
+  let leakFree = !findLeaks({ ...options, paths, testTmp: config.testTmp, evidenceDir: config.evidenceDir });
+  let noUnexpectedLeaks = authorized.size ? !findLeaks({ ...options, paths: paths.filter(path => !authorized.has(path)), testTmp: config.testTmp, evidenceDir: config.evidenceDir }) : Boolean(leakFree);
   const declared = declarationSet(config.testTmp);
   const unproven = paths.filter(path => (declared.has(path) || declared.has('sha256:' + hash(path))) && !authorizedDeclaration(capture, config, declared, path));
   // The unchanged engine gets every unproved declaration target as EGRESS too;
   // a later append cannot retroactively suppress bytes already written there.
-  if (unproven.length && findLeaks({ ...options, paths: unproven })) return false;
+  if (unproven.length && findLeaks({ ...options, paths: unproven })) { leakFree = false; if (!authorized.size) noUnexpectedLeaks = false; }
+  if (authorized.size && unproven.some(path => !authorized.has(path)) && findLeaks({ ...options, paths: unproven.filter(path => !authorized.has(path)) })) noUnexpectedLeaks = false;
+  const secretOutputMatches = [];
+  for (const row of approved) {
+    const match = findLeaks({ ...options, paths: [row.path] });
+    if (match) { leakFree = false; secretOutputMatches.push({ pathSha256: hash(row.path), sha256: row.sha256, encoding: match.encoding }); }
+  }
+  if (unexpectedSecretMatches(capture, retained, approved, findLeaks)) noUnexpectedLeaks = false;
   const roots = [...config.roots, ...config.outputs.filter(path => fs.existsSync(path)), capture];
   const names = new Set([...retained.map(record => record.path), ...roots.flatMap(directories), ...roots.flatMap(path => ancestry(dirname(path)).map(row => row.path))]);
   // Includes empty directories and all ancestor names. NUL cannot occur in a
   // filename, so one unchanged-engine pass retains every original name without
   // rebuilding source recognition for each directory and retained artifact.
   const outputNames = [...names].filter(path => !authorizedDeclaration(capture, config, declared, path));
-  if (findLeaks({ ...options, commandOutput: outputNames.join('\0') })) return false;
-  return true;
+  if (findLeaks({ ...options, commandOutput: outputNames.join('\0') })) { leakFree = false; noUnexpectedLeaks = false; }
+  return { leakFree: Boolean(leakFree), noUnexpectedLeaks, authorizedMatches: secretOutputMatches.length, secretOutputMatches };
 }
 function custody(capture, config) {
   const metadata = ['receipt.json', 'receipt.sha256', 'custody.json'].map(name => join(capture, name));
@@ -188,11 +206,17 @@ async function verify(root, capture) {
   if (digest(join(capture, 'custody.json')) !== receipt.custodySha256) throw new Error('capture custody record changed');
   if (!same(custody(capture, config), expected)) throw new Error('capture custody changed');
   retainedSourceIdentities(capture);
-  if (!receipt.result.complete || !receipt.result.leakFree) {
-    diagnostic('verify', receipt.result, [!receipt.result.complete ? 'recorded_incomplete' : 'recorded_leak']);
+  if (!receipt.result.complete || !receipt.result.policySatisfied) {
+    diagnostic('verify', receipt.result, [!receipt.result.complete ? 'recorded_incomplete' : 'recorded_policy_failure']);
     return 1;
   }
-  if (!scan(capture, config, records(capture, config)) || findLeaks({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources'), paths: metadataPaths(capture) })) {
+  const outputs = await secretOutputs(capture, config);
+  const checked = scan(capture, config, records(capture, config), outputs.approved);
+  const redact = sentinelRedactor({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources') });
+  if (!outputs.valid || !checked.noUnexpectedLeaks || checked.leakFree !== receipt.result.leakFree || checked.authorizedMatches !== receipt.result.authorizedMatches
+    || !same(checked.secretOutputMatches, receipt.secretOutputMatches)
+    || !same(outputs.approved.map(row => secretContext(row, redact)), receipt.secretOutputs)
+    || findLeaks({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources'), paths: metadataPaths(capture) })) {
     diagnostic('verify', receipt.result, ['verification_scan']);
     return 1;
   }
@@ -272,35 +296,42 @@ async function captureCommand(root, capture, command) {
     retainedSourceIdentities(capture);
   } catch { complete = false; reasons.add('closing_inventory'); }
   const retained = records(capture, config);
-  for (const record of retained.filter(row => row.purpose === 'INPUT')) {
+  for (const record of retained.filter(row => row.purpose === 'INPUT' || row.purpose === 'SECRET_OUTPUT')) {
     const source = fs.readFileSync(join(capture, 'private', 'bytes', record.sha256));
     const destination = join(capture, 'private', 'sources', record.sha256);
     if (!fs.existsSync(destination)) fs.writeFileSync(destination, source, { mode: 0o600, flag: 'wx' });
   }
-  let leakFree = false;
-  try { leakFree = scan(capture, config, retained); if (!leakFree) reasons.add('output_leak'); }
+  let leakFree = false, policySatisfied = false, authorizedMatches = 0, secretOutputMatches = [];
+  const outputsPolicy = await secretOutputs(capture, config);
+  try {
+    const checked = scan(capture, config, retained, outputsPolicy.approved);
+    ({ leakFree, authorizedMatches, secretOutputMatches } = checked);
+    policySatisfied = outputsPolicy.valid && checked.noUnexpectedLeaks;
+    if (!policySatisfied) reasons.add('output_leak');
+  }
   catch { complete = false; reasons.add('output_scan'); }
   const redact = sentinelRedactor({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources') });
   const context = row => ({ path: redact(row.path), ...(redact(row.path) !== row.path ? { pathSha256: hash(row.path) } : {}), sha256: row.sha256 });
   const declared = declarationSet(config.testTmp);
-  const sources = retained.filter(row => row.purpose === 'INPUT').flatMap(row => equivalents(fs.readFileSync(join(capture, 'private', 'bytes', row.sha256))).map(bytes => ({ ...context(row), sha256: hash(bytes), purpose: 'INPUT' })));
-  const artifacts = retained.filter(row => row.purpose !== 'INPUT').map(row => ({ ...context(row), purpose: row.path === join(config.testTmp, 'declared-out.txt') ? 'DECLARATION' : authorizedDeclaration(capture, config, declared, row.path) ? 'INPUT' : 'EGRESS' }));
+  const sources = retained.filter(row => row.purpose === 'INPUT' || row.purpose === 'SECRET_OUTPUT').flatMap(row => equivalents(fs.readFileSync(join(capture, 'private', 'bytes', row.sha256))).map(bytes => ({ ...context(row), sha256: hash(bytes), purpose: row.purpose })));
+  const artifacts = retained.filter(row => row.purpose !== 'INPUT').map(row => ({ ...context(row), purpose: row.purpose === 'SECRET_OUTPUT' || outputsPolicy.approved.some(output => output.path === row.path && output.sha256 === row.sha256) ? 'SECRET_OUTPUT' : row.path === join(config.testTmp, 'declared-out.txt') ? 'DECLARATION' : authorizedDeclaration(capture, config, declared, row.path) ? 'INPUT' : 'EGRESS' }));
   let census;
   try { census = custody(capture, config); }
   catch { complete = false; census = []; reasons.add('custody_inventory'); }
   fs.writeFileSync(join(capture, 'custody.json'), JSON.stringify(census), { mode: 0o600 });
-  const receipt = { scope: 'observed retained closing artifacts, full command streams, registered source lifetime and authenticated dependency inputs; no universal temporary-file history claim', boundarySha256: '8f4e83b62bad4940be142239352e443788d778d2ad10a24e76400bdf40f7bc27', parentBoundarySha256: '42784be10c0f54af383eb8005f0195db59f371081d504c9971fbb78dff6f9489', identity: { before, after }, result: { exitCode, complete, leakFree }, sources, artifacts, custodySha256: digest(join(capture, 'custody.json')) };
+  const receipt = { scope: 'observed retained closing artifacts, full command streams, registered source lifetime and authenticated dependency inputs; prospectively authorized canonical operator-key outputs retain literal matches with separate policy acceptance; no universal temporary-file history claim', boundarySha256: '8f4e83b62bad4940be142239352e443788d778d2ad10a24e76400bdf40f7bc27', parentBoundarySha256: '42784be10c0f54af383eb8005f0195db59f371081d504c9971fbb78dff6f9489', identity: { before, after }, result: { exitCode, complete, leakFree, policySatisfied, authorizedMatches }, sources, artifacts, secretOutputs: outputsPolicy.approved.map(row => secretContext(row, redact)), secretOutputMatches, custodySha256: digest(join(capture, 'custody.json')) };
   fs.writeFileSync(join(capture, 'receipt.json'), JSON.stringify(receipt), { mode: 0o600 });
   const metadata = ['receipt.json', 'receipt.sha256', 'custody.json'].map(name => ({ name, ...anchor(join(capture, name)) }));
   fs.writeFileSync(join(capture, 'receipt.sha256'), JSON.stringify({ receiptSha256: digest(join(capture, 'receipt.json')), metadata }), { mode: 0o600 });
   try {
-    if (findLeaks({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources'), paths: metadataPaths(capture) })) { leakFree = false; reasons.add('metadata_leak'); }
+    if (findLeaks({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources'), paths: metadataPaths(capture) })) { leakFree = false; policySatisfied = false; reasons.add('metadata_leak'); }
   } catch { complete = false; reasons.add('metadata_scan'); }
-  receipt.result = { exitCode, complete, leakFree };
+  policySatisfied = complete && policySatisfied;
+  receipt.result = { exitCode, complete, leakFree, policySatisfied, authorizedMatches };
   fs.writeFileSync(join(capture, 'receipt.json'), JSON.stringify(receipt), { mode: 0o600 });
   fs.writeFileSync(join(capture, 'receipt.sha256'), JSON.stringify({ receiptSha256: digest(join(capture, 'receipt.json')), metadata }), { mode: 0o600 });
-  if (exitCode || !complete || !leakFree) diagnostic('capture', receipt.result, [...reasons, ...(exitCode ? ['child_failure'] : [])]);
-  return exitCode || (complete && leakFree ? 0 : 1);
+  if (exitCode || !complete || !policySatisfied) diagnostic('capture', receipt.result, [...reasons, ...(exitCode ? ['child_failure'] : [])]);
+  return exitCode || (complete && policySatisfied ? 0 : 1);
 }
 async function main(args) {
   const verification = args[0] === 'verify';

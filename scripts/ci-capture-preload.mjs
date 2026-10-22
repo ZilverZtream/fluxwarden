@@ -3,12 +3,19 @@
 // Node.js/node doc/api/module.md: syncBuiltinESMExports updates named fs imports.
 import fs from 'node:fs';
 import promises from 'node:fs/promises';
+import childProcess from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname, basename } from 'node:path';
-import { files, inside, retain, hash } from './ci-capture-files.mjs';
+import { files, inside, retain, hash, binding, ancestry } from './ci-capture-files.mjs';
+import { secretProducer, producerEnvironment } from './ci-secret-output.mjs';
 
 const capture = process.env.FLUXWARDEN_CI_CAPTURE;
+let authorizeOutput;
+export async function authorizeOwnedSecretOutput(options) {
+  if (capture) return authorizeOutput(options);
+}
 if (capture) {
   const config = JSON.parse(fs.readFileSync(join(capture, 'private', 'config.json'), 'utf8'));
   const originals = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, readdirSync: fs.readdirSync, lstatSync: fs.lstatSync, realpathSync: fs.realpathSync };
@@ -19,6 +26,127 @@ if (capture) {
     busy = true;
     try { originals.writeFileSync(join(capture, 'private', 'incomplete'), 'capture lifecycle failed', { mode: 0o600 }); }
     finally { busy = previous; }
+  };
+  const intents = new Map();
+  const saveIntent = row => {
+    const previous = busy;
+    busy = true;
+    try { originals.writeFileSync(join(capture, 'private', 'authorizations', 'secret-output-' + hash(row.path) + '.json'), JSON.stringify(row), { mode: 0o600 }); }
+    finally { busy = previous; }
+  };
+  const absent = path => {
+    try { originals.lstatSync(path); throw new Error('secret output already exists'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  };
+  authorizeOutput = ({ path, command, args }) => {
+    try {
+      if (typeof path !== 'string' || path !== resolve(path) || intents.has(path)
+        || ![...config.roots, ...config.outputs].some(root => inside(root, path))
+        || inside(config.evidenceDir, path) || inside(config.sentinelDir, path) || config.registered.includes(path)) throw new Error('secret output destination');
+      absent(path);
+      const row = { purpose: 'SECRET_OUTPUT', prospective: true, path, command, args: [...args], producer: secretProducer(config, command, args, path), parents: ancestry(dirname(path)), state: 'authorized' };
+      const ledger = join(capture, 'private', 'authorizations', 'secret-output-' + hash(path) + '.json');
+      absent(ledger);
+      saveIntent(row);
+      intents.set(path, row);
+    } catch { incomplete(); throw new Error('secret output authorization rejected'); }
+  };
+  const startProducer = (command, args, options) => {
+    let row = [...intents.values()].find(row => row.command === command && JSON.stringify(row.args) === JSON.stringify(args));
+    let environment;
+    if (!row) {
+      // The existing canonical producer is observable independently of intent.
+      // Observation retains SOURCE; it never supplies prospective authorization.
+      let recognized = false;
+      try {
+        const path = args?.at(-1), producer = secretProducer(config, command, args, path);
+        recognized = true;
+        environment = producerEnvironment(options);
+        if (path !== resolve(path) || ![...config.roots, ...config.outputs].some(root => inside(root, path))) throw new Error('secret output destination');
+        try { originals.lstatSync(path); return; }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        row = { purpose: 'SECRET_OUTPUT', prospective: false, path, command, args: [...args], producer, parents: [], state: 'authorized' };
+        saveIntent(row); intents.set(path, row);
+      } catch { if (recognized) incomplete(); return; }
+    }
+    try {
+      if (row.state !== 'authorized' || options?.shell || options?.windowsVerbatimArguments || options?.input != null) throw new Error('secret output execution');
+      absent(row.path);
+      if (JSON.stringify(row.producer) !== JSON.stringify(secretProducer(config, command, args, row.path))
+        || row.prospective && JSON.stringify(row.parents) !== JSON.stringify(ancestry(dirname(row.path)))) throw new Error('secret output producer changed');
+      environment ??= producerEnvironment(options);
+      row.environment = environment.identity;
+      row.state = 'started'; saveIntent(row);
+      return { row, env: environment.env };
+    } catch { row.state = 'invalid'; saveIntent(row); incomplete(); }
+  };
+  const finishProducer = (row, result, stdout, stderr, stored) => {
+    const previous = busy;
+    busy = true;
+    try {
+      const out = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? '');
+      const err = Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? '');
+      if (!stored) {
+        originals.writeFileSync(join(capture, 'secret-output-' + hash(row.path) + '.stdout.log'), out, { flag: 'wx', mode: 0o600 });
+        originals.writeFileSync(join(capture, 'secret-output-' + hash(row.path) + '.stderr.log'), err, { flag: 'wx', mode: 0o600 });
+      }
+      row.result = { exitCode: result.status, signal: result.signal ?? null, errorCode: result.error?.code ?? null };
+      row.stdoutSha256 = stored?.stdoutSha256 ?? hash(out); row.stderrSha256 = stored?.stderrSha256 ?? hash(err);
+      if (!row.prospective && result.status !== 0 && !fs.existsSync(row.path)) {
+        row.state = 'not-produced'; saveIntent(row); return;
+      }
+      if (!row.prospective) row.parents = ancestry(dirname(row.path));
+      row.file = binding(row.path); row.state = 'closed';
+      if (result.status === 0 && !result.signal && !result.error) {
+        if (fs.statSync(row.path).size > 65_536) throw new Error('secret output source bound');
+        // Observe the original before returning control to the caller: it is a
+        // SOURCE identity without changing its original SECRET_OUTPUT purpose.
+        retain(capture, row.path, 'SECRET_OUTPUT');
+      }
+      saveIntent(row);
+    } catch { row.state = 'invalid'; saveIntent(row); incomplete(); }
+    finally { busy = previous; }
+  };
+  const spawnSync = childProcess.spawnSync;
+  childProcess.spawnSync = function (command, args, options) {
+    const execution = { ...options }, observed = startProducer(command, args, execution);
+    if (!observed) return spawnSync.apply(this, arguments);
+    const { row, env } = observed;
+    const result = spawnSync.call(this, command, args, { ...execution, env, encoding: 'buffer' });
+    finishProducer(row, result, result.stdout, result.stderr);
+    if (options?.encoding && options.encoding !== 'buffer') {
+      result.output = result.output?.map(value => Buffer.isBuffer(value) ? value.toString(options.encoding) : value);
+      result.stdout = result.output?.[1]; result.stderr = result.output?.[2];
+    }
+    return result;
+  };
+  const spawn = childProcess.spawn;
+  childProcess.spawn = function (command, args, options) {
+    const execution = { ...options }, observed = startProducer(command, args, execution);
+    const child = observed ? spawn.call(this, command, args, { ...execution, env: observed.env }) : spawn.apply(this, arguments);
+    const row = observed?.row;
+    if (row) {
+      let error;
+      if (!child.stdout || !child.stderr) { row.state = 'invalid'; saveIntent(row); incomplete(); }
+      else {
+        const streams = [child.stdout, child.stderr].map((stream, index) => {
+          const path = join(capture, 'secret-output-' + hash(row.path) + (index ? '.stderr.log' : '.stdout.log'));
+          const fd = fs.openSync(path, 'wx', 0o600), digest = createHash('sha256');
+          stream.on('data', bytes => {
+            const value = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+            for (let at = 0; at < value.length;) at += fs.writeSync(fd, value, at, value.length - at);
+            digest.update(value);
+          });
+          return { fd, digest };
+        });
+        child.once('error', value => { error = value; });
+        child.once('close', (status, signal) => {
+          for (const { fd } of streams) fs.closeSync(fd);
+          finishProducer(row, { status, signal, error }, null, null, { stdoutSha256: streams[0].digest.digest('hex'), stderrSha256: streams[1].digest.digest('hex') });
+        });
+      }
+    }
+    return child;
   };
   // All recorder-owned inputs, snapshots and custody records share the same
   // private namespace. Only the guarded internal recorder may mutate it.

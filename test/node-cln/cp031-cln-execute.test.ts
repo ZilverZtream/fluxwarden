@@ -36,6 +36,7 @@ import { ScriptedExecutionNode } from '../fakes/execution-node.js';
 import { fakeChannel } from '../fakes/preflight-node.js';
 import { loadClnRest } from '../helpers/adapter-interfaces.js';
 import { syntheticInvoice } from '../helpers/cp004-invoice.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 import { testRoot } from '../helpers/env.js';
 import type { CircularRoute, RouteRequest } from '../helpers/cp028-executor.js';
 import type { HopPolicy } from '../helpers/route-interfaces.js';
@@ -45,6 +46,7 @@ import { labelOf, loadClnExecute, reservationState, rowOf, sha256, type ClnExecu
 const scratch = mkdtempSync(join(tmpdir(), 'fw-cln-exec-'));
 const rune = `test-only-rune-${randomBytes(12).toString('hex')}`;
 const runePath = join(scratch, 'test.rune');
+declareFixturePaths([runePath]);
 writeFileSync(runePath, rune);
 
 const OWN = '03' + 'd4'.repeat(32);

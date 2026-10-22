@@ -7,7 +7,8 @@ import { constants, copyFileSync, existsSync, mkdirSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import Ajv2020 from 'ajv/dist/2020.js';
-import { readJson } from './cli.js';
+import { binPath, readJson } from './cli.js';
+import { declareFixturePaths } from './capture-fixture.js';
 import { createDatabase, jsonDocument, runCli, scratch, yamlPath, type Run, type SpawnOptions } from './cp016-cli.js';
 import { makeOwnerOnlyDir } from './cp015-persistence.js';
 import { certificatePath, type FakeServer, type TlsMaterial } from '../fakes/https.js';
@@ -148,6 +149,13 @@ export async function generateKey(dir: string, name = 'operator.key'): Promise<O
   const keyDir = join(dir, 'keys');
   if (!existsSync(keyDir)) mkdirSync(keyDir);
   const keyFile = join(keyDir, name);
+  if (process.env['FLUXWARDEN_CI_CAPTURE']) {
+    const { authorizeSecretOutput } = await import(new URL('../../scripts/ci-secret-output.mjs', import.meta.url).href) as {
+      authorizeSecretOutput: (intent: { path: string; command: string; args: readonly string[] }) => Promise<void>;
+    };
+    await authorizeSecretOutput({ path: keyFile, command: process.execPath,
+      args: [binPath(), '--json', 'keys', 'generate', '--out', keyFile] });
+  }
   const run = await runCli(['--json', 'keys', 'generate', '--out', keyFile]);
   if (run.status !== 0) throw new Error(`keys generate failed (${String(run.status)}): ${run.stdout}${run.stderr}`);
   const result = rec(jsonDocument(run)['result']);
@@ -218,6 +226,7 @@ export async function demo(open: FakeServer[], options: DemoOptions = {}): Promi
   else {
     mkdirSync(join(dir, 'keys'), { mode: 0o700 });
     const keyFile = join(dir, 'keys', 'operator.key');
+    declareFixturePaths([keyFile]);
     copyDemoFixture(options.fixtures.key.keyFile, keyFile);
     key = { ...options.fixtures.key, keyFile };
   }

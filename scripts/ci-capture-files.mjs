@@ -109,11 +109,16 @@ export function retain(capture, path, purpose) {
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   if (!fs.readFileSync(stored).equals(bytes) || observed.sha256 !== sha256 || JSON.stringify(observed) !== JSON.stringify(binding(path))) throw new Error('capture unstable retained file');
   const record = { path: resolve(path), sha256, purpose };
+  if (purpose === 'EGRESS') {
+    const output = { ...record, purpose: 'SECRET_OUTPUT' };
+    const original = join(capture, 'private', 'records', hash(JSON.stringify(output)) + '.json');
+    if (fs.existsSync(original) && fs.readFileSync(original, 'utf8') === JSON.stringify(output)) return output;
+  }
   // One immutable record per original context and byte identity, shared safely by workers.
   const name = hash(JSON.stringify(record));
   try { fs.writeFileSync(join(capture, 'private', 'records', name + '.json'), JSON.stringify(record), { flag: 'wx', mode: 0o600 }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
-  if (purpose === 'INPUT') {
+  if (purpose === 'INPUT' || purpose === 'SECRET_OUTPUT') {
     // Stable record names retain the original context; the observation stream
     // distinguishes source replacement during the owned lifetime from Closing.
     fs.appendFileSync(join(capture, 'private', 'identities', name + '.jsonl'), JSON.stringify({ ...observed, parents: ancestry(dirname(path)), storage: anchor(stored) }) + '\n', { mode: 0o600 });
