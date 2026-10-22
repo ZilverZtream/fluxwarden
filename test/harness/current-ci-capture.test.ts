@@ -366,9 +366,13 @@ it('CP-044/CI-CAPTURE recheck refuses expanded source declarations and missing f
     expect(f.invoke().status).toBe(0);
     if (target === 'declared-out.txt') appendFileSync(join(f.scratch, target), `${join(f.scratch, 'owned.db')}\n`);
     else rmSync(join(f.capture, target));
-    expect(f.invoke(true).status !== 0, 'expanded input contexts or omitted original output streams cannot pass').toBe(true);
+    const rechecked = f.invoke(true);
+    expect(rechecked.error, 'negative verification completes within its original child deadline').toBeUndefined();
+    expect(rechecked.signal, 'negative verification exits normally').toBeNull();
+    expect(typeof rechecked.status, 'negative verification reports a completed numeric exit status').toBe('number');
+    expect(rechecked.status !== 0, 'expanded input contexts or omitted original output streams cannot pass').toBe(true);
   }
-});
+}, 240_000);
 
 it('CP-044/CI-CAPTURE live positive control retains its originally registered source through completion', async () => {
   const f = fixture(), before = new Set(files(f.sourceRoot));
