@@ -360,6 +360,8 @@ writeFileSync(process.env.CONTROL_TRACE + '.' + kind, JSON.stringify(process.arg
 copyFileSync(join(process.env.CONTROL_REPORTS, mode === 'skip' ? 'skipped.json' : 'all-passed-a.json'), join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-' + kind + '.json'));
 process.exitCode = mode === 'fail' ? 7 : 0;
 `);
+  // Seven real job controls and five bounded inventory commands share this
+  // case allowance; their completion margin does not assert npm performance.
   for (const [harness, product, harnessResult, expected, trace, preparation] of [
     [true, 'pass', 'pass', 0, ['lint', 'build', 'database', 'product', 'harness'], 'pass'], [false, 'pass', 'pass', 0, ['product'], 'pass'],
     [true, 'fail', 'pass', 7, ['product'], 'pass'], [true, 'pass', 'fail', 7, ['product', 'harness'], 'pass'],
@@ -378,9 +380,11 @@ process.exitCode = mode === 'fail' ? 7 : 0;
       'npm', 'test', '--', '--reporter=default', '--reporter=json', `--outputFile.json=${join(jobEvidence, 'vitest-product.json')}`])], {
       cwd: jobRoot, env: { ...childEnv(), FLUXWARDEN_EVIDENCE_DIR: jobEvidence, CONTROL_PRODUCT: product,
         CONTROL_HARNESS: harnessResult, CONTROL_LINT: preparation, CONTROL_TRACE: traceFile, CONTROL_REPORTS: join(repoRoot, 'test/fixtures/no-pending') },
-      encoding: 'utf8', windowsHide: true, timeout: 10_000,
+      encoding: 'utf8', windowsHide: true, timeout: 30_000,
     });
     expect(result.error).toBeUndefined();
+    expect(result.signal, 'every stage control completes without being killed').toBeNull();
+    expect(result.status, 'a completed control has an actual exit status').not.toBeNull();
     expect(result.status, 'actual runner preserves child failure and rejects nonpassing reports').toBe(expected);
     expect(readFileSync(traceFile, 'utf8').trim().split('\n'), 'product precedes the selected harness').toEqual(trace);
     if (harness && product === 'pass' && preparation === 'pass') {
@@ -580,7 +584,7 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
       expect(stages[3]).toBe('node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"');
     }
   }
-});
+}, 300_000);
 
 const DOCUMENT_FILES = ['README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE', 'NOTICE-SOURCE-REUSE.md', 'docs/spec.md', 'docs/architecture.md', 'docs/security-model.md', 'docs/references.md', 'docs/references/failure-catalogue.md', 'docs/source-provenance.json'];
 const DOCUMENT_DIRS = ['docs/runbooks', 'docs/decisions'];

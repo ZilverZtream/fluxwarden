@@ -217,7 +217,7 @@ it('CP-032/REG-REC008 failed recovery remains pending for a bounded later startu
   expect(f.native.removals()).toEqual([layer, layer, layer]);
   await f.recover(); expect(f.native.removals()).toEqual([layer, layer, layer]);
   f.truth('CANCELLED');
-});
+}, 60_000);
 
 it('CP-032/REG-REC008 ambiguous removal retains pending cleanup until conclusive native absence', async () => {
   const f = await fixture(), layer = await f.leavePending();

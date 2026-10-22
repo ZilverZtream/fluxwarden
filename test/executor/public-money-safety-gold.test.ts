@@ -185,6 +185,6 @@ for (const pathKind of ['dispatch', 'unknown-track', 'unknown-startup', 'late-at
       expect(rowOf(s.path, s.executionId)).toMatchObject({ status: 'VERIFIED_SUCCESS', actual_fee_msat: actualFee });
       expect(reservationsOf(s.path, s.executionId)[0]).toMatchObject({ state: 'CONSUMED', consumed_msat: actualFee });
       expect(s.node.count('sendOnRoute')).toBe(1);
-    });
+    }, 60_000);
   }
 }

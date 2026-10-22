@@ -3,7 +3,7 @@
 // Public setup interface adopted by ROOT: ci-install.mjs [verify] --root ROOT.
 // These are disposable local packages, real npm commands and ordinary files;
 // no network, shared dependency tree, substituted npm return, or product hooks.
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -18,6 +18,22 @@ const sha = (bytes: Buffer | string): string => createHash('sha256').update(byte
 const npm = join(dirname(process.execPath), process.platform === 'win32'
   ? 'node_modules/npm/bin/npm-cli.js' : '../lib/node_modules/npm/bin/npm-cli.js');
 const setup = join(repoRoot, 'scripts/ci-install.mjs');
+// These functional fixtures include real npm, native ownership checks and nested
+// capture. Compose their caller deadlines around the unchanged 180s installer
+// and 60s native-check bounds instead of the global 15s test default.
+const COMMAND_TIMEOUT_MS = 30_000;
+const NATIVE_CHECK_TIMEOUT_MS = 60_000;
+const INSTALL_TIMEOUT_MS = 180_000 + 3 * NATIVE_CHECK_TIMEOUT_MS;
+const CAPTURE_TIMEOUT_MS = 3 * COMMAND_TIMEOUT_MS + 2 * NATIVE_CHECK_TIMEOUT_MS;
+const FIXTURE_TIMEOUT_MS = 10 * COMMAND_TIMEOUT_MS + NATIVE_CHECK_TIMEOUT_MS + INSTALL_TIMEOUT_MS + CAPTURE_TIMEOUT_MS;
+const DIAGNOSTIC_TIMEOUT_MS = 2 * COMMAND_TIMEOUT_MS + NATIVE_CHECK_TIMEOUT_MS;
+const DATABASE_TIMEOUT_MS = FIXTURE_TIMEOUT_MS + 9 * NATIVE_CHECK_TIMEOUT_MS;
+
+function expectCompletedCommand(result: SpawnSyncReturns<string>): void {
+  expect(result.error, 'fixture command completed without a spawn or deadline error').toBeUndefined();
+  expect(result.signal, 'fixture command completed without termination by signal').toBeNull();
+  expect(typeof result.status, 'negative checks require an actual completed process exit').toBe('number');
+}
 function files(directory: string): string[] {
   if (!existsSync(directory)) return [];
   return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -50,17 +66,21 @@ async function fixture(broken = false) {
   let sequence = 0;
   const commandProof = join(parent, 'commands');
   mkdirSync(commandProof);
-  const run = (command: string, args: string[], cwd = root, prerequisiteNpm = false) => {
+  const run = (command: string, args: string[], cwd = root, prerequisiteNpm = false, timeoutMs = COMMAND_TIMEOUT_MS) => {
     // Fixture-authoring npm calls precede the target invocation; their optional
     // Node cache must not inflate its original owned output census. The actual
     // ci-install/capture/validation commands retain the normal environment.
     const commandEnv = prerequisiteNpm ? { ...env, NODE_DISABLE_COMPILE_CACHE: '1' } : env;
-    const result = spawnSync(command, args, { cwd, env: commandEnv, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    const result = spawnSync(command, args, { cwd, env: commandEnv, encoding: 'utf8', windowsHide: true, timeout: timeoutMs });
+    const stdout: unknown = result.stdout, stderr: unknown = result.stderr;
     const id = String(sequence++);
-    writeFileSync(join(commandProof, `${id}.stdout`), result.stdout);
-    writeFileSync(join(commandProof, `${id}.stderr`), result.stderr);
+    writeFileSync(join(commandProof, `${id}.stdout`), typeof stdout === 'string' ? stdout : '');
+    writeFileSync(join(commandProof, `${id}.stderr`), typeof stderr === 'string' ? stderr : '');
     appendFileSync(join(commandProof, 'results.jsonl'), JSON.stringify({ id, command, args, cwd, execPath: process.execPath,
-      status: result.status, signal: result.signal, error: result.error?.name ?? null }) + '\n');
+      status: result.status, signal: result.signal, error: result.error?.name ?? null,
+      errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null, timeoutMs,
+      stdoutPresent: typeof stdout === 'string', stderrPresent: typeof stderr === 'string' }) + '\n');
+    expectCompletedCommand(result);
     return result;
   };
   const seed = randomBytes(32), source = join(root, 'test/sentinels/control.bin');
@@ -167,7 +187,8 @@ async function fixture(broken = false) {
   const evidence = roots[4] ?? '', scratch = roots[2] ?? '';
   declareFixtureCapture(capture, [seed], [{ path: join(root, 'node_modules/.vite/leaked.log'), bytes: seed }]);
   const install = (verify = false) => {
-    const result = run(process.execPath, ownedCaptureToolArgs([setup, ...(verify ? ['verify'] : []), '--root', root]));
+    const result = run(process.execPath, ownedCaptureToolArgs([setup, ...(verify ? ['verify'] : []), '--root', root]),
+      root, false, verify ? COMMAND_TIMEOUT_MS : INSTALL_TIMEOUT_MS);
     // The real trusted installer may recreate this exact original setup INPUT.
     // Bind its new identity before any candidate validation is started.
     if (!broken && !verify && !result.error && result.status !== null) {
@@ -180,7 +201,7 @@ async function fixture(broken = false) {
   const validationCapture = (directory = capture) => {
     const result = run(process.execPath, ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-capture.mjs'), '--root', root, '--capture-dir', directory,
       '--', process.execPath, join(root, 'scripts/ci-job.mjs'), '--commands-only', '--', 'node', setup, 'verify', '--root', root,
-      '--next', 'node', validation, '--next', 'node', setup, 'verify', '--root', root]));
+      '--next', 'node', validation, '--next', 'node', setup, 'verify', '--root', root]), root, false, CAPTURE_TIMEOUT_MS);
     if (!result.error && result.status !== null) innerEvidence = { receipt: join(directory, 'receipt.json'), custody: join(directory, 'custody.json') };
     return result;
   };
@@ -246,7 +267,7 @@ it('CP-044/DEPENDENCY-SETUP successful frozen-lock install disables hooks and re
   expect([...originals, ...logs, join(f.evidence, 'npm-install.json')].every(path => artifacts.some(row => row['path'] === path
     && row['purpose'] === 'EGRESS' && row['sha256'] === sha(readFileSync(path)))), 'every original installer channel, status and log is in the scanned Closing census').toBe(true);
   f.finishInputAssertions();
-});
+}, FIXTURE_TIMEOUT_MS);
 
 it('CP-044/DEPENDENCY-SETUP actual offline install failure retains status and logs and prevents candidate validation', async () => {
   const f = await fixture(true), installed = f.install();
@@ -261,7 +282,7 @@ it('CP-044/DEPENDENCY-SETUP actual offline install failure retains status and lo
   expect(f.validationCapture().status !== 0, 'failed setup verification prevents subsequent validation stages').toBe(true);
   expect(existsSync(f.marker), 'candidate code never begins after installation failure').toBe(false);
   f.finishInputAssertions();
-});
+}, FIXTURE_TIMEOUT_MS);
 
 for (const mutation of ['changed', 'missing', 'extra'] as const) {
   it(`CP-044/DEPENDENCY-SETUP Closing rejects ${mutation} dependency input`, async () => {
@@ -276,7 +297,7 @@ for (const mutation of ['changed', 'missing', 'extra'] as const) {
     expect(existsSync(f.marker), 'candidate mutation executes after initial dependency authentication').toBe(true);
     expect(result.status !== null && result.status !== 0, 'dependency read-set cannot gain, lose or replace bytes at Closing').toBe(true);
     f.finishInputAssertions();
-  });
+  }, FIXTURE_TIMEOUT_MS);
 }
 
 for (const kind of ['escaping', 'dangling', 'cyclic'] as const) {
@@ -297,7 +318,7 @@ ${JSON.stringify(f.dependencyLink)}, process.platform === 'win32' ? 'junction' :
     expect(result.status !== null && result.status !== 0, 'unauthenticated, unresolved and cyclic dependency links fail closed').toBe(true);
     f.restoreDependencyLink(target);
     f.finishInputAssertions();
-  });
+  }, FIXTURE_TIMEOUT_MS);
 }
 
 it('CP-044/DEPENDENCY-SETUP originally excluded generated .vite output stays EGRESS and its original secret bytes are detected', async () => {
@@ -312,7 +333,7 @@ it('CP-044/DEPENDENCY-SETUP originally excluded generated .vite output stays EGR
   expect(objects(receipt['artifacts']).some(row => row['path'] === join(f.root, 'node_modules/.vite/leaked.log')
     && row['purpose'] === 'EGRESS' && row['sha256'] === sha(f.seed))).toBe(true);
   f.finishInputAssertions();
-});
+}, FIXTURE_TIMEOUT_MS);
 
 async function diagnosticFixture() {
   const parent = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'setup-diagnostic-'));
@@ -326,12 +347,14 @@ async function diagnosticFixture() {
     FLUXWARDEN_SENTINEL_DIR: roots[3], FLUXWARDEN_EVIDENCE_DIR: roots[4] };
   let sequence = 0;
   return { parent, run(command: string, args: string[]) {
-    const result = spawnSync(command, args, { cwd: parent, env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    const result = spawnSync(command, args, { cwd: parent, env, encoding: 'utf8', windowsHide: true, timeout: COMMAND_TIMEOUT_MS });
+    const stdout: unknown = result.stdout, stderr: unknown = result.stderr;
     const id = String(sequence++);
-    writeFileSync(join(parent, `${id}.stdout`), result.stdout);
-    writeFileSync(join(parent, `${id}.stderr`), result.stderr);
+    writeFileSync(join(parent, `${id}.stdout`), typeof stdout === 'string' ? stdout : '');
+    writeFileSync(join(parent, `${id}.stderr`), typeof stderr === 'string' ? stderr : '');
     writeFileSync(join(parent, `${id}.status.json`), JSON.stringify({ status: result.status, signal: result.signal,
-      error: result.error?.name ?? null }));
+      error: result.error?.name ?? null, timeoutMs: COMMAND_TIMEOUT_MS }));
+    expectCompletedCommand(result);
     return result;
   } };
 }
@@ -349,7 +372,7 @@ it('CP-044/DEPENDENCY-SETUP recorder failures expose stable safe classification 
     return text;
   });
   expect(diagnostics[0], 'same failure class is independent of private path and OS error text').toBe(diagnostics[1]);
-});
+}, DIAGNOSTIC_TIMEOUT_MS);
 
 // Adopted Windows CI ordering: authentic setup precedes Opening, and the actual
 // database smoke then runs inside capture. Existing setup INPUT identities must
@@ -374,13 +397,15 @@ if (process.platform === 'win32') it('CP-044/DEPENDENCY-SETUP Windows database p
   const proof = join(root, 'command-proof');
   mkdirSync(proof);
   let sequence = 0;
-  const run = (command: string, args: string[]) => {
-    const result = spawnSync(command, args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 60_000 });
+  const run = (command: string, args: string[], timeoutMs = NATIVE_CHECK_TIMEOUT_MS) => {
+    const result = spawnSync(command, args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: timeoutMs });
+    const stdout: unknown = result.stdout, stderr: unknown = result.stderr;
     const id = String(sequence++);
-    writeFileSync(join(proof, `${id}.stdout`), result.stdout);
-    writeFileSync(join(proof, `${id}.stderr`), result.stderr);
+    writeFileSync(join(proof, `${id}.stdout`), typeof stdout === 'string' ? stdout : '');
+    writeFileSync(join(proof, `${id}.stderr`), typeof stderr === 'string' ? stderr : '');
     writeFileSync(join(proof, `${id}.status.json`), JSON.stringify({ status: result.status, signal: result.signal,
-      error: result.error?.name ?? null }));
+      error: result.error?.name ?? null, timeoutMs }));
+    expectCompletedCommand(result);
     return result;
   };
   const seed = randomBytes(32), source = join(root, 'test/control.bin');
@@ -407,7 +432,7 @@ if (process.platform === 'win32') it('CP-044/DEPENDENCY-SETUP Windows database p
     expect(run('git', args).status, 'real immutable fixture identity is established before setup').toBe(0);
   }
   declareFixtureCapture(capture, [seed], []);
-  const installed = run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-install.mjs'), '--root', root]));
+  const installed = run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-install.mjs'), '--root', root]), INSTALL_TIMEOUT_MS);
   expect(installed.error).toBeUndefined();
   expect(installed.status, 'real offline trusted setup completes before Opening').toBe(0);
   const retained = [join(evidence, 'npm-install.stdout.log'), join(evidence, 'npm-install.stderr.log'), join(evidence, 'npm-install.json')];
@@ -427,7 +452,7 @@ if (process.platform === 'win32') it('CP-044/DEPENDENCY-SETUP Windows database p
   for (const path of [parent, ...roots]) assertStrictWindowsOwnerOnly(readWindowsSecurity(path, env), 'directory');
   const result = run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-capture.mjs'), '--root', root, '--capture-dir', capture, '--',
     process.execPath, join(root, 'scripts/ci-job.mjs'), '--commands-only', '--', 'node', join(root, 'scripts/ci-install.mjs'), 'verify', '--root', root,
-    '--next', 'node', join(root, 'scripts/ci-database-check.mjs')]));
+    '--next', 'node', join(root, 'scripts/ci-database-check.mjs')]), CAPTURE_TIMEOUT_MS);
   expect(result.error).toBeUndefined();
   const receipt = asRecord(JSON.parse(readFileSync(join(capture, 'receipt.json'), 'utf8')) as unknown, 'database preflight receipt');
   expect(asRecord(receipt['result'], 'result')['exitCode'], 'actual database preflight completes its ownership and durability smoke checks').toBe(0);
@@ -437,5 +462,5 @@ if (process.platform === 'win32') it('CP-044/DEPENDENCY-SETUP Windows database p
   expect(after, 'database preflight preserves authentic setup bytes, physical identities and original Windows security descriptors').toEqual(before);
   expect(result.status, 'the completed original database smoke also has valid Closing evidence').toBe(0);
   expect(receipt['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: true });
-  expect(run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-capture.mjs'), 'verify', '--root', root, '--capture-dir', capture])).status).toBe(0);
-}, 75_000);
+  expect(run(process.execPath, ownedCaptureToolArgs([join(root, 'scripts/ci-capture.mjs'), 'verify', '--root', root, '--capture-dir', capture]), CAPTURE_TIMEOUT_MS).status).toBe(0);
+}, DATABASE_TIMEOUT_MS);

@@ -30,6 +30,8 @@ function runtimeFiles(directory: string): string[] {
   });
 }
 
+// Eight Git calls (30s each), capture (60s), verification (30s), and
+// fixture/scanner work share the finite six-minute case completion allowance.
 async function fixture(mode: string, registerKey = true) {
   const parent = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ko-'));
   const root = join(parent, 'r'), capture = join(parent, 'c');
@@ -59,7 +61,7 @@ async function fixture(mode: string, registerKey = true) {
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'owned-key-output-fixture', version: '1.0.0', type: 'module',
     bin: { fluxwarden: relative(root, binary).replace(/\\/g, '/') } }));
   const git = (...args: string[]) => {
-    const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 30_000 });
     appendFileSync(join(parent, 'git-setup.jsonl'), JSON.stringify({ stage: args[0], status: result.status, signal: result.signal,
       errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null }) + '\n');
     return result;
@@ -178,7 +180,7 @@ for (const mode of ['unbound', 'existing', 'replaced', 'hard-linked', 'insecure'
     expect(asRecord(receipt['result'], 'result')['policySatisfied']).not.toBe(true);
     expect(records(receipt['sources']).some(row => row['sha256'] === control['originalSha256']), 'failed boundary retains original generated SOURCE membership').toBe(true);
     expect(f.invoke(true).status !== 0, 'independent verification preserves rejection').toBe(true);
-  }, 120_000);
+  }, 360_000);
 }
 
 it('CP-044/SECRET-OUTPUT genuine prospective generated key stays SOURCE-scanned output with truthful expected-match acceptance', async () => {
@@ -205,7 +207,7 @@ it('CP-044/SECRET-OUTPUT genuine prospective generated key stays SOURCE-scanned 
     'unchanged original engine still detects the generated private key').not.toBeNull();
   expect(JSON.stringify(receipt).includes(bytes.toString('utf8')), 'public receipt never publishes private key bytes').toBe(false);
   expect(f.invoke(true).status, 'fresh independent recheck retains truthful policy acceptance').toBe(0);
-}, 120_000);
+}, 360_000);
 
 for (const mode of ['missing', 'late', 'elsewhere']) {
   it(`CP-044/SECRET-OUTPUT rejects ${mode} authorization or an additional credential disclosure`, async () => {
@@ -218,7 +220,7 @@ for (const mode of ['missing', 'late', 'elsewhere']) {
     expect(asRecord(receipt['result'], 'result')['policySatisfied']).not.toBe(true);
     expect(records(receipt['sources']).some(row => row['sha256'] === sha(readFileSync(f.key))), 'failed evidence retains generated original SOURCE').toBe(true);
     expect(f.invoke(true).status !== 0, 'recheck cannot retroactively accept the failed boundary').toBe(true);
-  }, 120_000);
+  }, 360_000);
 }
 
 it('CP-044/SECRET-OUTPUT automatic SOURCE custody accepts the genuine key without caller registration', async () => {
@@ -240,7 +242,7 @@ it('CP-044/SECRET-OUTPUT automatic SOURCE custody accepts the genuine key withou
   expect(result.status, 'automatic recognition permits only the prospective own-key match').toBe(0);
   expect(receipt['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: false, policySatisfied: true });
   expect(f.invoke(true).status, 'independent verification retains automatic SOURCE custody and acceptance').toBe(0);
-}, 120_000);
+}, 360_000);
 
 for (const mode of ['elsewhere', 'stdout']) {
   it(`CP-044/SECRET-OUTPUT automatic SOURCE custody rejects ${mode} disclosure without caller registration`, async () => {
@@ -258,7 +260,7 @@ for (const mode of ['elsewhere', 'stdout']) {
       && row['sha256'] === fingerprint), 'own key retains OUTPUT purpose despite the additional leak').toHaveLength(1);
     expect(asRecord(receipt['result'], 'result')).toMatchObject({ leakFree: false, policySatisfied: false });
     expect(f.invoke(true).status !== 0, 'independent verification preserves the additional-disclosure rejection').toBe(true);
-  }, 120_000);
+  }, 360_000);
 }
 
 for (const mode of ['missing', 'late']) {
@@ -272,5 +274,5 @@ for (const mode of ['missing', 'late']) {
       'genuine key generation still requires exact prospective authorization').toBe(true);
     expect(asRecord(f.receipt()['result'], 'result')['policySatisfied']).not.toBe(true);
     expect(f.invoke(true).status !== 0, 'independent verification cannot accept missing or late authorization').toBe(true);
-  }, 120_000);
+  }, 360_000);
 }
