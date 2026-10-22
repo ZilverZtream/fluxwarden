@@ -13,7 +13,7 @@ import { FEE, PRINCIPAL, S, T } from '../fakes/cln/rebalance-node.js';
 import { binPath, childEnv } from '../helpers/cli.js';
 import { approve, demo, plan, rec, rows, prepareDemoFixtures, type Demo, type DemoFixtures, type Run } from '../helpers/cpw-cli.js';
 import { testRoot } from '../helpers/env.js';
-import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { prepareMoneySafetyAlertKey, registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
 
 const servers: FakeServer[] = [];
 let fixtures: DemoFixtures;
@@ -196,6 +196,7 @@ it('CP-001/REG-SIGNAL repeated graceful events after an actual paid fee breach r
 
 it('CP-001/REG-SRC009 repeated graceful events during a pending observation retain an established paid breach8', async () => {
   const { d, proposal } = await prepared(), actualFee = 300_001n;
+  await prepareMoneySafetyAlertKey(d.database);
   d.cln.state.bkprFeeMsat = actualFee;
   let reached: (() => void) | undefined;
   const pending = new Promise<void>(resolve => { reached = resolve; });

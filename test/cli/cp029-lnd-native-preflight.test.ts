@@ -62,8 +62,8 @@ it('CP-029/B4 CP-030/B3 CP-033/B1 T-05 native LND channel keys survive fresh pre
   const readToken = randomBytes(48), executeToken = randomBytes(48);
   const readPath = join(dir, 'read.macaroon'), executePath = join(dir, 'execute.macaroon');
   for (const [path, value] of [[readPath, readToken], [executePath, executeToken]] as const) {
-    writeFileSync(path, value, { mode: 0o600 });
     appendFileSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'declared-out.txt'), `${path}\n`);
+    writeFileSync(path, value, { mode: 0o600 });
     writeFileSync(join(testRoot('FLUXWARDEN_SENTINEL_DIR'), `${randomBytes(8).toString('hex')}.bin`), value, { mode: 0o600 });
   }
   const requests: { method: string; path: string; credential: string; body: Record<string, unknown> }[] = [];

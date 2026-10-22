@@ -38,8 +38,8 @@ async function setup(execute: (rpc: RpcExecution) => void = rpc => {
   const dir = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'cln-cadence-'));
   const rune = syntheticCadenceRune();
   const runePath = join(dir, 'credential.rune');
-  writeFileSync(runePath, `${rune}\n`, { mode: 0o600 });
   appendFileSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'declared-out.txt'), `${runePath}\n`);
+  writeFileSync(runePath, `${rune}\n`, { mode: 0o600 });
   copyFileSync(runePath, join(testRoot('FLUXWARDEN_SENTINEL_DIR'), `cln-cadence-${String(open.length)}-${String(performance.now())}.rune`));
   const server = await startCadenceServer({ rune, execute, ...(authRefusal === undefined ? {} : { authRefusal }) });
   open.push(server);
@@ -128,8 +128,8 @@ it('CP-012/cadence-concurrent a second call respects authorization time while th
 it('CP-012/cadence-reopen concurrent reopened clients using copies of one rune preserve its permission timing', async () => {
   const { server, runePath, dir } = await setup();
   const alias = join(dir, 'same-rune-copy.rune');
-  copyFileSync(runePath, alias);
   appendFileSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'declared-out.txt'), `${alias}\n`);
+  copyFileSync(runePath, alias);
   const first = await rest(server, runePath);
   await first.call('getinfo');
   const [second, third] = await Promise.all([rest(server, runePath), rest(server, alias)]);

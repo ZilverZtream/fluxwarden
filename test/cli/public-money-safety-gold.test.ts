@@ -15,7 +15,7 @@ import {
   type Demo, type DemoFixtures,
 } from '../helpers/cpw-cli.js';
 import { raw } from '../helpers/cp028-executor.js';
-import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { prepareMoneySafetyAlertKey, registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
 
 const servers: FakeServer[] = [];
 let fixtures: DemoFixtures;
@@ -68,6 +68,7 @@ for (const mode of ['dispatch', 'recovery'] as const) {
     // The CLI policy approves 300000 msat, 2500 ppm, exemption 5000.
     // At P=100000000, 250001 msat violates only ppm (ceil=2501).
     const d = await demo(servers, { fixtures, ...(mode === 'recovery' ? { fake: { sendpay: 'lose-answer' as const } } : {}) });
+    await prepareMoneySafetyAlertKey(d.database);
     registerMoneySafetyCredentials([d.key.keyFile, d.cln.runeFile]);
     d.rewrite({ attemptDeadline: '1s' });
     // Zero cooldown separates future refusal by quarantine from a cooldown refusal.

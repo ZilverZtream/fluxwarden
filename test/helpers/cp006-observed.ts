@@ -101,8 +101,8 @@ export function observedLab(owner: Owner, script: ScriptOptions = {}): {
       const source = args.at(-2) ?? '';
       const kind = /macaroon|rune|key/.test(source) ? 'macaroon' : undefined;
       const bytes = kind ? readFileSync(join(sentinelDir, `product-${kind}.bin`)) : Buffer.from('synthetic public node certificate');
-      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 }); writeFileSync(destination, bytes, { mode: 0o600 }); privateFiles.set(destination, bytes);
       if (kind) { const tmp = process.env['FLUXWARDEN_TEST_TMP']; if (!tmp) throw new Error('private scratch root required'); appendFileSync(join(tmp, 'declared-out.txt'), `${destination}\n`); }
+      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 }); writeFileSync(destination, bytes, { mode: 0o600 }); privateFiles.set(destination, bytes);
       return result('');
     }
     if (method === 'state') return result({ state: 'RPC_ACTIVE' });
