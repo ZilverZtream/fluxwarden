@@ -70,4 +70,4 @@ it('CP-037/B2 a proven paid unknown incoming principal has a complete balanced t
     expect(r.node.count('createInvoice')).toBe(oldInvoiceCount);
     expect(r.node.count('cancelUnpaidInvoice')).toBe(oldCancelCount);
   } finally { state.close(); }
-});
+}, 60_000);

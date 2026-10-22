@@ -26,19 +26,29 @@ jobs:
           - { os: windows-latest, node: '22.23.2', shard: core-1, coreShard: '1/3' }
           - { os: windows-latest, node: '22.23.2', shard: core-2, coreShard: '2/3' }
           - { os: windows-latest, node: '22.23.2', shard: core-3, coreShard: '3/3' }
-          - { os: windows-latest, node: '22.23.2', shard: harness-1, harnessShard: '1/4' }
-          - { os: windows-latest, node: '22.23.2', shard: harness-2, harnessShard: '2/4' }
-          - { os: windows-latest, node: '22.23.2', shard: harness-3, harnessShard: '3/4' }
-          - { os: windows-latest, node: '22.23.2', shard: harness-4, harnessShard: '4/4' }
-          - { os: windows-latest, node: '22.23.2', shard: native }
+          - { os: windows-latest, node: '22.23.2', shard: harness-1, harnessShard: '1/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-2, harnessShard: '2/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-3, harnessShard: '3/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-4, harnessShard: '4/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-5, harnessShard: '5/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-6, harnessShard: '6/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-7, harnessShard: '7/8' }
+          - { os: windows-latest, node: '22.23.2', shard: harness-8, harnessShard: '8/8' }
+          - { os: windows-latest, node: '22.23.2', shard: native-1, nativeShard: '1/2' }
+          - { os: windows-latest, node: '22.23.2', shard: native-2, nativeShard: '2/2' }
           - { os: windows-latest, node: '24.x', shard: core-1, coreShard: '1/3' }
           - { os: windows-latest, node: '24.x', shard: core-2, coreShard: '2/3' }
           - { os: windows-latest, node: '24.x', shard: core-3, coreShard: '3/3' }
-          - { os: windows-latest, node: '24.x', shard: harness-1, harnessShard: '1/4' }
-          - { os: windows-latest, node: '24.x', shard: harness-2, harnessShard: '2/4' }
-          - { os: windows-latest, node: '24.x', shard: harness-3, harnessShard: '3/4' }
-          - { os: windows-latest, node: '24.x', shard: harness-4, harnessShard: '4/4' }
-          - { os: windows-latest, node: '24.x', shard: native }
+          - { os: windows-latest, node: '24.x', shard: harness-1, harnessShard: '1/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-2, harnessShard: '2/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-3, harnessShard: '3/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-4, harnessShard: '4/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-5, harnessShard: '5/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-6, harnessShard: '6/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-7, harnessShard: '7/8' }
+          - { os: windows-latest, node: '24.x', shard: harness-8, harnessShard: '8/8' }
+          - { os: windows-latest, node: '24.x', shard: native-1, nativeShard: '1/2' }
+          - { os: windows-latest, node: '24.x', shard: native-2, nativeShard: '2/2' }
     defaults:
       run:
         shell: bash
@@ -117,7 +127,7 @@ jobs:
           --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
           --next node scripts/no-pending.mjs "$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
       - name: Test Windows native product
-        if: always() && matrix.os == 'windows-latest' && matrix.shard == 'native'
+        if: always() && matrix.os == 'windows-latest' && startsWith(matrix.shard, 'native-')
         run: >-
           node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=1 --fileParallelism=false
           test/labs/cp006-cp008-owner-lifecycle.test.ts
@@ -132,6 +142,7 @@ jobs:
           test/daemon/cp041-daemon.test.ts
           test/ledger/cp037-ledger.test.ts
           test/commands/cp043-t05-repository.test.ts
+          --shard=${{ matrix.nativeShard }}
           --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
       - name: Verify complete invocation custody
         if: always()

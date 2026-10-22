@@ -16,6 +16,9 @@ import { ScriptedExecutionNode } from '../fakes/execution-node.js';
 
 afterEach(() => { vi.restoreAllMocks(); });
 
+// Native fixture setup and deliberate real waits share this runner completion deadline.
+const PUB001_TIMEOUT_MS = 60_000;
+
 // Real elapsed time is essential here: SQLite's clock must advance while Date.now is frozen.
 for (const phase of ['route-and-invoice', 'invoice', 'baseline'] as const) {
   it(`PUB001/${phase} refuses snapshots that expire during awaited preparation, with a live lease and approval`, async () => {
@@ -61,7 +64,7 @@ for (const phase of ['route-and-invoice', 'invoice', 'baseline'] as const) {
       expect.soft(rowOf(path, ready.executionId).status).toBe('CANCELLED');
       expect.soft(reservationsOf(path, ready.executionId)[0]?.state).toBe('RELEASED');
     } finally { db.close(); }
-  });
+  }, PUB001_TIMEOUT_MS);
 }
 
 it('PUB001/db-clock fresh snapshots remain usable when the host clock jumps forward', async () => {
@@ -75,14 +78,20 @@ it('PUB001/db-clock fresh snapshots remain usable when the host clock jumps forw
     const { prepareExecution } = await loadPreflight();
     const observedAt = dbNow(path);
     vi.spyOn(Date, 'now').mockReturnValue(observedAt + 86_400_000);
-    const node = new FakePreflightNode(base.sourceKey, base.targetKey, { channels: () => [
-      fakeChannel(base.sourceKey, OUT_PEER, { observedAt }), fakeChannel(base.targetKey, IN_PEER, { observedAt }),
-    ] });
+    const node = new FakePreflightNode(base.sourceKey, base.targetKey, { channels: () => {
+      const freshObservedAt = dbNow(path);
+      return [fakeChannel(base.sourceKey, OUT_PEER, { observedAt: freshObservedAt }),
+        fakeChannel(base.targetKey, IN_PEER, { observedAt: freshObservedAt })];
+    } });
+    // Setup may outlast the freshness window; the adapter still returns observations made at the read boundary.
+    await sleep(1_100);
+    expect(dbNow(path) - observedAt).toBeGreaterThan(policy.maxSnapshotAgeMs);
+    expect(Date.now()).toBe(observedAt + 86_400_000);
     const ready = await prepareExecution({ db, adapter: node, workerId: 'clock-control', leaseMs: 60_000 }, { approval, policy, approvalKeyIds: APPROVAL_KEYS });
     expect(ready.kind, 'step' in ready ? `preflight step: ${ready.step}` : undefined).toBe('READY');
     expect(node.mutatingCalls()).toEqual([]);
   } finally { db.close(); }
-});
+}, PUB001_TIMEOUT_MS);
 
 const PRINCIPAL = 1_000_000n;
 const CAP = 10_000n;

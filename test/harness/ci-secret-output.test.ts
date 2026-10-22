@@ -98,7 +98,7 @@ process.exitCode=${mode === 'failed-producer' ? '7' : '0'};
   writeFileSync(environmentProducer, `
 import {spawnSync} from 'node:child_process';
 const env=Object.fromEntries(Object.entries(process.env).filter(([name])=>!/^NODE_OPTIONS$/i.test(name)));
-const actual=spawnSync(process.execPath,process.argv.slice(1),{env,windowsHide:true,timeout:10000});
+const actual=spawnSync(process.execPath,process.argv.slice(1),{env,windowsHide:true,timeout:30000});
 if(actual.error||actual.signal||actual.status!==0)throw Error('actual nested genuine producer did not succeed');
 process.stdout.write(actual.stdout);process.stderr.write(actual.stderr);process.exit(actual.status);
 `);
@@ -125,7 +125,7 @@ async function intent(){ if(authorize)try { await authorize({path:mode==='unboun
 if(mode!=='missing'&&mode!=='late')await intent();
 const producerEnv=Object.fromEntries(Object.entries(process.env).filter(([name])=>!/^FLUXWARDEN_|^NODE_OPTIONS$|^NODE_DEBUG$/i.test(name)||name.toUpperCase()==='FLUXWARDEN_TEST_TMP'));
 if(mode==='environment-preload')producerEnv.NODE_OPTIONS='--import='+${JSON.stringify(pathToFileURL(environmentProducer).href)};
-const produced=spawnSync(process.execPath,args,{env:producerEnv,encoding:'utf8',windowsHide:true,timeout:10000});
+const produced=spawnSync(process.execPath,args,{env:producerEnv,encoding:'utf8',windowsHide:true,timeout:30000});
 if(produced.error)throw produced.error;
 writeFileSync(response,produced.stdout);
 process.stdout.write(produced.stdout);process.stderr.write(produced.stderr);
@@ -145,10 +145,20 @@ if(mode==='hard-linked'){linkSync(key,key+'.alias');linked=lstatSync(key).nlink>
 writeFileSync(${JSON.stringify(control)},JSON.stringify({helperAvailable,authorizationRejected,producerStatus:produced.status,identityChanged,linked,
  originalSha256:createHash('sha256').update(bytes).digest('hex')}));
 `);
-  const invoke = (verify = false) => spawnSync(process.execPath, [...ownedCaptureToolArgs([captureCli, ...(verify ? ['verify'] : []),
-    '--root', root, '--capture-dir', capture, ...(verify ? [] : ['--', process.execPath, child])])], {
-    cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 10_000,
-  });
+  // These nested custody operations must finish; an infrastructure deadline is
+  // not an authorization rejection. Allow each its own bounded completion time.
+  const invoke = (verify = false) => {
+    const result = spawnSync(process.execPath, [...ownedCaptureToolArgs([captureCli, ...(verify ? ['verify'] : []),
+      '--root', root, '--capture-dir', capture, ...(verify ? [] : ['--', process.execPath, child])])], {
+      cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: verify ? 30_000 : 60_000,
+    });
+    if (verify) {
+      expect(result.error, 'independent verifier completes without a spawn error or deadline').toBeUndefined();
+      expect(result.signal, 'a killed verifier cannot establish rejection').toBeNull();
+      expect(result.status, 'verification reports an actual process exit').not.toBeNull();
+    }
+    return result;
+  };
   return { root, capture, sourceRoot: roots[3] ?? '', key, response, control, invoke,
     receipt: () => asRecord(JSON.parse(readFileSync(join(capture, 'receipt.json'), 'utf8')) as unknown, 'safe receipt') };
 }
@@ -168,7 +178,7 @@ for (const mode of ['unbound', 'existing', 'replaced', 'hard-linked', 'insecure'
     expect(asRecord(receipt['result'], 'result')['policySatisfied']).not.toBe(true);
     expect(records(receipt['sources']).some(row => row['sha256'] === control['originalSha256']), 'failed boundary retains original generated SOURCE membership').toBe(true);
     expect(f.invoke(true).status !== 0, 'independent verification preserves rejection').toBe(true);
-  });
+  }, 120_000);
 }
 
 it('CP-044/SECRET-OUTPUT genuine prospective generated key stays SOURCE-scanned output with truthful expected-match acceptance', async () => {
@@ -195,7 +205,7 @@ it('CP-044/SECRET-OUTPUT genuine prospective generated key stays SOURCE-scanned 
     'unchanged original engine still detects the generated private key').not.toBeNull();
   expect(JSON.stringify(receipt).includes(bytes.toString('utf8')), 'public receipt never publishes private key bytes').toBe(false);
   expect(f.invoke(true).status, 'fresh independent recheck retains truthful policy acceptance').toBe(0);
-});
+}, 120_000);
 
 for (const mode of ['missing', 'late', 'elsewhere']) {
   it(`CP-044/SECRET-OUTPUT rejects ${mode} authorization or an additional credential disclosure`, async () => {
@@ -208,7 +218,7 @@ for (const mode of ['missing', 'late', 'elsewhere']) {
     expect(asRecord(receipt['result'], 'result')['policySatisfied']).not.toBe(true);
     expect(records(receipt['sources']).some(row => row['sha256'] === sha(readFileSync(f.key))), 'failed evidence retains generated original SOURCE').toBe(true);
     expect(f.invoke(true).status !== 0, 'recheck cannot retroactively accept the failed boundary').toBe(true);
-  });
+  }, 120_000);
 }
 
 it('CP-044/SECRET-OUTPUT automatic SOURCE custody accepts the genuine key without caller registration', async () => {
@@ -230,7 +240,7 @@ it('CP-044/SECRET-OUTPUT automatic SOURCE custody accepts the genuine key withou
   expect(result.status, 'automatic recognition permits only the prospective own-key match').toBe(0);
   expect(receipt['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: false, policySatisfied: true });
   expect(f.invoke(true).status, 'independent verification retains automatic SOURCE custody and acceptance').toBe(0);
-});
+}, 120_000);
 
 for (const mode of ['elsewhere', 'stdout']) {
   it(`CP-044/SECRET-OUTPUT automatic SOURCE custody rejects ${mode} disclosure without caller registration`, async () => {
@@ -248,7 +258,7 @@ for (const mode of ['elsewhere', 'stdout']) {
       && row['sha256'] === fingerprint), 'own key retains OUTPUT purpose despite the additional leak').toHaveLength(1);
     expect(asRecord(receipt['result'], 'result')).toMatchObject({ leakFree: false, policySatisfied: false });
     expect(f.invoke(true).status !== 0, 'independent verification preserves the additional-disclosure rejection').toBe(true);
-  });
+  }, 120_000);
 }
 
 for (const mode of ['missing', 'late']) {
@@ -262,5 +272,5 @@ for (const mode of ['missing', 'late']) {
       'genuine key generation still requires exact prospective authorization').toBe(true);
     expect(asRecord(f.receipt()['result'], 'result')['policySatisfied']).not.toBe(true);
     expect(f.invoke(true).status !== 0, 'independent verification cannot accept missing or late authorization').toBe(true);
-  });
+  }, 120_000);
 }

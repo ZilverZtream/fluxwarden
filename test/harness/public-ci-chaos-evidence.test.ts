@@ -228,7 +228,7 @@ cp.spawn = function(command, args, options) {
   mkdirSync(dependencies);
   writeFileSync(join(dependencies, 'install-canary'), 'owned stale install canary');
   const installed = spawnSync(process.execPath, [...ownedCaptureToolArgs([join(fixture, 'scripts/ci-install.mjs'), '--root', fixture])], {
-    cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+    cwd: fixture, env, encoding: 'utf8', windowsHide: true, timeout: 30_000,
   });
   expect(installed.error).toBeUndefined();
   expect(installed.status, 'real trusted offline npm setup succeeds before validation').toBe(0);
@@ -275,4 +275,4 @@ cp.spawn = function(command, args, options) {
   const assertions = asRecord(results[0], 'test file')['assertionResults'];
   if (!Array.isArray(assertions)) throw new Error('actual assertion results required');
   expect(assertions.map(value => asRecord(value, 'assertion')['status']).sort()).toEqual(['failed', 'passed']);
-}, 75_000);
+}, 120_000);

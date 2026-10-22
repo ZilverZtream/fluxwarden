@@ -182,15 +182,16 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   const runsOn = String(test['runs-on']);
   const linuxVersions = ['22.23.2', '22.x', '24.18.1', '24.x'];
   const windowsVersions = ['22.23.2', '24.x'];
-  // D29 Windows budget repair: three core-product and four harness shards,
-  // plus the original native job, for each original Windows Node version.
-  expect(combos).toHaveLength(32);
-  expect(combos.length + Object.keys(jobs).length - 1, 'dispatch retains all thirty-four independent jobs').toBe(34);
+  // D29 Windows budget repair: three core, eight harness and two native jobs
+  // for each original Windows Node version; Linux and dispatch-only jobs stay complete.
+  expect(combos).toHaveLength(42);
+  expect(combos.length + Object.keys(jobs).length - 1, 'dispatch retains all forty-four independent jobs').toBe(44);
   expect(combos.filter(c => subst(runsOn, c) === 'ubuntu-latest').map(c => subst(nodeVersionExpr, c)).sort())
     .toEqual(linuxVersions.flatMap(version => [version, version, version, version]).sort());
   expect(combos.filter(c => subst(runsOn, c) === 'windows-latest')
     .map(c => `${subst(nodeVersionExpr, c)} ${c['shard'] ?? '<unset>'}`).sort()).toEqual(windowsVersions.flatMap(version =>
-      ['core-1', 'core-2', 'core-3', 'harness-1', 'harness-2', 'harness-3', 'harness-4', 'native'].map(shard => `${version} ${shard}`)).sort());
+      ['core-1', 'core-2', 'core-3', ...Array.from({ length: 8 }, (_, index) => `harness-${String(index + 1)}`),
+        'native-1', 'native-2'].map(shard => `${version} ${shard}`)).sort());
 
   const captureCommand = (run: string): string => run.replace(
     /^node scripts\/ci-capture\.mjs --root "\$PWD" --capture-dir "\$FLUXWARDEN_CI_CAPTURE_DIR" -- /, '');
@@ -264,7 +265,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     const windows = subst(runsOn, combo) === 'windows-latest';
     const core = /^core-[123]$/.test(combo['shard'] ?? '');
     const harnessOnly = ordered.some(step => kind(step) === 'harness');
-    if (windows) expect(harnessOnly, 'only the four Windows harness partitions execute the harness suite').toBe(/^harness-[1234]$/.test(combo['shard'] ?? ''));
+    if (windows) expect(harnessOnly, 'only the eight Windows harness partitions execute the harness suite').toBe(/^harness-[1-8]$/.test(combo['shard'] ?? ''));
     const suite = harnessOnly ? 'harness' : 'product';
     expect(ordered.map(kind), JSON.stringify(combo)).toEqual([
       'checkout', 'setup-node', 'npm ci', suite,
@@ -295,7 +296,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
       const shards = [...subst(productRun, combo).matchAll(/--shard(?:=|\s+)(\S+)/g)];
       expect(shards, 'one explicit independent Windows suite shard').toHaveLength(1);
       const shard = shards[0]?.[1], index = (combo['shard'] ?? '').split('-')[1];
-      expect(shard).toBe(`${index ?? '<unset>'}/${core ? '3' : '4'}`);
+      expect(shard).toBe(`${index ?? '<unset>'}/${core ? '3' : '8'}`);
       const version = subst(nodeVersionExpr, combo);
       windowsCoverage.set(version, [...(windowsCoverage.get(version) ?? []), `${core ? 'core' : 'harness'} ${shard ?? '<unset>'}`]);
       if (core) {
@@ -303,10 +304,14 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
         expect(map(productStep['env'], 'core environment')['FLUXWARDEN_CI_CORE_CONFIG']).toBe('${{ env.TEMP }}/vitest-windows-core.config.mjs');
       } else expect(productRun).not.toMatch(/--config\b|\btest\/[\w./-]+\.test\.[cm]?[jt]s\b/);
     } else if (windows) {
-      expect(productRun).not.toMatch(/--shard\b/);
+      expect(combo['shard']).toMatch(/^native-[12]$/);
+      const shards = [...subst(productRun, combo).matchAll(/--shard(?:=|\s+)(\S+)/g)];
+      expect(shards.length, 'native allocations use at most one execution shard').toBeLessThanOrEqual(1);
+      const index = (combo['shard'] ?? '').split('-')[1];
+      if (shards.length > 0) expect(shards[0]?.[1]).toBe(`${index ?? '<unset>'}/2`);
       expect(productRun).not.toMatch(/--config\b/);
       const version = subst(nodeVersionExpr, combo);
-      windowsCoverage.set(version, [...(windowsCoverage.get(version) ?? []), 'native']);
+      windowsCoverage.set(version, [...(windowsCoverage.get(version) ?? []), `native ${index ?? '<unset>'}/2`]);
     } else {
       const shards = [...subst(productRun, combo).matchAll(/--shard(?:=|\s+)(\S+)/g)];
       expect(shards, 'one explicit independent Linux suite shard').toHaveLength(1);
@@ -330,7 +335,8 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   }
   for (const version of windowsVersions) {
     expect(windowsCoverage.get(version)?.sort(), `${version}: every Windows core, harness and native partition occurs exactly once`).toEqual([
-      'core 1/3', 'core 2/3', 'core 3/3', 'harness 1/4', 'harness 2/4', 'harness 3/4', 'harness 4/4', 'native',
+      'core 1/3', 'core 2/3', 'core 3/3', ...Array.from({ length: 8 }, (_, index) => `harness ${String(index + 1)}/8`),
+      'native 1/2', 'native 2/2',
     ]);
   }
 
@@ -399,18 +405,41 @@ process.exitCode = mode === 'fail' ? 7 : 0;
     'test/ledger/cp037-ledger.test.ts',
     'test/commands/cp043-t05-repository.test.ts',
   ];
+  const harnessFiles = [
+    'test/harness/ci-dependency-setup.test.ts',
+    'test/harness/ci-secret-output.test.ts',
+    'test/harness/ci-worker-source-lifetime.test.ts',
+    'test/harness/config.test.ts',
+    'test/harness/cp001-repo.test.ts',
+    'test/harness/cp002-byte-boundary-gold.test.ts',
+    'test/harness/cp002-declaration-freshness.test.ts',
+    'test/harness/cp002-encoding-completeness.test.ts',
+    'test/harness/cp002-leak.test.ts',
+    'test/harness/cp004-provenance.test.ts',
+    'test/harness/cp028-worker-completion.test.ts',
+    'test/harness/current-ci-capture.test.ts',
+    'test/harness/docs.test.ts',
+    'test/harness/docs-consistency.test.ts',
+    'test/harness/public-ci-chaos-evidence.test.ts',
+    'test/harness/release.test.ts',
+    'test/harness/release-smoke-retention.test.ts',
+  ];
   const coreCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'core-1');
-  const nativeCombo = combos.find(c => c['os'] === 'windows-latest' && c['shard'] === 'native');
-  if (!coreCombo || !nativeCombo) throw new Error('both Windows shards are required');
+  if (!coreCombo) throw new Error('Windows core shards are required');
   const coreProduct = steps.find(s => kind(s) === 'product' && active(s, coreCombo));
-  const nativeProduct = steps.find(s => kind(s) === 'product' && active(s, nativeCombo));
-  const nativeArgs = String(nativeProduct?.['run']).match(/\btest\/[\w./-]+\.test\.ts\b/g) ?? [];
-  expect(nativeArgs).toEqual(nativeFiles);
+  const nativeSelections: { version: string; index: number; files: string[]; sharded: boolean }[] = [];
   for (const version of windowsVersions) {
-    const combo = combos.find(c => subst(runsOn, c) === 'windows-latest' && subst(nodeVersionExpr, c) === version && c['shard'] === 'native');
-    if (combo === undefined) throw new Error('each original Windows Node version retains its native product job');
-    const selected = steps.find(s => kind(s) === 'product' && active(s, combo));
-    expect(String(selected?.['run']).match(/\btest\/[\w./-]+\.test\.ts\b/g) ?? [], `${version}: native product inventory is unchanged`).toEqual(nativeFiles);
+    for (const index of [1, 2]) {
+      const combo = combos.find(c => subst(runsOn, c) === 'windows-latest' && subst(nodeVersionExpr, c) === version && c['shard'] === `native-${String(index)}`);
+      if (combo === undefined) throw new Error('each original Windows Node version retains both native product allocations');
+      const selected = steps.find(s => kind(s) === 'product' && active(s, combo));
+      const run = subst(commandOf(selected ?? {}), combo);
+      const files = run.match(/\btest\/[\w./-]+\.test\.ts\b/g) ?? [];
+      expect(files.length, `${version}: native allocation ${String(index)} names its eligible files`).toBeGreaterThan(0);
+      expect(new Set(files).size, `${version}: native selectors contain no duplicates`).toBe(files.length);
+      expect(files.filter(file => !nativeFiles.includes(file)), `${version}: native selectors contain only the official inventory`).toEqual([]);
+      nativeSelections.push({ version, index, files, sharded: /--shard(?:=|\s+)/.test(run) });
+    }
   }
   if (coreProduct === undefined) throw new Error('core product step is required');
   expect(map(coreProduct['env'], 'core environment')['FLUXWARDEN_CI_CORE_CONFIG']).toBe('${{ env.TEMP }}/vitest-windows-core.config.mjs');
@@ -443,25 +472,34 @@ process.exitCode = mode === 'fail' ? 7 : 0;
     }).sort();
   };
   const productFiles = (args: readonly string[] = []): string[] => projectFiles('product', args);
-  const complete = productFiles(), coreFiles = productFiles(['--config', coreConfig]), native = productFiles(nativeArgs);
+  const complete = productFiles(), coreFiles = productFiles(['--config', coreConfig]), native = productFiles(nativeFiles);
   const fullHarness = projectFiles('harness-docs');
+  expect(complete, 'the unchanged complete product inventory has 133 files').toHaveLength(133);
+  expect(coreFiles, 'three Windows core shards retain all 121 original core files').toHaveLength(121);
+  expect(native, 'two Windows native allocations retain all twelve original files').toHaveLength(12);
   expect(fullHarness, 'Windows harness shards retain all seventeen project files').toHaveLength(17);
+  expect(fullHarness, 'the exact official harness inventory is unchanged').toEqual([...harnessFiles].sort());
   expect(fullHarness, 'the real worker completion regression remains in the harness inventory').toContain('test/harness/cp028-worker-completion.test.ts');
   // `list --filesOnly` lists eligible files without applying execution sharding.
   // Exercise the pinned public sequencer over that inventory instead.
   const partition = spawnSync(process.execPath, ['--input-type=module'], {
-    cwd: repoRoot, env: { ...childEnv(), CI_CORE_FILES: JSON.stringify(coreFiles),
+    cwd: repoRoot, env: { ...childEnv(), CI_CORE_FILES: JSON.stringify(coreFiles), CI_NATIVE_SELECTIONS: JSON.stringify(nativeSelections),
       CI_LINUX_PRODUCT_FILES: JSON.stringify(complete), CI_LINUX_HARNESS_FILES: JSON.stringify(fullHarness) },
     input: `import { BaseSequencer } from 'vitest/node';
 const split = async (value, count) => {
  const files = JSON.parse(value).map(moduleId => ({ moduleId }));
  return Promise.all(Array.from({ length: count }, (_, offset) => new BaseSequencer({ config: { root: process.cwd(), shard: { index: offset + 1, count } } }).shard(files)));
 };
-const [groups, product, harness, windowsHarness] = await Promise.all([split(process.env.CI_CORE_FILES, 3), split(process.env.CI_LINUX_PRODUCT_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 4)]);
+const [groups, product, harness, windowsHarness] = await Promise.all([split(process.env.CI_CORE_FILES, 3), split(process.env.CI_LINUX_PRODUCT_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 8)]);
+const native = await Promise.all(JSON.parse(process.env.CI_NATIVE_SELECTIONS).map(async selection => {
+ const files = selection.files.map(moduleId => ({ moduleId }));
+ const selected = selection.sharded ? await new BaseSequencer({ config: { root: process.cwd(), shard: { index: selection.index, count: 2 } } }).shard(files) : files;
+ return ['native-' + selection.version + '-' + selection.index, selected.map(file => file.moduleId)];
+}));
 console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second: groups[1].map(file => file.moduleId), third: groups[2].map(file => file.moduleId),
  productFirst: product[0].map(file => file.moduleId), productSecond: product[1].map(file => file.moduleId),
  harnessFirst: harness[0].map(file => file.moduleId), harnessSecond: harness[1].map(file => file.moduleId),
- windowsHarness: windowsHarness.map(group => group.map(file => file.moduleId)) }));`,
+ windowsHarness: windowsHarness.map(group => group.map(file => file.moduleId)), ...Object.fromEntries(native) }));`,
     encoding: 'utf8', windowsHide: true, timeout: 10000,
   });
   expect(partition.error).toBeUndefined();
@@ -479,6 +517,10 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
   expect(complete.length).toBeGreaterThan(nativeFiles.length);
   expect(native).toEqual([...nativeFiles].sort());
   for (const version of windowsVersions) {
+    const firstNative = shardFiles(`native-${version}-1`), secondNative = shardFiles(`native-${version}-2`);
+    expect([firstNative.length, secondNative.length], `${version}: native allocations are two nonempty six-file groups`).toEqual([6, 6]);
+    expect(firstNative.filter(file => secondNative.includes(file)), `${version}: native allocations are disjoint`).toEqual([]);
+    expect([...firstNative, ...secondNative].sort(), `${version}: native allocations preserve the exact twelve-file inventory`).toEqual([...nativeFiles].sort());
     expect(firstCore.length, `${version}: first core shard is nonempty`).toBeGreaterThan(0);
     expect(secondCore.length, `${version}: second core shard is nonempty`).toBeGreaterThan(0);
     expect(thirdCore.length, `${version}: third core shard is nonempty`).toBeGreaterThan(0);
@@ -487,16 +529,20 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
     expect([...firstCore, ...secondCore, ...thirdCore].sort(), `${version}: Windows core shards cover the complete original core inventory`).toEqual(coreFiles);
     const groups = partitions['windowsHarness'];
     if (!Array.isArray(groups)) throw new Error('Windows harness partitions are not a list');
-    expect(groups).toHaveLength(4);
+    expect(groups).toHaveLength(8);
     const files = groups.map((group: unknown) => {
       if (!Array.isArray(group) || !group.every((file: unknown) => typeof file === 'string')) throw new Error('Windows harness partition is not a path list');
       return group;
     });
+    expect(files.map(group => group.length), `${version}: bounded harness allocations retain seventeen files`).toEqual([3, 2, 2, 2, 2, 2, 2, 2]);
     for (const [index, group] of files.entries()) {
       expect(group.length, `${version}: Windows harness shard ${String(index + 1)} is nonempty`).toBeGreaterThan(0);
       expect(group.filter(file => files.slice(index + 1).flat().includes(file)), `${version}: Windows harness shard ${String(index + 1)} is disjoint`).toEqual([]);
     }
-    expect(files.flat().sort(), `${version}: four Windows harness shards preserve all seventeen original files`).toEqual(fullHarness);
+    expect(files.flat().sort(), `${version}: eight Windows harness shards preserve all seventeen original files`).toEqual(fullHarness);
+    expect(files.findIndex(group => group.includes('test/harness/ci-secret-output.test.ts')),
+      `${version}: secret-output and public-chaos proofs run in distinct harness jobs`)
+      .not.toBe(files.findIndex(group => group.includes('test/harness/public-ci-chaos-evidence.test.ts')));
   }
   expect(coreFiles.filter(file => native.includes(file)), 'Windows shards are disjoint').toEqual([]);
   expect([...coreFiles, ...native].sort(), 'Windows shards cover the complete product inventory').toEqual(complete);

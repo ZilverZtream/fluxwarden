@@ -46,4 +46,4 @@ it('CP-035/B3 REG-PERS018 recovering terminal attribution keeps the original suc
     expect(outcome.ok).toBe(true);
     expect(r.node.count('sendOnRoute')).toBe(1);
   } finally { db.close(); }
-});
+}, 60_000);
