@@ -7,7 +7,7 @@
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { expect, it } from 'vitest';
+import { beforeEach, expect, it } from 'vitest';
 import { childEnv, repoRoot } from '../helpers/cli.js';
 import {
   channel, codeOf, fileHash, grantOthers, listing, loadPersistence, NODE_ID, raw, scratch, seeded,
@@ -71,6 +71,11 @@ async function fixture(): Promise<{ path: string; channelId: string; open(readOn
   return { path, channelId, open: readOnly => p.openDatabase(path, { readOnly }) as CommandDatabase };
 }
 
+// Each case keeps its own fresh database. Native owner-only setup completes under the existing
+// fixture hook deadline before the unchanged behavior deadline starts.
+let preparedFixture: Awaited<ReturnType<typeof fixture>>;
+beforeEach(async () => { preparedFixture = await fixture(); });
+
 // Separate process, real commit, then close/checkpoint before the parent resumes. No sleep or mocked
 // persistence boundary: spawnSync completion is the deterministic interleaving barrier.
 const WRITER = `
@@ -129,8 +134,8 @@ const READS: ReadCase[] = [
 ];
 
 for (const check of READS) {
-  it(`CP-015/B2 commandData.${check.name} reads the external commit or BUSY on an existing read-only handle`, async () => {
-    const f = await fixture();
+  it(`CP-015/B2 commandData.${check.name} reads the external commit or BUSY on an existing read-only handle`, () => {
+    const f = preparedFixture;
     const reader = f.open(true);
     try {
       expect(check.read(reader)).toEqual(check.initial);
@@ -152,8 +157,8 @@ for (const check of READS) {
   });
 }
 
-it('CP-015/B2 healthy read-only command data reads all initial facts without changing files', async () => {
-  const f = await fixture();
+it('CP-015/B2 healthy read-only command data reads all initial facts without changing files', () => {
+  const f = preparedFixture;
   const before = { names: listing(dirname(f.path)), hash: fileHash(f.path) };
   const reader = f.open(true);
   try {
@@ -162,8 +167,8 @@ it('CP-015/B2 healthy read-only command data reads all initial facts without cha
   expect({ names: listing(dirname(f.path)), hash: fileHash(f.path) }).toEqual(before);
 });
 
-it('CP-015/B2 ordinary writer command data reads new committed facts through the same handle', async () => {
-  const f = await fixture();
+it('CP-015/B2 ordinary writer command data reads new committed facts through the same handle', () => {
+  const f = preparedFixture;
   const writer = f.open(false);
   try {
     for (const check of READS) expect(check.read(writer), check.name).toEqual(check.initial);
@@ -172,8 +177,8 @@ it('CP-015/B2 ordinary writer command data reads new committed facts through the
   } finally { writer.close(); }
 });
 
-it('CP-015/B7 command data reads refuse a database whose permissions became unsafe after opening', async () => {
-  const f = await fixture();
+it('CP-015/B7 command data reads refuse a database whose permissions became unsafe after opening', () => {
+  const f = preparedFixture;
   const reader = f.open(true);
   try {
     for (const check of READS) expect(check.read(reader), check.name).toEqual(check.initial);
@@ -182,8 +187,8 @@ it('CP-015/B7 command data reads refuse a database whose permissions became unsa
   } finally { reader.close(); }
 });
 
-it('CP-015/B2 a read-only command data handle refuses approval insertion without changing the database', async () => {
-  const f = await fixture();
+it('CP-015/B2 a read-only command data handle refuses approval insertion without changing the database', () => {
+  const f = preparedFixture;
   const before = fileHash(f.path);
   const reader = f.open(true);
   try {

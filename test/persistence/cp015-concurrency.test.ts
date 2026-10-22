@@ -276,11 +276,12 @@ it('CP-015/B6 processes racing to create the same database each open it or get a
     receipt('round-end', round);
     return outs;
   }
-  // Distinct database paths keep the rounds independent; at most two sets of eight openers are active.
-  for (let round = 0; round < 12; round += 2) {
-    const rounds = await Promise.all([runRound(round), runRound(round + 1)]);
+  // Distinct database paths make the rounds independent. Keep all eight contenders within each
+  // round while completing one database's native setup before starting the next independent round.
+  for (let round = 0; round < 12; round += 1) {
+    const roundOutcomes = await runRound(round);
     if (isStopped()) return;
-    outcomes.push(...rounds.flat());
+    outcomes.push(...roundOutcomes);
   }
   // A losing O_EXCL create must not surface as Error:EEXIST; it is an existing database (or a coded refusal).
   expect(outcomes.filter(out => !/^(?:ok|PersistenceError:[A-Z_]+)$/.test(out))).toEqual([]);
