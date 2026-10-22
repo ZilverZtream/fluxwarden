@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, rm, readdir, lstat, realpath, chmod, copyFi
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { promisify } from 'node:util';
+import { performance } from 'node:perf_hooks';
 import { isAbsolute, relative, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fail } from './readiness.mjs';
@@ -53,17 +54,35 @@ export async function protectCreated(paths, { copies = [], privateDirectories = 
     }
     return;
   }
-  const encoded = Buffer.from(JSON.stringify({ paths, copies, privateDirectories }), 'utf16le').toString('base64');
-  const code = `$ErrorActionPreference='Stop'; Import-Module Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,Microsoft.PowerShell.Management; $request=ConvertFrom-Json ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}'))); $user=[Security.Principal.WindowsIdentity]::GetCurrent().User; function Assert-Directories { foreach($directory in $request.privateDirectories) { $actual=[IO.DirectoryInfo]::new($directory).GetAccessControl(); $rules=@($actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); if($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user.Value -or !($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -eq $user.Value }) -or ($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $user.Value })) { throw 'unsafe private directory'; } } }; function Protect-Path($path) { $item=Get-Item -LiteralPath $path; if($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'linked owned path'; } if($item.PSIsContainer) { $acl=[Security.AccessControl.DirectorySecurity]::new(); $flags=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit; } else { $acl=[Security.AccessControl.FileSecurity]::new(); $flags=[Security.AccessControl.InheritanceFlags]::None; } $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false); $rule=[Security.AccessControl.FileSystemAccessRule]::new($user,[Security.AccessControl.FileSystemRights]::FullControl,$flags,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl; $after=Get-Acl -LiteralPath $path; if(!$after.AreAccessRulesProtected -or $after.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user.Value -or @($after.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $user.Value }).Count -gt 0) { throw 'unsafe owned path'; } }; Assert-Directories; foreach($path in $request.paths) { Protect-Path $path }; foreach($copy in $request.copies) { $source=[IO.FileInfo]::new($copy.source); if(!$source.Exists -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $source.Length -lt 1 -or $source.Length -gt 65536) { throw 'unsafe copied file'; }; [IO.File]::Copy($copy.source,$copy.target,$false); Protect-Path $copy.target }; Assert-Directories;`;
-  const system = process.env.SystemRoot || 'C:\\Windows';
-  await execute(join(system, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
-    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')],
-    { shell: false, windowsHide: true, timeout: 60000, maxBuffer: 16384,
-      env: { SystemRoot: system, TEMP: process.env.TEMP, PATH: join(system, 'System32'), PSModulePath: join(system, 'System32/WindowsPowerShell/v1.0/Modules') } });
+  const deadline = performance.now() + 60000;
+  const protect = async selected => {
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining <= 0) throw fail('permissions');
+    await protectWindowsCreated(selected, privateDirectories, remaining);
+  };
+  await protect(paths);
+  for (const copy of copies) {
+    const source = await lstat(copy.source);
+    if (!source.isFile() || source.isSymbolicLink() || source.size < 1 || source.size > 65536) throw fail('permissions');
+    // The protected source and private destination directory keep the exclusive
+    // Node copy private from creation, while its original write remains observable.
+    await copyFile(copy.source, copy.target, constants.COPYFILE_EXCL);
+  }
+  if (copies.length) await protect(copies.map(copy => copy.target));
   for (const [index, directory] of privateDirectories.entries()) {
     const after = await realDirectory(directory);
     if (after.dev !== before[index].dev || after.ino !== before[index].ino) throw fail('permissions');
   }
+}
+
+async function protectWindowsCreated(paths, privateDirectories, timeout) {
+  const encoded = Buffer.from(JSON.stringify({ paths, copies: [], privateDirectories }), 'utf16le').toString('base64');
+  const code = `$ErrorActionPreference='Stop'; Import-Module Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,Microsoft.PowerShell.Management; $request=ConvertFrom-Json ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}'))); $user=[Security.Principal.WindowsIdentity]::GetCurrent().User; function Assert-Directories { foreach($directory in $request.privateDirectories) { $actual=[IO.DirectoryInfo]::new($directory).GetAccessControl(); $rules=@($actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); if($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user.Value -or !($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -eq $user.Value }) -or ($rules | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $user.Value })) { throw 'unsafe private directory'; } } }; function Protect-Path($path) { $item=Get-Item -LiteralPath $path; if($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'linked owned path'; } if($item.PSIsContainer) { $acl=[Security.AccessControl.DirectorySecurity]::new(); $flags=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit; } else { $acl=[Security.AccessControl.FileSecurity]::new(); $flags=[Security.AccessControl.InheritanceFlags]::None; } $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false); $rule=[Security.AccessControl.FileSystemAccessRule]::new($user,[Security.AccessControl.FileSystemRights]::FullControl,$flags,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $path -AclObject $acl; $after=Get-Acl -LiteralPath $path; if(!$after.AreAccessRulesProtected -or $after.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user.Value -or @($after.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -ne $user.Value }).Count -gt 0) { throw 'unsafe owned path'; } }; Assert-Directories; foreach($path in $request.paths) { Protect-Path $path }; foreach($copy in $request.copies) { $source=[IO.FileInfo]::new($copy.source); if(!$source.Exists -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $source.Length -lt 1 -or $source.Length -gt 65536) { throw 'unsafe copied file'; }; [IO.File]::Copy($copy.source,$copy.target,$false); Protect-Path $copy.target }; Assert-Directories;`;
+  const system = process.env.SystemRoot || 'C:\\Windows';
+  await execute(join(system, 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(code, 'utf16le').toString('base64')],
+    { shell: false, windowsHide: true, timeout, maxBuffer: 16384,
+      env: { SystemRoot: system, TEMP: process.env.TEMP, PATH: join(system, 'System32'), PSModulePath: join(system, 'System32/WindowsPowerShell/v1.0/Modules') } });
 }
 
 async function registryLock(context, operation) {

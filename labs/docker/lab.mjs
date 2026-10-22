@@ -154,14 +154,19 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
         : { certificate: '/root/.lightning/regtest/ca.pem' };
       for (const [kind, source] of Object.entries(paths)) {
         const path = join(directory, `${node}-${kind}`);
+        if (kind === 'credential') {
+          const sentinel = join(owner.sentinelRoot, `${node}-${attempt}-bootstrap.bin`);
+          const testTmp = process.env.FLUXWARDEN_TEST_TMP;
+          if (testTmp) await writeFile(join(testTmp, 'declared-out.txt'), `${path}\n${sentinel}\n`, { flag: 'a', mode: 0o600 });
+        }
         await compose('bootstrap-copy', ['cp', `${node}:${source}`, path]);
         files.push({ node, kind, path });
       }
     }
     const copies = files.filter(file => file.kind === 'credential').map(file => ({ source: file.path,
       target: join(owner.sentinelRoot, `${file.node}-${attempt}-bootstrap.bin`) }));
-    // Protect source files before copying their bytes, then protect the new sentinels in the
-    // same native operation. Directory ACLs are read freshly before and after the copies.
+    // Protect source files before copying their bytes, then protect the new sentinels.
+    // Directory ACLs are read freshly around both native protection batches.
     await protectCreated(files.map(file => file.path), { copies,
       privateDirectories: [directory, owner.sentinelRoot] });
     if (permissions.assert !== assertPrivateDirectory) await permissions.assert(directory);
@@ -171,11 +176,6 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
       if (!inside || inside.startsWith('..') || isAbsolute(inside) || stat.isSymbolicLink() || !stat.isFile() || stat.size === 0 || stat.size > 65536) throw fail('bootstrap-file');
       const bytes = await readFile(actual);
       identities[file.node][file.kind] = { path: actual, sha256: createHash('sha256').update(bytes).digest('hex') };
-      if (file.kind === 'credential') {
-        const sentinel = join(owner.sentinelRoot, `${file.node}-${attempt}-bootstrap.bin`);
-        const testTmp = process.env.FLUXWARDEN_TEST_TMP;
-        if (testTmp) await writeFile(join(testTmp, 'declared-out.txt'), `${actual}\n${sentinel}\n`, { flag: 'a', mode: 0o600 });
-      }
     }
   }
   // Credential controls re-aim the managed proxies; a ready lab has each proxy on its own node.

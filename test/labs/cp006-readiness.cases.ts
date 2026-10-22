@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import ts from 'typescript';
 import { expect, it } from 'vitest';
 import { asRecord, repoRoot } from '../helpers/cli.js';
+import { ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { loadLab, options, owner } from '../helpers/cp006-lab.js';
 import type { Owner } from '../helpers/cp006-lab.js';
 import { nodes, observedLab, topology } from '../helpers/cp006-observed.js';
@@ -146,7 +147,7 @@ it('CP-006/B8 two real owner workers overlap at a deterministic barrier with dis
   writeFileSync(compiled, ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText, { mode: 0o600 });
   const workers = selected.map(owner => {
     const declaration = join(owner.tmpRoot, 'worker-owner.json'); writeFileSync(declaration, JSON.stringify(owner), { mode: 0o600 });
-    return fork(join(repoRoot, 'test/fixtures/cp006-owner-worker.mjs'), [declaration, compiled, join(repoRoot, 'labs/docker/lab.mjs'), join(repoRoot, 'scripts/private-scratch.mjs')], { cwd: repoRoot, execPath: process.execPath, execArgv: [], env: { ...process.env, VITEST_MAX_THREADS: '99', VITEST_MAX_WORKERS: '99' }, silent: true });
+    return fork(join(repoRoot, 'test/fixtures/cp006-owner-worker.mjs'), [declaration, compiled, join(repoRoot, 'labs/docker/lab.mjs'), join(repoRoot, 'scripts/private-scratch.mjs')], { cwd: repoRoot, execPath: process.execPath, execArgv: ownedCaptureToolArgs([]), env: { ...process.env, VITEST_MAX_THREADS: '99', VITEST_MAX_WORKERS: '99' }, silent: true });
   });
   const acquired: Record<string, unknown>[] = [], completed: Record<string, unknown>[] = [];
   const timer = setTimeout(() => { for (const worker of workers) worker.kill(); }, 110000);
