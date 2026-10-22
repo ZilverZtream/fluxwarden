@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createECDH } from 'node:crypto';
+import { createECDH, createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { asRecord, readJson, repoRoot } from './cli.js';
 import type { CommandOptions, Owner, Result, Run } from './cp006-lab.js';
@@ -42,8 +42,10 @@ export interface ScriptOptions {
 export function observedLab(owner: Owner, script: ScriptOptions = {}): {
   run: Run; observations: Observation[]; privateFiles: Map<string, Buffer>; pubkeys: Record<string, string>; clock: () => number; delay: (ms: number, signal?: AbortSignal) => Promise<void>; delays: number[]; maxMutating: () => number;
 } {
-  const sentinelDir = process.env['FLUXWARDEN_SENTINEL_DIR'];
-  if (!sentinelDir) throw new Error('private sentinel root required');
+  const sentinelRoot = process.env['FLUXWARDEN_SENTINEL_DIR'];
+  if (!sentinelRoot) throw new Error('private sentinel root required');
+  const sentinelDir = join(sentinelRoot, createHash('sha256').update(owner.runtimeRoot).digest('hex'));
+  mkdirSync(sentinelDir, { recursive: true, mode: 0o700 });
   const registry = readJson('test/sentinels.json');
   if (!Array.isArray(registry) || registry.length !== 5) throw new Error('five disposable sentinel files are required');
   for (const entry of registry as unknown[]) {

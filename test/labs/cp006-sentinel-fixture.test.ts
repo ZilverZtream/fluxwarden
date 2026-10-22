@@ -1,4 +1,5 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { repoRoot } from '../helpers/cli.js';
@@ -8,9 +9,10 @@ import { sentinelRoot, sentinels } from '../helpers/output.js';
 
 // SECURITY INV-11: synthetic credential copies use the independently committed registry.
 it('CP-006/B7 a fresh observed owner registers exact fixture bytes before copying within its runtime', async () => {
-  const previous = sentinelRoot(), isolated = mkdtempSync(join(previous, 'copy-control-'));
-  const selected = await owner(), destination = join(selected.runtimeRoot, 'lnd-p', 'admin.macaroon');
-  process.env['FLUXWARDEN_SENTINEL_DIR'] = isolated;
+  const previous = sentinelRoot(), registry = mkdtempSync(join(previous, 'copy-control-'));
+  const selected = await owner(), isolated = join(registry, createHash('sha256').update(selected.runtimeRoot).digest('hex')), destination = join(selected.runtimeRoot, 'lnd-p', 'admin.macaroon');
+  mkdirSync(isolated, { mode: 0o700 });
+  process.env['FLUXWARDEN_SENTINEL_DIR'] = registry;
   try {
     expect(readdirSync(isolated)).toHaveLength(0);
     const fake = observedLab(selected), fixtures = sentinels();
@@ -28,6 +30,6 @@ it('CP-006/B7 a fresh observed owner registers exact fixture bytes before copyin
     expect([...fake.privateFiles.keys()]).toEqual([destination]);
   } finally {
     process.env['FLUXWARDEN_SENTINEL_DIR'] = previous;
-    rmSync(isolated, { recursive: true, force: true });
+    rmSync(registry, { recursive: true, force: true });
   }
 });
