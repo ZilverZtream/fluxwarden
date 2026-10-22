@@ -243,6 +243,7 @@ it('CP-015/B6 processes racing to create the same database each open it or get a
   async function runRound(round: number): Promise<string[]> {
     const path = join(scratch('first-open'), 'state', 'fluxwarden.db');
     const children = Array.from({ length: 8 }, () => run(OPENER, [moduleUrl, path]));
+    const terminalAfterExit = new Set<ChildProcessWithoutNullStreams>();
     for (const child of children) {
       owned.add(child);
       child.once('exit', () => { owned.delete(child); });
@@ -251,16 +252,27 @@ it('CP-015/B6 processes racing to create the same database each open it or get a
     receipt('round-start', round);
     const results = children.map(child => new Promise<string>(resolve => {
       let out = '';
-      child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString(); });
-      child.once('exit', () => { resolve(out.slice(out.indexOf('=') + 1)); });
+      child.stdout.on('data', (chunk: Buffer) => {
+        out += chunk.toString();
+        if (out.includes('=') && child.exitCode !== null) terminalAfterExit.add(child);
+      });
+      child.once('close', () => { resolve(out.slice(out.indexOf('=') + 1)); });
     }));
     await Promise.all(children.map(child => waitFor(child, 'ready')));
     if (isStopped()) return [];
     receipt('round-ready', round);
-    for (const child of children) child.stdin.write('go');
+    // Node's exit event does not promise drained stdio; close does. Exercise
+    // that ordering with each actual opener's pipe, without replacing output.
+    // https://nodejs.org/download/release/v24.21.0/docs/api/child_process.html#event-close
+    for (const child of children) {
+      child.stdout.pause();
+      child.once('exit', () => { child.stdout.resume(); });
+      child.stdin.write('go');
+    }
     const outs = await Promise.all(results);
     if (isStopped()) return [];
     expect(outs.filter(out => out === 'ok').length, `round ${String(round)}: ${outs.join(', ')}`).toBeGreaterThan(0);
+    expect(terminalAfterExit.size, 'all eight real terminal responses are delivered after process exit').toBe(8);
     receipt('round-end', round);
     return outs;
   }

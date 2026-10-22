@@ -126,7 +126,7 @@ src/executor/preflight.ts:
     createInvoice, sendOnRoute, cancelUnpaidInvoice, with NormalizedChannel of src/core/normalize.ts and CircularRoute of SPEC §5.1;
     findCircularRoute(req: RouteRequest) resolves to a CircularRoute or { refusal: <SPEC §7.5 code> }.
 */
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { constants, copyFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -610,8 +610,12 @@ export interface WorkerResult { readonly workerId: string; readonly outcomes: Cl
 const encode = (value: unknown): string => JSON.stringify(value, (_k, v: unknown) => typeof v === 'bigint' ? `bigint:${v.toString()}` : v);
 const reviveBigints = (_k: string, v: unknown): unknown => typeof v === 'string' && v.startsWith('bigint:') ? BigInt(v.slice(7)) : v;
 
-/** Runs one claim worker process per entry against the same database file and releases them at the same moment. */
-export async function raceClaims(path: string, workers: readonly { workerId: string; inputs: readonly { approval: VerifiedApproval; policy: ExecutionPolicy }[] }[]): Promise<WorkerResult[]> {
+/**
+ * Runs one claim worker process per entry against the same database file and releases them at the same moment.
+ * beforeRelease optionally controls the real streams after readiness, for deterministic helper lifecycle tests.
+ */
+export async function raceClaims(path: string, workers: readonly { workerId: string; inputs: readonly { approval: VerifiedApproval; policy: ExecutionPolicy }[] }[],
+  beforeRelease?: (children: readonly ChildProcessWithoutNullStreams[]) => void): Promise<WorkerResult[]> {
   const children = workers.map(worker => {
     const child = spawn(process.execPath, ['--no-warnings', '--input-type=module', '-e', CLAIM_WORKER,
       pathToFileURL(builtClaim).href, pathToFileURL(builtPersistence).href, path, worker.workerId], {
@@ -623,12 +627,13 @@ export async function raceClaims(path: string, workers: readonly { workerId: str
     const ready = new Promise<void>((resolve, reject) => {
       child.stdout.on('data', (chunk: Buffer) => { out += chunk.toString(); if (out.includes('ready\n')) resolve(); });
       child.stderr.on('data', (chunk: Buffer) => { err += chunk.toString(); });
-      child.once('exit', status => { if (!out.includes('ready\n')) reject(new Error(`worker exited ${String(status)} before ready: ${err}`)); });
+      child.once('close', status => { if (!out.includes('ready\n')) reject(new Error(`worker exited ${String(status)} before ready: ${err}`)); });
       child.once('error', reject);
     });
     const done = new Promise<WorkerResult>((resolve, reject) => {
       child.once('error', reject);
-      child.once('exit', status => {
+      // Node's exit event does not guarantee stdio has drained; close follows stream closure.
+      child.once('close', status => {
         if (status !== 0) { reject(new Error(`worker ${worker.workerId} exited ${String(status)}: ${err}`)); return; }
         const line = out.split('\n').filter(text => text.startsWith('[')).pop() ?? '[]';
         resolve({ workerId: worker.workerId, outcomes: JSON.parse(line, reviveBigints) as ClaimOutcome[] });
@@ -642,6 +647,7 @@ export async function raceClaims(path: string, workers: readonly { workerId: str
   void completed.catch(() => undefined);
   try {
     await Promise.all(children.map(c => c.ready));
+    beforeRelease?.(children.map(c => c.child));
     for (const c of children) c.child.stdin.write('go\n');
     return await completed;
   } finally {

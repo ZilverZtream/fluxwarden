@@ -738,6 +738,15 @@ it('CP-044/CI-DIAGNOSTIC registered numeric source cannot escape through diagnos
   declareFixturePaths([numericSource]);
   declareFixtureCapture(f.capture, [sourceBytes], [{ path: f.reportPath, bytes: Buffer.from(JSON.stringify(report)) }]);
   writeFileSync(numericSource, sourceBytes, { mode: 0o600 });
+  if (process.env['FLUXWARDEN_CI_CAPTURE']) {
+    // Witness this exact known synthetic INPUT in the outer test worker before
+    // the nested recorder owns its child's writes. Leave the inner report absent
+    // at Opening so the original command still creates fresh refused EGRESS.
+    writeFileSync(f.reportPath, JSON.stringify(report), { flag: 'wx', mode: 0o600 });
+    expect(readFileSync(f.reportPath).equals(Buffer.from(JSON.stringify(report))), 'outer fixture setup witnesses only the exact known synthetic report bytes').toBe(true);
+    rmSync(f.reportPath);
+    expect(existsSync(f.reportPath), 'the inner capture opens with its report path still absent').toBe(false);
+  }
   f.script(`const numeric = readFileSync(join(sourceRoot, 'numeric-control.bin'), 'utf8');
 const file = ${JSON.stringify(join(f.root, f.relativeFile))};
 const report = { numPassedTests: Number(numeric), numFailedTests: 1, numPendingTests: 0, success: false,
