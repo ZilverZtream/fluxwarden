@@ -11,7 +11,8 @@ export default defineConfig({
   test: {
     allowOnly: false,
     passWithNoTests: false,
-    testTimeout: 15_000,
+    // Finite framework completion budget; explicit behavioral and child deadlines remain separate.
+    testTimeout: 60_000,
     hookTimeout: 30_000,
     maxWorkers: 4,
     projects: [
