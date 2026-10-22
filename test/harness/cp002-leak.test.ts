@@ -437,7 +437,7 @@ it('CP-002/B15 empty lab succeeds, empty chaos fails explicitly, and unavailable
   }
   mkdirSync(join(fixture, 'scripts'));
   for (const file of ['private-scratch.mjs', 'no-pending.mjs', 'leak-check.mjs', 'later.mjs',
-    'ci-test-driver.mjs', 'ci-capture-preload.mjs', 'ci-capture-files.mjs']) {
+    'ci-test-driver.mjs', 'ci-capture-preload.mjs', 'ci-capture-files.mjs', 'ci-secret-output.mjs']) {
     copyFileSync(join(repoRoot, 'scripts', file), join(fixture, 'scripts', file));
   }
   const dependencies = join(fixture, 'node_modules');

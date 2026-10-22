@@ -3,7 +3,7 @@
 // reporter fixture proves truthful failure evidence, never real chaos coverage.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
@@ -21,7 +21,8 @@ function files(directory: string): string[] {
 
 function copyPhysicalToolInputs(source: string, destination: string): void {
   const root = realpathSync.native(source);
-  const validate = (path: string, ancestors: ReadonlySet<string>): void => {
+  const inputs: { source: string; destination: string; directory: boolean }[] = [];
+  const validate = (path: string, output: string, ancestors: ReadonlySet<string>): void => {
     const info = lstatSync(path), target = realpathSync.native(path), within = relative(root, target);
     if (isAbsolute(within) || within === '..' || within.startsWith(`..${sep}`)) {
       throw new Error('fixture tool input resolves outside the original dependency root');
@@ -32,14 +33,28 @@ function copyPhysicalToolInputs(source: string, destination: string): void {
     const physical = info.isSymbolicLink() ? statSync(path) : info;
     if (physical.isDirectory()) {
       if (ancestors.has(target)) throw new Error('fixture tool input contains a directory link cycle');
+      inputs.push({ source: target, destination: output, directory: true });
       const next = new Set(ancestors).add(target);
-      for (const name of readdirSync(path)) validate(join(path, name), next);
-    } else if (!physical.isFile()) throw new Error('fixture tool input must resolve to a regular file or directory');
+      for (const name of readdirSync(target)) validate(join(target, name), join(output, name), next);
+    } else if (physical.isFile()) inputs.push({ source: target, destination: output, directory: false });
+    else throw new Error('fixture tool input must resolve to a regular file or directory');
   };
-  // Resolve and validate the complete pinned graph before cp follows any link.
-  // Keep every copied byte as a regular artifact for the outer Closing scan.
-  validate(root, new Set());
-  cpSync(root, destination, { recursive: true, dereference: true });
+  const validatePhysical = (path: string): void => {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) {
+      throw new Error('fixture tool copy must contain only physical regular files and directories');
+    }
+    if (info.isDirectory()) for (const name of readdirSync(path)) validatePhysical(join(path, name));
+  };
+  // Validate the complete pinned graph before copying only its canonical inputs.
+  // Explicit file/directory writes leave no links for the outer Closing scan.
+  validate(root, destination, new Set());
+  if (existsSync(destination)) validatePhysical(destination);
+  for (const input of inputs) {
+    if (input.directory) mkdirSync(input.destination, { recursive: true });
+    else copyFileSync(input.source, input.destination);
+  }
+  validatePhysical(destination);
 }
 
 it('CP-033/034 without a live plan the chaos command selects its existing fake-node matrix and excludes live references', () => {
