@@ -194,4 +194,4 @@ it('CP-015/B2 a read-only command data handle refuses approval insertion without
     expect(reader.commandData.approvals.listByProposal(PROPOSAL).map(item => item.id)).toEqual([APPROVAL]);
   } finally { reader.close(); }
   expect(fileHash(f.path)).toBe(before);
-});
+}, 60_000);

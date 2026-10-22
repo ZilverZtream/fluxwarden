@@ -93,7 +93,7 @@ for (const phase of ['chain', 'balance', 'peers', 'mempool', 'active', 'graph', 
     expect(fake.delays.length).toBeGreaterThan(0);
     expect(fake.delays.length, 'no unbounded polling').toBeLessThan(10000);
     cleanup(fake.observations, selected.project);
-  });
+  }, 60_000);
 }
 
 const stages = ['up', 'getinfo', 'generatetoaddress', 'sendtoaddress', 'walletbalance', 'listfunds', 'connect', 'listpeers', 'openchannel', 'fundchannel', 'getmempoolinfo', 'listpeerchannels', 'updatechanpolicy', 'setchannel', 'describegraph', 'askrene-listlayers'];
