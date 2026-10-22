@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, childEnv, readText, repoRoot } from '../helpers/cli.js';
 import { testRoot } from '../helpers/env.js';
@@ -557,3 +558,211 @@ writeFileSync(join(scratch, 'custody-removal-control.json'), JSON.stringify({ ma
   expect(!published.includes(original) && !published.includes(original.toString('hex')) && !published.includes(original.toString('base64')),
     'safe receipts and diagnostics disclose no runtime source value').toBe(true);
 });
+
+// D29 owner-delegated failure-diagnostic contract: optional details contains
+// bounded report metadata and hashed exceptions, never report strings. These
+// exercise the public command and its real retained report, not a parser import.
+function failureDetails(result: { stdout: string; stderr: string }): Record<string, unknown> {
+  const envelopes = [result.stdout, result.stderr].flatMap(stream => stream.split(/\r?\n/).flatMap(line => {
+    try {
+      const value = JSON.parse(line) as unknown;
+      return value !== null && typeof value === 'object' && 'details' in value ? [asRecord(value, 'failure envelope')] : [];
+    } catch { return []; }
+  }));
+  expect(envelopes.length, 'one public failure envelope carries bounded diagnostic metadata').toBe(1);
+  const details = asRecord(envelopes[0]?.['details'], 'safe failure details');
+  expect(Array.isArray(details['reports']) && Array.isArray(details['errors']), 'diagnostics use fixed report and error arrays').toBe(true);
+  return details;
+}
+function failureReport(details: Record<string, unknown>): Record<string, unknown> {
+  const reports = records(details['reports'], 'safe report metadata').filter(row => row['report'] === 'vitest-harness.json');
+  expect(reports.length, 'the report is identified by its fixed basename').toBe(1);
+  return reports[0] ?? {};
+}
+function diagnosticFixture() {
+  const f = fixture(), relativeFile = 'test/diagnostic.test.mjs';
+  const vitest = pathToFileURL(join(repoRoot, 'node_modules/vitest/dist/index.js')).href;
+  writeFileSync(join(f.root, relativeFile), `import { expect, it } from ${JSON.stringify(vitest)};
+it('bounded passing control', () => expect(true).toBe(true));
+it('bounded failure control', () => {
+  throw Object.assign(new Error('bounded fixture failure'), { code: 'ETIMEDOUT' });
+});\n`);
+  writeFileSync(join(f.root, 'vitest.config.mjs'), `export default { test: { include: ['${relativeFile}'],
+allowOnly: false, passWithNoTests: false, maxWorkers: 1, fileParallelism: false } };\n`);
+  for (const args of [['add', '--', relativeFile, 'vitest.config.mjs'],
+    ['-c', 'user.name=CI diagnostic fixture', '-c', 'user.email=fixture@invalid', '-c', 'commit.gpgsign=false',
+      'commit', '--quiet', '-m', 'tracked diagnostic test source']]) {
+    const result = spawnSync('git', args, { cwd: f.root, env: f.env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    expect(result.status, 'diagnostic source provenance uses explicit tracked fixture inputs').toBe(0);
+  }
+  return Object.assign(f, { relativeFile, reportPath: join(f.evidence, 'vitest-harness.json') });
+}
+
+it('CP-044/CI-DIAGNOSTIC actual failed Vitest report exposes counts and hashes with a tracked source frame', () => {
+  const f = diagnosticFixture();
+  f.script(`const { spawnSync } = await import('node:child_process');
+const run = spawnSync(process.execPath, ${JSON.stringify([join(repoRoot, 'scripts/ci-test-driver.mjs'), 'run',
+    '--config', join(f.root, 'vitest.config.mjs'), '--root', f.root, '--maxWorkers=1', '--fileParallelism=false',
+    '--reporter=json', `--outputFile.json=${f.reportPath}`])},
+ { cwd: ${JSON.stringify(f.root)}, env: process.env, encoding: 'utf8', windowsHide: true, timeout: 10000 });
+process.stdout.write(run.stdout ?? ''); process.stderr.write(run.stderr ?? '');
+writeFileSync(join(evidence, 'driver-status.json'), JSON.stringify({ status: run.status, signal: run.signal, error: run.error?.name ?? null }));
+writeFileSync(join(scratch, 'owned.db'), bytes);`, 1);
+  const result = f.invoke();
+  expect(result.error, 'actual worker and capture retain their original deadline').toBeUndefined();
+  expect(result.status, 'the real failing test exit remains the command result').toBe(1);
+  expect(JSON.parse(readFileSync(join(f.evidence, 'driver-status.json'), 'utf8')) as unknown).toEqual({ status: 1, signal: null, error: null });
+  const reportBytes = readFileSync(f.reportPath), original = asRecord(JSON.parse(reportBytes.toString()) as unknown, 'actual failed report');
+  expect({ passed: original['numPassedTests'], failed: original['numFailedTests'], pending: original['numPendingTests'] })
+    .toEqual({ passed: 1, failed: 1, pending: 0 });
+  const failures = records(records(original['testResults'], 'actual suites')[0]?.['assertionResults'], 'actual assertions')
+    .filter(row => row['status'] === 'failed');
+  expect(failures.length).toBe(1);
+  const failed = failures[0] ?? {}, messages = failed['failureMessages'];
+  if (!Array.isArray(messages) || !messages.every(message => typeof message === 'string')) throw new Error('actual failure messages are required');
+  expect(f.receipt()['result']).toMatchObject({ exitCode: 1, leakFree: false, policySatisfied: false });
+  const verification = f.invoke(true);
+  expect(verification.status !== null && verification.status !== 0, 'actual failed-report diagnostics cannot excuse the deliberate source disclosure').toBe(true);
+  const metadata = failureReport(failureDetails(result));
+  expect(metadata).toMatchObject({ status: 'OK', passed: 1, failed: 1, pending: 0, sha256: digest(reportBytes) });
+  const rows = records(metadata['failures'], 'failed case metadata');
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ titleSha256: digest(String(failed['fullName'])), messageSha256: digest(messages.join('\n')),
+    file: f.relativeFile, line: 4 });
+  expect(Number.isSafeInteger(rows[0]?.['column']) && Number(rows[0]?.['column']) > 0, 'actual tracked source column is a bounded positive integer').toBe(true);
+  expect(JSON.stringify(metadata).includes('bounded fixture failure') || JSON.stringify(metadata).includes('bounded failure control')
+    || JSON.stringify(metadata).includes(f.root), 'raw title, exception and absolute frame path remain private').toBe(false);
+}, 15_000);
+
+it('CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames cannot become public source paths', () => {
+  const f = diagnosticFixture(), marker = 'REPLACE_FIXTURE_SECRET';
+  const suites = Array.from({ length: 17 }, (_, index) => {
+    const path = index === 0 ? `${f.root}/../${marker}/escape.test.mjs` : `${f.root}/test/${marker}-${String(index)}.test.mjs`;
+    return { name: path, status: 'failed', assertionResults: [{ fullName: `${marker} title ${String(index)}`, title: `${marker} title ${String(index)}`,
+      status: 'failed', failureMessages: [`Error: ENOENT: ${marker} private message UNKNOWN_FIXTURE_CODE\n    at ${path}:4:9`] }] };
+  });
+  const template = { numPassedTests: 0, numFailedTests: 17, numPendingTests: 0, success: false, testResults: suites };
+  const reportBytes = Buffer.from(JSON.stringify(template).replaceAll(marker, f.seed.toString('hex')));
+  // Known synthetic poison stays inner EGRESS. Only these exact original bytes
+  // and retained copies belong to the outer fixture's prospective INPUT setup.
+  declareFixtureCapture(f.capture, [], [{ path: f.reportPath, bytes: reportBytes }]);
+  f.script(`const report = JSON.parse(${JSON.stringify(JSON.stringify(template))}.replaceAll(${JSON.stringify(marker)}, bytes.toString('hex')));
+writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 7);
+  const result = f.invoke(), receipt = f.receipt(), verify = f.invoke(true);
+  expect(result.error).toBeUndefined();
+  expect(result.status, 'diagnostics preserve the original child failure').toBe(7);
+  expect(receipt['result']).toMatchObject({ exitCode: 7, complete: true, leakFree: false, policySatisfied: false });
+  expect(verify.status !== null && verify.status !== 0, 'the genuine report disclosure still fails independent verification').toBe(true);
+  expect(readFileSync(f.reportPath).equals(reportBytes), 'the actual unsafe report remains privately retained').toBe(true);
+  const published = Buffer.from(result.stdout + result.stderr + verify.stdout + verify.stderr + JSON.stringify(receipt));
+  expect([f.seed, Buffer.from(f.seed.toString('hex')), Buffer.from(f.seed.toString('base64'))].every(bytes => !published.includes(bytes)),
+    'synthetic registered secrets in title, message and path never appear in public channels').toBe(true);
+  const metadata = failureReport(failureDetails(result));
+  expect(metadata).toMatchObject({ status: 'OK', passed: 0, failed: 17, pending: 0, sha256: digest(reportBytes) });
+  const rows = records(metadata['failures'], 'bounded poisoned case metadata');
+  expect(rows, 'failure diagnostics have the original fixed sixteen-case bound').toHaveLength(16);
+  expect(rows.every(row => row['file'] === null && row['line'] === null && row['column'] === null),
+    'escaping and untracked report frames cannot identify a trusted source location').toBe(true);
+  expect(rows.every(row => JSON.stringify(row['codes']) === JSON.stringify(['ENOENT'])), 'only finite known error codes may be emitted').toBe(true);
+  const first = suites[0]?.assertionResults[0];
+  expect(rows[0]).toMatchObject({ titleSha256: digest(String(first?.fullName).replaceAll(marker, f.seed.toString('hex'))),
+    messageSha256: digest((first?.failureMessages ?? []).join('\n').replaceAll(marker, f.seed.toString('hex'))) });
+}, 15_000);
+
+for (const status of ['INVALID', 'OVERSIZE', 'MISSING'] as const) {
+  it(`CP-044/CI-DIAGNOSTIC ${status} report cannot change original failure receipt or verification`, () => {
+    const f = fixture();
+    const body = status === 'MISSING' ? '' : status === 'INVALID' ? "writeFileSync(join(evidence, 'vitest-harness.json'), '{');"
+      : "writeFileSync(join(evidence, 'vitest-harness.json'), ' '.repeat(16 * 1024 * 1024 + 1));";
+    f.script(body, 7);
+    const result = f.invoke();
+    expect(result.error, 'diagnostic parsing retains the ordinary capture deadline').toBeUndefined();
+    expect(result.status, 'diagnostic-only refusal does not replace the original child failure').toBe(7);
+    expect(f.receipt()['result']).toMatchObject({ exitCode: 7, complete: true, leakFree: true, policySatisfied: true });
+    expect(f.invoke(true).status, 'report diagnostic status cannot alter independent evidence verification').toBe(0);
+    const metadata = failureReport(failureDetails(result));
+    expect(metadata['status']).toBe(status);
+    expect(['passed', 'failed', 'pending'].every(key => metadata[key] === undefined || metadata[key] === null),
+      'unvalidated reports cannot publish invented numeric counts').toBe(true);
+  }, 15_000);
+}
+
+it('CP-044/CI-DIAGNOSTIC real missing-receipt exception exposes only finite codes and hashed error data', () => {
+  const f = fixture(), receiptPath = join(f.capture, 'receipt.json');
+  let expectedMessage = '';
+  try { readFileSync(receiptPath); } catch (error) { expectedMessage = (error as Error).message; }
+  const result = f.invoke(true);
+  expect(result.error).toBeUndefined();
+  expect(result.status !== null && result.status !== 0, 'verification still refuses genuinely absent evidence').toBe(true);
+  expect(existsSync(receiptPath), 'diagnostics cannot fabricate a replacement receipt').toBe(false);
+  const errors = records(failureDetails(result)['errors'], 'bounded exception metadata');
+  const missing = errors.find(row => row['code'] === 'ENOENT');
+  expect(missing, 'an actual filesystem exception is useful without publishing its raw strings').toMatchObject({
+    name: 'Error', code: 'ENOENT', messageSha256: digest(expectedMessage), pathSha256: digest(receiptPath) });
+  const frame = missing?.['frame'];
+  if (frame !== null) {
+    const source = asRecord(frame, 'public capture source frame');
+    expect(source['file']).toBe('scripts/ci-capture.mjs');
+    expect(Number.isSafeInteger(source['line']) && Number(source['line']) > 0
+      && Number.isSafeInteger(source['column']) && Number(source['column']) > 0).toBe(true);
+  }
+  const safe = result.stdout + result.stderr;
+  expect(safe.includes(expectedMessage) || safe.includes(receiptPath) || safe.includes(f.root), 'raw exception message and private paths remain private').toBe(false);
+}, 15_000);
+
+it('CP-044/CI-DIAGNOSTIC clean passing capture keeps failure diagnostics absent', () => {
+  const f = fixture();
+  f.script("writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify({ numPassedTests: 1, numFailedTests: 0, numPendingTests: 0, success: true, testResults: [] }));");
+  const result = f.invoke(), verify = f.invoke(true);
+  expect(result.error).toBeUndefined();
+  expect(verify.error).toBeUndefined();
+  expect(result.status).toBe(0);
+  expect(f.receipt()['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: true, policySatisfied: true });
+  expect(verify.status).toBe(0);
+  expect(/"details"\s*:/.test(result.stdout + result.stderr + verify.stdout + verify.stderr), 'passing command and verification retain their existing public output').toBe(false);
+}, 15_000);
+
+it('CP-044/CI-DIAGNOSTIC registered numeric source cannot escape through diagnostic counts or frame coordinates', () => {
+  const f = diagnosticFixture();
+  // This benign random sixteen-digit decimal is an independently registered
+  // SOURCE. A safe integer alone is not authority to publish its original bytes.
+  const numeric = `1${[...randomBytes(15)].map(value => String(value % 10)).join('')}`;
+  const sourceBytes = Buffer.from(numeric), numericSource = join(f.sourceRoot, 'numeric-control.bin');
+  expect(Number.isSafeInteger(Number(numeric)), 'the control exercises accepted finite integer syntax').toBe(true);
+  const frame = `Error: bounded numeric control\n    at ${join(f.root, f.relativeFile)}:${numeric}:${numeric}`;
+  const report = { numPassedTests: Number(numeric), numFailedTests: 1, numPendingTests: 0, success: false,
+    testResults: [{ name: join(f.root, f.relativeFile), status: 'failed', assertionResults: [{
+      fullName: 'bounded numeric control', title: 'bounded numeric control', status: 'failed', failureMessages: [frame],
+      location: { line: Number(numeric), column: Number(numeric) },
+    }] }] };
+  declareFixturePaths([numericSource]);
+  declareFixtureCapture(f.capture, [sourceBytes], [{ path: f.reportPath, bytes: Buffer.from(JSON.stringify(report)) }]);
+  writeFileSync(numericSource, sourceBytes, { mode: 0o600 });
+  f.script(`const numeric = readFileSync(join(sourceRoot, 'numeric-control.bin'), 'utf8');
+const file = ${JSON.stringify(join(f.root, f.relativeFile))};
+const report = { numPassedTests: Number(numeric), numFailedTests: 1, numPendingTests: 0, success: false,
+ testResults: [{ name: file, status: 'failed', assertionResults: [{
+  fullName: 'bounded numeric control', title: 'bounded numeric control', status: 'failed',
+  failureMessages: ['Error: bounded numeric control\\n    at ' + file + ':' + numeric + ':' + numeric],
+  location: { line: Number(numeric), column: Number(numeric) }
+ }] }] };
+writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 7);
+  const result = f.invoke();
+  expect(result.error).toBeUndefined();
+  expect(result.status, 'diagnostics preserve the original child failure').toBe(7);
+  expect(f.receipt()['result']).toMatchObject({ exitCode: 7, complete: true, leakFree: false, policySatisfied: false });
+  expect(records(f.receipt()['sources'], 'actual runtime SOURCE union').some(row => row['purpose'] === 'INPUT' && row['sha256'] === digest(sourceBytes)),
+    'the numeric control is an actual capture SOURCE, not only a test-side matcher').toBe(true);
+  expect(readFileSync(f.reportPath).equals(Buffer.from(JSON.stringify(report))), 'the controlled report retains its actual original numeric fields').toBe(true);
+  // A real missing-receipt verification must also sanitize report diagnostics;
+  // the retained report is not made safe by the earlier command's failure.
+  rmSync(join(f.capture, 'receipt.json'));
+  const verification = f.invoke(true);
+  expect(verification.error).toBeUndefined();
+  expect(verification.status !== null && verification.status !== 0, 'verification still refuses absent evidence').toBe(true);
+  expect(existsSync(join(f.capture, 'receipt.json')), 'diagnostics cannot replace missing evidence').toBe(false);
+  const published = Buffer.from(result.stdout + result.stderr + verification.stdout + verification.stderr);
+  expect([sourceBytes, Buffer.from(sourceBytes.toString('hex')), Buffer.from(sourceBytes.toString('base64'))]
+    .every(value => !published.includes(value)), 'all public metadata fields retain SOURCE confidentiality, including numbers and validated frames').toBe(true);
+  expect(failureReport(failureDetails(verification))['status'], 'claimed counts inconsistent with the actual assertion population cannot be OK').not.toBe('OK');
+}, 15_000);

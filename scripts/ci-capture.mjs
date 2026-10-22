@@ -12,9 +12,109 @@ const write = (path, value) => fs.writeFileSync(path, JSON.stringify(value), { m
 const read = path => JSON.parse(fs.readFileSync(path, 'utf8'));
 const digest = path => hash(fs.readFileSync(path));
 const secretContext = (row, redact) => ({ path: redact(row.path), ...(redact(row.path) !== row.path ? { pathSha256: hash(row.path) } : {}), sha256: row.sha256, keyId: row.keyId, authorizationSha256: row.authorizationSha256 });
-function diagnostic(phase, result, reasons) {
-  process.stderr.write(JSON.stringify({ stage: 'ci-capture', phase, exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 1,
-    complete: result.complete === true, leakFree: result.leakFree === true, policySatisfied: result.policySatisfied === true, reasons }) + '\n');
+let diagnosticContext;
+const diagnosticClasses = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError']);
+const diagnosticCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'EEXIST', 'ENOTDIR', 'EISDIR', 'ENAMETOOLONG', 'ELOOP', 'ENOSPC', 'EIO', 'ENOBUFS', 'ENOMEM', 'ETIMEDOUT', 'ERR_ASSERTION', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER']);
+const diagnosticInteger = value => Number.isSafeInteger(value) && value >= 0;
+const diagnosticLocation = value => diagnosticInteger(value) && value > 0 && value <= 10_000_000;
+function diagnosticFrame(text, file, root) {
+  if (typeof text !== 'string' || text.length > 1_048_576) return undefined;
+  const absolute = resolve(root, file);
+  for (const name of [absolute, absolute.split(sep).join('/'), pathToFileURL(absolute).href, file]) {
+    const at = text.indexOf(name + ':');
+    if (at < 0) continue;
+    const match = /^(\d{1,7})(?::(\d{1,7}))?(?!\d)/.exec(text.slice(at + name.length + 1));
+    if (match && diagnosticLocation(Number(match[1]))) return { file, line: Number(match[1]), column: diagnosticLocation(Number(match[2])) ? Number(match[2]) : null };
+  }
+}
+function diagnosticError(error) {
+  try {
+    const frame = diagnosticFrame(error?.stack, 'scripts/ci-capture.mjs', dirname(dirname(script)));
+    return { name: diagnosticClasses.has(error?.name) ? error.name : 'UNKNOWN', code: diagnosticCodes.has(error?.code) ? error.code : null,
+      messageSha256: hash(typeof error?.message === 'string' ? error.message : typeof error === 'string' ? error : ''),
+      pathSha256: typeof error?.path === 'string' ? hash(error.path) : null,
+      frame: frame ?? null };
+  } catch { return { name: 'UNKNOWN', code: null, messageSha256: hash(''), pathSha256: null, frame: null }; }
+}
+function diagnosticReport(kind) {
+  const context = diagnosticContext;
+  const reportName = 'vitest-' + kind + '.json';
+  let reportSha256 = null;
+  const unavailable = status => ({ report: reportName, status, sha256: reportSha256, failures: [] });
+  if (typeof context?.evidenceDir !== 'string' || !context.tests) return unavailable('UNREADABLE');
+  const path = join(context.evidenceDir, reportName);
+  let fd;
+  try {
+    // Reports are untrusted data. Bound the read even if the file grows, and
+    // refuse links or a redirected evidence directory before reading bytes.
+    const canonical = value => process.platform === 'win32' ? value.toLowerCase() : value;
+    if (canonical(fs.realpathSync.native(path)) !== canonical(resolve(path))) return unavailable('UNREADABLE');
+    const before = fs.lstatSync(path);
+    if (!before.isFile() || before.isSymbolicLink()) return unavailable('UNREADABLE');
+    if (before.size > 16_777_216) return unavailable('OVERSIZE');
+    fd = fs.openSync(path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const opened = fs.fstatSync(fd);
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) return unavailable('UNREADABLE');
+    const bytes = Buffer.alloc(before.size + 1);
+    let length = 0, count;
+    while (length < bytes.length && (count = fs.readSync(fd, bytes, length, bytes.length - length, null))) length += count;
+    const after = fs.fstatSync(fd);
+    if (length !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) return unavailable('UNREADABLE');
+    reportSha256 = hash(bytes.subarray(0, length));
+    const report = JSON.parse(bytes.subarray(0, length).toString('utf8'));
+    const totals = {};
+    for (const key of ['numPassedTests', 'numFailedTests', 'numPendingTests']) {
+      if (!diagnosticInteger(report?.[key])) return unavailable('INVALID');
+      totals[key] = report[key];
+    }
+    if (report.numTotalTests !== undefined && (!diagnosticInteger(report.numTotalTests) || report.numPassedTests + report.numFailedTests + report.numPendingTests > report.numTotalTests)) return unavailable('INVALID');
+    if (!Array.isArray(report.testResults) || report.testResults.length > 20_000) return unavailable('INVALID');
+    const failed = [];
+    let assertions = 0;
+    for (const suite of report.testResults) {
+      if (typeof suite?.name !== 'string' || suite.name.length > 4096 || !Array.isArray(suite.assertionResults)) return unavailable('INVALID');
+      const claimedFile = relative(context.root, resolve(context.root, suite.name)).split(sep).join('/');
+      const file = context.tests.has(claimedFile) ? claimedFile : null;
+      assertions += suite.assertionResults.length;
+      if (assertions > 20_000) return unavailable('INVALID');
+      for (const test of suite.assertionResults) {
+        if (!['passed', 'failed', 'pending', 'skipped', 'todo', 'disabled'].includes(test?.status)) return unavailable('INVALID');
+        if (test.status !== 'failed') continue;
+        if (typeof test.fullName !== 'string' || !Array.isArray(test.failureMessages) || test.failureMessages.some(message => typeof message !== 'string')) return unavailable('INVALID');
+        if (failed.length >= 16) continue;
+        const frame = file ? test.failureMessages.map(message => diagnosticFrame(message, file, context.root)).find(Boolean)
+          ?? (diagnosticLocation(test.location?.line) ? { file, line: test.location.line, column: diagnosticLocation(test.location.column) ? test.location.column : null } : undefined) : undefined;
+        const codes = test.failureMessages.flatMap(message => {
+          const code = /^\w*Error \[([A-Z0-9_]+)\]:/.exec(message)?.[1] ?? /^\w*Error: ([A-Z0-9_]+):/.exec(message)?.[1];
+          return diagnosticCodes.has(code) ? [code] : [];
+        });
+        failed.push({ titleSha256: hash(test.fullName), messageSha256: hash(test.failureMessages.join('\n')), file, line: frame?.line ?? null, column: frame?.column ?? null, codes: [...new Set(codes)] });
+      }
+    }
+    if (Object.values(totals).some(count => count > assertions)) return unavailable('INVALID');
+    return { report: reportName, status: 'OK', passed: totals.numPassedTests, failed: totals.numFailedTests, pending: totals.numPendingTests, sha256: reportSha256, failures: failed };
+  } catch (error) { return unavailable(error?.code === 'ENOENT' ? 'MISSING' : error?.code ? 'UNREADABLE' : 'INVALID'); }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* Diagnostics never replace the original failure. */ } } }
+}
+function safeDiagnostic(value) {
+  try {
+    const context = diagnosticContext, text = JSON.stringify(value);
+    const options = { root: context.root, sentinels: join(context.root, 'test/sentinels.json') };
+    // A config under verification must never replace the caller's actual union.
+    if (findLeaks({ ...options, sentinelDir: context.environment.sentinelDir, commandOutput: text })) return null;
+    if (context.sentinelDir !== context.environment.sentinelDir && findLeaks({ ...options, sentinelDir: context.sentinelDir, commandOutput: text })) return null;
+    const retained = join(context.capture, 'private', 'sources');
+    if (fs.existsSync(retained) && findLeaks({ ...options, sentinelDir: retained, commandOutput: text })) return null;
+    return text;
+  } catch { return null; }
+}
+function diagnostic(phase, result, reasons, errors = []) {
+  const base = { stage: 'ci-capture', phase, exitCode: Number.isInteger(result.exitCode) ? result.exitCode : 1,
+    complete: result.complete === true, leakFree: result.leakFree === true, policySatisfied: result.policySatisfied === true, reasons };
+  // Public-looking paths and numeric metadata can themselves be literal sources.
+  // Guard the complete JSON, including keys and hashes, before any emission.
+  const safe = safeDiagnostic({ ...base, details: { reports: ['harness', 'product'].map(diagnosticReport), errors } }) ?? safeDiagnostic(base);
+  if (safe !== null) process.stderr.write(safe + '\n');
 }
 function git(root, args, env = process.env, input) {
   const result = spawnSync('git', ['-C', root, ...args], { env, input, encoding: 'utf8', windowsHide: true });
@@ -206,6 +306,8 @@ async function verify(root, capture) {
   if (digest(join(capture, 'custody.json')) !== receipt.custodySha256) throw new Error('capture custody record changed');
   if (!same(custody(capture, config), expected)) throw new Error('capture custody changed');
   retainedSourceIdentities(capture);
+  diagnosticContext.evidenceDir = config.evidenceDir;
+  diagnosticContext.sentinelDir = config.sentinelDir;
   if (!receipt.result.complete || !receipt.result.policySatisfied) {
     diagnostic('verify', receipt.result, [!receipt.result.complete ? 'recorded_incomplete' : 'recorded_policy_failure']);
     return 1;
@@ -253,11 +355,14 @@ async function captureCommand(root, capture, command) {
   const anchoredRoots = [...roots, capture, join(capture, 'private'), ...['bytes', 'records', 'sources', 'identities', 'authorizations'].map(name => join(capture, 'private', name))];
   const rootIdentities = parentBindings(anchoredRoots);
   const config = { root, capture, roots, outputs, rootIdentities, initialDeclarations: [...declarationSet(resolve(env.FLUXWARDEN_TEST_TMP))], registered: sourcePaths, sentinelDir: resolve(env.FLUXWARDEN_SENTINEL_DIR), testTmp: resolve(env.FLUXWARDEN_TEST_TMP), evidenceDir: resolve(env.FLUXWARDEN_EVIDENCE_DIR) };
+  diagnosticContext.evidenceDir = config.evidenceDir;
+  diagnosticContext.sentinelDir = config.sentinelDir;
   write(join(capture, 'private', 'config.json'), config);
   write(join(capture, 'private', 'sentinels.json'), []);
   const before = identity(root, capture);
   let complete = before.dependencyValid;
   const reasons = new Set(complete ? [] : ['dependency_identity']);
+  const errors = [];
   const initialSources = inventory([...sourcePaths, config.sentinelDir]);
   for (const row of initialSources) retain(capture, row.path, 'INPUT');
   const setupPaths = ['npm-install.stdout.log', 'npm-install.stderr.log', 'npm-install.json', 'npm-install-logs'].map(name => join(config.evidenceDir, name)).filter(path => fs.existsSync(path));
@@ -273,7 +378,7 @@ async function captureCommand(root, capture, command) {
       cwd: root, env: { ...env, FLUXWARDEN_CI_CAPTURE: capture }, stdio: ['ignore', stdout, stderr], windowsHide: true,
     });
     exitCode = await new Promise(resolveExit => {
-      child.once('error', () => { complete = false; reasons.add('child_spawn'); resolveExit(1); });
+      child.once('error', error => { complete = false; reasons.add('child_spawn'); errors.push({ stage: 'child_spawn', ...diagnosticError(error) }); resolveExit(1); });
       child.once('close', code => resolveExit(code ?? 1));
     });
     }
@@ -294,7 +399,7 @@ async function captureCommand(root, capture, command) {
     for (const path of captureEgress(capture, records(capture, config))) retain(capture, path, 'EGRESS');
     if (fs.existsSync(join(capture, 'private', 'incomplete'))) { complete = false; reasons.add('source_lifecycle'); }
     retainedSourceIdentities(capture);
-  } catch { complete = false; reasons.add('closing_inventory'); }
+  } catch (error) { complete = false; reasons.add('closing_inventory'); errors.push({ stage: 'closing_inventory', ...diagnosticError(error) }); }
   const retained = records(capture, config);
   for (const record of retained.filter(row => row.purpose === 'INPUT' || row.purpose === 'SECRET_OUTPUT')) {
     const source = fs.readFileSync(join(capture, 'private', 'bytes', record.sha256));
@@ -309,7 +414,7 @@ async function captureCommand(root, capture, command) {
     policySatisfied = outputsPolicy.valid && checked.noUnexpectedLeaks;
     if (!policySatisfied) reasons.add('output_leak');
   }
-  catch { complete = false; reasons.add('output_scan'); }
+  catch (error) { complete = false; reasons.add('output_scan'); errors.push({ stage: 'output_scan', ...diagnosticError(error) }); }
   const redact = sentinelRedactor({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources') });
   const context = row => ({ path: redact(row.path), ...(redact(row.path) !== row.path ? { pathSha256: hash(row.path) } : {}), sha256: row.sha256 });
   const declared = declarationSet(config.testTmp);
@@ -317,7 +422,7 @@ async function captureCommand(root, capture, command) {
   const artifacts = retained.filter(row => row.purpose !== 'INPUT').map(row => ({ ...context(row), purpose: row.purpose === 'SECRET_OUTPUT' || outputsPolicy.approved.some(output => output.path === row.path && output.sha256 === row.sha256) ? 'SECRET_OUTPUT' : row.path === join(config.testTmp, 'declared-out.txt') ? 'DECLARATION' : authorizedDeclaration(capture, config, declared, row.path) ? 'INPUT' : 'EGRESS' }));
   let census;
   try { census = custody(capture, config); }
-  catch { complete = false; census = []; reasons.add('custody_inventory'); }
+  catch (error) { complete = false; census = []; reasons.add('custody_inventory'); errors.push({ stage: 'custody_inventory', ...diagnosticError(error) }); }
   fs.writeFileSync(join(capture, 'custody.json'), JSON.stringify(census), { mode: 0o600 });
   const receipt = { scope: 'observed retained closing artifacts, full command streams, registered source lifetime and authenticated dependency inputs; prospectively authorized canonical operator-key outputs retain literal matches with separate policy acceptance; no universal temporary-file history claim', boundarySha256: '8f4e83b62bad4940be142239352e443788d778d2ad10a24e76400bdf40f7bc27', parentBoundarySha256: '42784be10c0f54af383eb8005f0195db59f371081d504c9971fbb78dff6f9489', identity: { before, after }, result: { exitCode, complete, leakFree, policySatisfied, authorizedMatches }, sources, artifacts, secretOutputs: outputsPolicy.approved.map(row => secretContext(row, redact)), secretOutputMatches, custodySha256: digest(join(capture, 'custody.json')) };
   fs.writeFileSync(join(capture, 'receipt.json'), JSON.stringify(receipt), { mode: 0o600 });
@@ -325,12 +430,12 @@ async function captureCommand(root, capture, command) {
   fs.writeFileSync(join(capture, 'receipt.sha256'), JSON.stringify({ receiptSha256: digest(join(capture, 'receipt.json')), metadata }), { mode: 0o600 });
   try {
     if (findLeaks({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources'), paths: metadataPaths(capture) })) { leakFree = false; policySatisfied = false; reasons.add('metadata_leak'); }
-  } catch { complete = false; reasons.add('metadata_scan'); }
+  } catch (error) { complete = false; reasons.add('metadata_scan'); errors.push({ stage: 'metadata_scan', ...diagnosticError(error) }); }
   policySatisfied = complete && policySatisfied;
   receipt.result = { exitCode, complete, leakFree, policySatisfied, authorizedMatches };
   fs.writeFileSync(join(capture, 'receipt.json'), JSON.stringify(receipt), { mode: 0o600 });
   fs.writeFileSync(join(capture, 'receipt.sha256'), JSON.stringify({ receiptSha256: digest(join(capture, 'receipt.json')), metadata }), { mode: 0o600 });
-  if (exitCode || !complete || !policySatisfied) diagnostic('capture', receipt.result, [...reasons, ...(exitCode ? ['child_failure'] : [])]);
+  if (exitCode || !complete || !policySatisfied) diagnostic('capture', receipt.result, [...reasons, ...(exitCode ? ['child_failure'] : [])], errors);
   return exitCode || (complete && policySatisfied ? 0 : 1);
 }
 async function main(args) {
@@ -338,9 +443,14 @@ async function main(args) {
   if (verification) args = args.slice(1);
   if (args[0] !== '--root' || !args[1] || args[2] !== '--capture-dir' || !args[3] || (verification ? args.length !== 4 : args[4] !== '--')) return 2;
   const root = resolve(args[1]), capture = resolve(args[3]);
+  let tests;
+  try { tests = new Set(git(root, ['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', 'test']).split('\0').filter(path => path.length <= 512 && /^test\/[A-Za-z0-9_./-]+\.test\.[cm]?[jt]sx?$/.test(path))); }
+  catch { /* A diagnostic without a trusted tracked-file allowlist emits no report fields. */ }
+  const environment = Object.freeze({ evidenceDir: process.env.FLUXWARDEN_EVIDENCE_DIR, sentinelDir: process.env.FLUXWARDEN_SENTINEL_DIR });
+  diagnosticContext = { root, capture, tests, environment, ...environment };
   return verification ? verify(root, capture) : captureCommand(root, capture, args.slice(5));
 }
 if (process.argv[1] && resolve(process.argv[1]) === script) {
   try { process.exitCode = await main(process.argv.slice(2)); }
-  catch { diagnostic(process.argv[2] === 'verify' ? 'verify' : 'capture', {}, ['operation_failed']); process.exitCode = 1; }
+  catch (error) { diagnostic(process.argv[2] === 'verify' ? 'verify' : 'capture', {}, ['operation_failed'], [{ stage: 'operation_failed', ...diagnosticError(error) }]); process.exitCode = 1; }
 }
