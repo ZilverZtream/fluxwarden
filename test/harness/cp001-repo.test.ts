@@ -176,7 +176,7 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
 
   const captureCommand = (run: string): string => run.replace(
     /^node scripts\/ci-capture\.mjs --root "\$PWD" --capture-dir "\$FLUXWARDEN_CI_CAPTURE_DIR" -- /, '');
-  const jobPrefix = /^node scripts\/ci-job\.mjs(?: --harness| \$\{\{ matrix\.shard == 'core-1' && '--harness' \|\| '' \}\})? -- /;
+  const jobPrefix = /^node scripts\/ci-job\.mjs(?: --harness-before-final| \$\{\{ matrix\.shard == 'core-1' && '--harness-before-final' \|\| '' \}\})? -- /;
   const commandsOf = (step: { [key: string]: Yaml }): string[] => captureCommand(typeof step['run'] === 'string' ? step['run'].trim() : '')
     .replace(jobPrefix, '').split(/\s+--next\s+/);
   const commandOf = (step: { [key: string]: Yaml }): string => {
@@ -250,9 +250,9 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     const productStep = ordered.find(s => kind(s) === 'product') ?? {};
     const wrapped = String(productStep['run']);
     expect(captureCommand(wrapped), 'one transparent finite wrapper encloses the job').not.toBe(wrapped);
-    const job = captureCommand(subst(wrapped, combo)).replace(/\$\{\{ matrix\.shard == 'core-1' && '--harness' \|\| '' \}\}/g,
-      combo['shard'] === 'core-1' ? '--harness' : '').replace(/\s+/g, ' ');
-    expect(job.startsWith(`node scripts/ci-job.mjs ${harness ? '--harness ' : ''}-- node scripts/ci-install.mjs verify --root "$PWD" --next `), 'capture starts with the original installer failure gate and retains each shard harness selection').toBe(true);
+    const job = captureCommand(subst(wrapped, combo)).replace(/\$\{\{ matrix\.shard == 'core-1' && '--harness-before-final' \|\| '' \}\}/g,
+      combo['shard'] === 'core-1' ? '--harness-before-final' : '').replace(/\s+/g, ' ');
+    expect(job.startsWith(`node scripts/ci-job.mjs ${harness ? '--harness-before-final ' : ''}-- node scripts/ci-install.mjs verify --root "$PWD" --next `), 'capture starts with the original installer failure gate and retains each shard harness selection').toBe(true);
     const stages = commandsOf(productStep);
     expect(stages.slice(0, -1), 'all original preparation stages are inside capture in their original order').toEqual([
       'node scripts/ci-install.mjs verify --root "$PWD"', 'npm run lint', 'npm run build', 'node scripts/ci-database-check.mjs',
@@ -619,4 +619,66 @@ it('CP-009/B4 npm run fixtures:record without an owner is a usage refusal, not t
   expect(r.status).toBe(2);
   expect(r.stdout).toBe('');
   expect(r.stderr).not.toContain('this capability is not yet available');
+});
+
+// Owner-delegated orchestration contract: the explicit alternative flag runs the
+// full harness after prerequisites and before the final product command, then
+// accepts both reports together. The existing --harness ordering stays covered above.
+// Bugs caught: an unsupported flag, a duplicated/reordered stage, a failure that
+// allows a later stage, or final acceptance that omits either selected report.
+it('CP-044/REG-CI-ORDER selected harness runs before final product stage with failures propagated', () => {
+  const jobRoot = scratchDir('ci-job-harness-before-final');
+  mkdirSync(join(jobRoot, 'scripts'));
+  copyFileSync(join(repoRoot, 'scripts/no-pending.mjs'), join(jobRoot, 'scripts/no-pending-check.mjs'));
+  writeFileSync(join(jobRoot, 'scripts/no-pending.mjs'), `import { appendFileSync, writeFileSync } from 'node:fs';
+appendFileSync(process.env.CONTROL_TRACE, 'no-pending\\n');
+writeFileSync(process.env.CONTROL_TRACE + '.no-pending', JSON.stringify(process.argv.slice(2)));
+await import('./no-pending-check.mjs');
+`);
+  writeFileSync(join(jobRoot, 'package.json'), JSON.stringify({ name: 'owned-ci-job-order-control', version: '1.0.0', type: 'module',
+    scripts: { lint: 'node record.mjs lint', build: 'node record.mjs build', test: 'node record.mjs product', 'test:harness': 'node record.mjs harness' } }));
+  writeFileSync(join(jobRoot, 'scripts/ci-database-check.mjs'), "process.argv[2] = 'database'; await import('../record.mjs');\n");
+  writeFileSync(join(jobRoot, 'record.mjs'), `import { appendFileSync, copyFileSync, writeFileSync } from 'node:fs'; import { join } from 'node:path';
+const kind = process.argv[2], mode = process.env['CONTROL_' + kind.toUpperCase()];
+appendFileSync(process.env.CONTROL_TRACE, kind + '\\n');
+writeFileSync(process.env.CONTROL_TRACE + '.' + kind, JSON.stringify(process.argv.slice(3)));
+copyFileSync(join(process.env.CONTROL_REPORTS, mode === 'skip' ? 'skipped.json' : 'all-passed-a.json'), join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-' + kind + '.json'));
+process.exitCode = mode === 'fail' ? 7 : 0;
+`);
+  for (const [name, lint, build, database, harness, product, expected, trace] of [
+    ['all-pass', 'pass', 'pass', 'pass', 'pass', 'pass', 0, ['lint', 'build', 'database', 'harness', 'product', 'no-pending']],
+    ['harness-fails', 'pass', 'pass', 'pass', 'fail', 'pass', 7, ['lint', 'build', 'database', 'harness']],
+    ['product-fails', 'pass', 'pass', 'pass', 'pass', 'fail', 7, ['lint', 'build', 'database', 'harness', 'product']],
+    ['lint-fails', 'fail', 'pass', 'pass', 'pass', 'pass', 7, ['lint']],
+    ['build-fails', 'pass', 'fail', 'pass', 'pass', 'pass', 7, ['lint', 'build']],
+    ['database-fails', 'pass', 'pass', 'fail', 'pass', 'pass', 7, ['lint', 'build', 'database']],
+    ['harness-skips', 'pass', 'pass', 'pass', 'skip', 'pass', 1, ['lint', 'build', 'database', 'harness', 'product', 'no-pending']],
+    ['product-skips', 'pass', 'pass', 'pass', 'pass', 'skip', 1, ['lint', 'build', 'database', 'harness', 'product', 'no-pending']],
+  ] as const) {
+    const evidence = join(jobRoot, name), traceFile = join(evidence, 'trace.log');
+    mkdirSync(evidence);
+    const result = spawnSync(process.execPath, [...ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-job.mjs'), '--harness-before-final', '--',
+      'npm', 'run', 'lint', '--next', 'npm', 'run', 'build', '--next', 'node', 'scripts/ci-database-check.mjs', '--next',
+      'npm', 'test', '--', '--reporter=default', '--reporter=json', `--outputFile.json=${join(evidence, 'vitest-product.json')}`])], {
+      cwd: jobRoot, env: { ...childEnv(), FLUXWARDEN_EVIDENCE_DIR: evidence, CONTROL_LINT: lint, CONTROL_BUILD: build,
+        CONTROL_DATABASE: database, CONTROL_HARNESS: harness, CONTROL_PRODUCT: product,
+        CONTROL_TRACE: traceFile, CONTROL_REPORTS: join(repoRoot, 'test/fixtures/no-pending') },
+      encoding: 'utf8', windowsHide: true, timeout: 10_000,
+    });
+    expect(result.error, name).toBeUndefined();
+    expect(result.status, `${name}: the selected stages preserve failures and validate both reports`).toBe(expected);
+    expect(readFileSync(traceFile, 'utf8').trim().split('\n'), `${name}: every requested stage runs once in order and stops on failure`).toEqual(trace);
+    const reached: readonly string[] = trace;
+    if (reached.includes('harness')) {
+      const args: unknown = JSON.parse(readFileSync(traceFile + '.harness', 'utf8'));
+      expect(args, `${name}: full harness writes its selected report`).toContain(`--outputFile.json=${join(evidence, 'vitest-harness.json')}`);
+    }
+    if (reached.includes('no-pending')) {
+      const reports: unknown = JSON.parse(readFileSync(traceFile + '.no-pending', 'utf8'));
+      expect(reports, `${name}: final acceptance selects exactly two reports`).toHaveLength(2);
+      expect(reports, `${name}: final acceptance validates both product and harness reports`).toEqual(expect.arrayContaining([
+        join(evidence, 'vitest-product.json'), join(evidence, 'vitest-harness.json'),
+      ]));
+    }
+  }
 });

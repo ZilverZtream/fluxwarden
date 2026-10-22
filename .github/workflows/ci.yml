@@ -77,14 +77,14 @@ jobs:
       # The hosted Linux runners have two CPUs; four workers contend in timing-bound proofs.
       - name: Test Linux product
         if: always() && matrix.os == 'ubuntu-latest' && matrix.shard == 'core'
-        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --harness -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --harness-before-final -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
       # Separate Windows VMs keep native process and owner-lifecycle proofs from competing with core tests.
       - name: Test Windows core product
         env:
           FLUXWARDEN_CI_CORE_CONFIG: ${{ env.TEMP }}/vitest-windows-core.config.mjs
         if: always() && matrix.os == 'windows-latest' && startsWith(matrix.shard, 'core-')
         run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs ${{ matrix.shard == 'core-1' && '--harness' || '' }} -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next node scripts/ci-windows-core.mjs --next npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=1 --fileParallelism=false
+          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs ${{ matrix.shard == 'core-1' && '--harness-before-final' || '' }} -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next node scripts/ci-windows-core.mjs --next npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=1 --fileParallelism=false
           --shard=${{ matrix.coreShard }}
           --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
       - name: Test Windows native product

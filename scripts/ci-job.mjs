@@ -21,7 +21,8 @@ async function run(command, args) {
 }
 try {
   const args = process.argv.slice(2);
-  const harness = args[0] === '--harness';
+  const harnessBeforeFinal = args[0] === '--harness-before-final';
+  const harness = args[0] === '--harness' || harnessBeforeFinal;
   if (harness) args.shift();
   const reports = args[0] !== '--commands-only';
   if (!reports) args.shift();
@@ -31,14 +32,18 @@ try {
     if (arg === '--next' || arg === '--finally') commands.push({ args: [], always: arg === '--finally' });
     else commands.at(-1).args.push(arg);
   }
+  const runHarness = () => run('npm', ['run', 'test:harness', '--', '--maxWorkers=1', '--fileParallelism=false', '--reporter=default', '--reporter=json', '--outputFile.json=' + join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-harness.json')]);
   let result = 0;
-  for (const command of commands) {
+  for (const [index, command] of commands.entries()) {
     if (!command.args.length) throw new Error('CI stage required');
+    // Packaging proofs can rebuild dist; finish the harness before the final
+    // product stage establishes protected producer identities for capture.
+    if (result === 0 && harnessBeforeFinal && index === commands.length - 1) result = await runHarness();
     if (result !== 0 && !command.always) continue;
     const stage = await run(command.args[0], command.args.slice(1));
     if (result === 0) result = stage;
   }
-  if (result === 0 && harness) result = await run('npm', ['run', 'test:harness', '--', '--maxWorkers=1', '--fileParallelism=false', '--reporter=default', '--reporter=json', '--outputFile.json=' + join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-harness.json')]);
+  if (result === 0 && harness && !harnessBeforeFinal) result = await runHarness();
   if (result === 0 && reports) result = await run('node', ['scripts/no-pending.mjs', join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-product.json'), ...(harness ? [join(process.env.FLUXWARDEN_EVIDENCE_DIR, 'vitest-harness.json')] : [])]);
   process.exitCode = result;
 } catch { process.stderr.write('CI command failed\n'); process.exitCode = 1; }
