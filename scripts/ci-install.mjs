@@ -30,11 +30,11 @@ async function install(root) {
     if (!npm) throw new Error('setup npm unavailable');
     record.npmCliSha256 = digest(npm);
     record.nodeVersion = process.version;
-    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^npm_config_(?:userconfig|globalconfig|cache|logs_dir|update_notifier)$/i.test(name)));
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^npm_config_(?:userconfig|globalconfig|cache|logs_dir|update_notifier|audit)$/i.test(name)));
     const result = spawnSync(process.execPath, [npm, 'ci', '--ignore-scripts'], {
       cwd: root, windowsHide: true, timeout: 180_000, stdio: ['ignore', stdout, stderr],
       env: { ...env, NPM_CONFIG_USERCONFIG: userconfig, NPM_CONFIG_GLOBALCONFIG: globalconfig,
-        NPM_CONFIG_CACHE: cache, NPM_CONFIG_LOGS_DIR: logs, NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+        NPM_CONFIG_CACHE: cache, NPM_CONFIG_LOGS_DIR: logs, NPM_CONFIG_UPDATE_NOTIFIER: 'false', NPM_CONFIG_AUDIT: 'false',
         NODE_COMPILE_CACHE: join(cache, 'node-compile-cache') },
     });
     record.status = result.status;
