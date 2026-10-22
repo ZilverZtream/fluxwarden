@@ -110,6 +110,114 @@ process.exitCode = ${String(exitCode)};
   };
 }
 
+// Node 24.21 fs.link, fs.linkSync and fsPromises.link create a new hard-link
+// destination; they do not overwrite an existing destination. Source:
+// https://nodejs.org/download/release/v24.21.0/docs/api/fs.html#fslinkexistingpath-newpath-callback
+// SECURITY INV-11: declaration authority must precede the first destination write,
+// independently of the source inode's existing recognition or input purpose.
+const linkAdapter = (api: 'sync' | 'callback' | 'promise'): string => `
+const { linkSync, link, unlinkSync, statSync, existsSync } = await import('node:fs');
+const { link: promiseLink } = await import('node:fs/promises');
+let callbackCount = 0;
+async function createLink(from, to) {
+ if (${JSON.stringify(api)} === 'sync') return linkSync(from, to);
+ if (${JSON.stringify(api)} === 'promise') return promiseLink(from, to);
+ return new Promise((resolve, reject) => link(from, to, error => {
+  callbackCount++; if (error) reject(error); else resolve();
+ }));
+}
+const stage = join(scratch, 'hardlink-stage.bin');
+appendFileSync(join(scratch, 'declared-out.txt'), stage + '\\n');
+writeFileSync(stage, bytes, { mode: 0o600 });
+`;
+
+for (const api of ['sync', 'callback', 'promise'] as const) {
+  it(`CP-044/CI-LINK ${api} prospective hard-link destination retains observed INPUT bytes and ordinary semantics`, () => {
+    const f = fixture(), destination = join(f.scratch, 'hardlink-input.bin');
+    declareFixturePaths([join(f.scratch, 'hardlink-stage.bin'), destination]);
+    writeFileSync(join(f.scratch, 'declared-out.txt'), '', { mode: 0o600 });
+    f.script(`${linkAdapter(api)}
+const destination = join(scratch, 'hardlink-input.bin');
+appendFileSync(join(scratch, 'declared-out.txt'), destination + '\\n');
+const returned = await createLink(stage, destination);
+const original = statSync(stage), linked = statSync(destination);
+const sharedInode = original.dev === linked.dev && original.ino === linked.ino && linked.nlink > 1;
+unlinkSync(stage);
+writeFileSync(join(evidence, 'link-control.json'), JSON.stringify({ callbackCount, sharedInode,
+ returnedUndefined: returned === undefined, stageRemoved: !existsSync(stage), exactBytes: readFileSync(destination).equals(bytes) }));`);
+    const result = f.invoke();
+    expect(result.error, 'the ordinary capture deadline is unchanged').toBeUndefined();
+    const control = asRecord(JSON.parse(readFileSync(join(f.evidence, 'link-control.json'), 'utf8')) as unknown, 'actual link result');
+    expect(control).toEqual({ callbackCount: api === 'callback' ? 1 : 0, sharedInode: true,
+      returnedUndefined: true, stageRemoved: true, exactBytes: true });
+    expect(result.status, 'prospective declaration applies to the actual first hard-link destination write').toBe(0);
+    const receipt = f.receipt();
+    expect(receipt['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: true, policySatisfied: true });
+    expect(records(receipt['artifacts'], 'destination census').some(row => row['path'] === destination
+      && row['purpose'] === 'INPUT' && row['sha256'] === digest(f.seed)), 'exact destination bytes have witnessed INPUT purpose').toBe(true);
+    expect(f.invoke(true).status, 'independent verification accepts the retained prospective input').toBe(0);
+  });
+
+  it(`CP-044/CI-LINK ${api} undeclared late and existing destinations retain EGRESS and existing-file refusal`, () => {
+    const f = fixture();
+    const destinations = ['undeclared', 'late', 'existing'].map(kind => join(f.scratch, `hardlink-${kind}.bin`));
+    // These exact deliberate negative artifacts are only outer fixture inputs;
+    // the inner invocation receives the declaration ordering exercised below.
+    declareFixturePaths([join(f.scratch, 'hardlink-stage.bin'), ...destinations]);
+    writeFileSync(join(f.scratch, 'declared-out.txt'), '', { mode: 0o600 });
+    f.script(`${linkAdapter(api)}
+const undeclared = join(scratch, 'hardlink-undeclared.bin'), late = join(scratch, 'hardlink-late.bin');
+const first = await createLink(stage, undeclared), second = await createLink(stage, late);
+appendFileSync(join(scratch, 'declared-out.txt'), late + '\\n');
+const existing = join(scratch, 'hardlink-existing.bin');
+writeFileSync(existing, bytes, { mode: 0o600 });
+const before = statSync(existing);
+appendFileSync(join(scratch, 'declared-out.txt'), existing + '\\n');
+let existingError = null;
+try { await createLink(stage, existing); } catch (error) { existingError = error.code; }
+const after = statSync(existing);
+unlinkSync(stage);
+writeFileSync(join(evidence, 'link-control.json'), JSON.stringify({ callbackCount, existingError,
+ successfulReturnsUndefined: first === undefined && second === undefined,
+ existingUnchanged: before.dev === after.dev && before.ino === after.ino && readFileSync(existing).equals(bytes) }));`);
+    const result = f.invoke();
+    expect(result.error, 'negative controls retain the ordinary capture deadline').toBeUndefined();
+    const control = asRecord(JSON.parse(readFileSync(join(f.evidence, 'link-control.json'), 'utf8')) as unknown, 'negative link result');
+    expect(control).toEqual({ callbackCount: api === 'callback' ? 3 : 0, existingError: 'EEXIST',
+      successfulReturnsUndefined: true, existingUnchanged: true });
+    expect(result.status !== null && result.status !== 0, 'source equality and later declarations cannot authorize output').toBe(true);
+    const receipt = f.receipt();
+    expect(receipt['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: false, policySatisfied: false });
+    const artifacts = records(receipt['artifacts'], 'negative destination census');
+    for (const destination of destinations) expect(artifacts.some(row => row['path'] === destination
+      && row['purpose'] === 'EGRESS' && row['sha256'] === digest(f.seed)), 'every original disclosure keeps its bytes and EGRESS purpose').toBe(true);
+    expect(f.invoke(true).status !== 0, 'independent verification preserves the original disclosures').toBe(true);
+  });
+
+  it(`CP-044/CI-LINK ${api} rejects recorder-private source and destination operands without creating aliases`, () => {
+    const f = fixture(), alias = join(f.scratch, 'private-source-alias.bin');
+    declareFixturePaths([join(f.scratch, 'hardlink-stage.bin'), alias]);
+    writeFileSync(join(f.scratch, 'declared-out.txt'), '', { mode: 0o600 });
+    f.script(`${linkAdapter(api)}
+const { createHash } = await import('node:crypto');
+const protectedSource = join(capture, 'private/sources', createHash('sha256').update(bytes).digest('hex'));
+const alias = join(scratch, 'private-source-alias.bin'), protectedDestination = join(capture, 'private/link-destination.bin');
+let sourceDenied = false, destinationDenied = false;
+try { await createLink(protectedSource, alias); } catch (error) { sourceDenied = error.code !== 'ENOENT'; }
+try { await createLink(stage, protectedDestination); } catch (error) { destinationDenied = error.code !== 'ENOENT'; }
+unlinkSync(stage);
+writeFileSync(join(evidence, 'link-control.json'), JSON.stringify({ sourceDenied, destinationDenied,
+ aliasAbsent: !existsSync(alias), privateDestinationAbsent: !existsSync(protectedDestination) }));`);
+    const result = f.invoke();
+    expect(result.error, 'private-operand controls retain the ordinary capture deadline').toBeUndefined();
+    expect(asRecord(JSON.parse(readFileSync(join(f.evidence, 'link-control.json'), 'utf8')) as unknown, 'private operand results'))
+      .toEqual({ sourceDenied: true, destinationDenied: true, aliasAbsent: true, privateDestinationAbsent: true });
+    expect(readFileSync(join(f.capture, 'private/sources', digest(f.seed))).equals(f.seed), 'original private source remains unchanged').toBe(true);
+    expect(result.status !== null && result.status !== 0, 'private namespace access remains a rejected invocation').toBe(true);
+    expect(f.invoke(true).status !== 0, 'independent verification preserves private-namespace rejection').toBe(true);
+  });
+}
+
 for (const exitCode of [0, 7]) {
   it(`CP-044/CI-CAPTURE clean finite command retains complete sources, output census and exact failure ${String(exitCode)}`, () => {
     const f = fixture();

@@ -21,7 +21,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         node: ['22.23.2', '22.x', '24.18.1', '24.x']
-        shard: [core]
+        shard: [product-1, product-2, harness-1, harness-2]
         include:
           - { os: windows-latest, node: '22.23.2', shard: core-1, coreShard: '1/2' }
           - { os: windows-latest, node: '22.23.2', shard: core-2, coreShard: '2/2' }
@@ -74,10 +74,22 @@ jobs:
           NODE
       - name: Install locked toolchain without lifecycle scripts
         run: node scripts/ci-install.mjs --root "$PWD"
-      # The hosted Linux runners have two CPUs; four workers contend in timing-bound proofs.
+      # Keep each complete capture and its independent recheck inside the job budget.
+      # The two deterministic shards of each project retain its complete file inventory.
+      # Hosted Linux runners have two CPUs; retain the original product worker bound.
       - name: Test Linux product
-        if: always() && matrix.os == 'ubuntu-latest' && matrix.shard == 'core'
-        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --harness-before-final -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2 --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
+        if: always() && matrix.os == 'ubuntu-latest' && startsWith(matrix.shard, 'product-')
+        run: >-
+          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2
+          --shard=${{ matrix.shard == 'product-1' && '1/2' || '2/2' }}
+          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
+      - name: Test Linux harness
+        if: always() && matrix.os == 'ubuntu-latest' && startsWith(matrix.shard, 'harness-')
+        run: >-
+          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm run test:harness -- --maxWorkers=1 --fileParallelism=false
+          --shard=${{ matrix.shard == 'harness-1' && '1/2' || '2/2' }}
+          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
+          --next node scripts/no-pending.mjs "$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
       # Separate Windows VMs keep native process and owner-lifecycle proofs from competing with core tests.
       - name: Test Windows core product
         env:

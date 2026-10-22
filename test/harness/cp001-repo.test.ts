@@ -166,22 +166,38 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
   const steps = list(test['steps'], 'test.steps').map(s => map(s, 'test step'));
   const setupNode = steps.find(s => s['uses'] === SETUP_NODE);
   const nodeVersionExpr = String(map(setupNode?.['with'], 'setup-node.with')['node-version']);
-  const subst = (expr: string, c: Record<string, string>): string => expr.replace(/\$\{\{\s*matrix\.([\w-]+)\s*\}\}/g, (_m, k: string) => c[k] ?? '<unset>');
+  const scalar = (expression: string, combo: Record<string, string>): string => {
+    const direct = /^\s*matrix\.([\w-]+)\s*$/.exec(expression);
+    const choice = /^\s*matrix\.([\w-]+)\s*==\s*'((?:[^']|'')*)'\s*&&\s*'((?:[^']|'')*)'\s*\|\|\s*'((?:[^']|'')*)'\s*$/.exec(expression);
+    const property = direct?.[1] ?? choice?.[1];
+    const value = property === undefined ? undefined : combo[property];
+    if (value === undefined) throw new Error(`unsupported CI scalar expression: ${expression}`);
+    if (direct) return value;
+    if (!choice) throw new Error(`unsupported CI scalar choice: ${expression}`);
+    const literal = (index: number): string => (choice[index] ?? '').replace(/''/g, "'");
+    return (value === literal(2) ? literal(3) : '') || literal(4);
+  };
+  const subst = (expr: string, c: Record<string, string>): string => expr.replace(/\$\{\{\s*([^{}]+?)\s*\}\}/g,
+    (_match, expression: string) => scalar(expression, c));
   const runsOn = String(test['runs-on']);
-  expect(combos.map(c => `${subst(runsOn, c)} ${subst(nodeVersionExpr, c)} ${c['shard'] ?? '<unset>'} ${c['coreShard'] ?? '<unset>'}`).sort()).toEqual([
-    'ubuntu-latest 22.23.2 core <unset>', 'ubuntu-latest 22.x core <unset>', 'ubuntu-latest 24.18.1 core <unset>', 'ubuntu-latest 24.x core <unset>',
+  const linuxVersions = ['22.23.2', '22.x', '24.18.1', '24.x'];
+  expect(combos).toHaveLength(22);
+  expect(combos.filter(c => subst(runsOn, c) === 'ubuntu-latest').map(c => subst(nodeVersionExpr, c)).sort())
+    .toEqual(linuxVersions.flatMap(version => [version, version, version, version]).sort());
+  expect(combos.filter(c => subst(runsOn, c) === 'windows-latest')
+    .map(c => `${subst(runsOn, c)} ${subst(nodeVersionExpr, c)} ${c['shard'] ?? '<unset>'} ${c['coreShard'] ?? '<unset>'}`).sort()).toEqual([
     'windows-latest 22.23.2 core-1 1/2', 'windows-latest 22.23.2 core-2 2/2', 'windows-latest 22.23.2 native <unset>',
     'windows-latest 24.x core-1 1/2', 'windows-latest 24.x core-2 2/2', 'windows-latest 24.x native <unset>',
   ]);
 
   const captureCommand = (run: string): string => run.replace(
     /^node scripts\/ci-capture\.mjs --root "\$PWD" --capture-dir "\$FLUXWARDEN_CI_CAPTURE_DIR" -- /, '');
-  const jobPrefix = /^node scripts\/ci-job\.mjs(?: --harness-before-final| \$\{\{ matrix\.shard == 'core-1' && '--harness-before-final' \|\| '' \}\})? -- /;
+  const jobPrefix = /^node scripts\/ci-job\.mjs(?: --commands-only| --harness-before-final| \$\{\{ matrix\.shard == 'core-1' && '--harness-before-final' \|\| '' \}\})? -- /;
   const commandsOf = (step: { [key: string]: Yaml }): string[] => captureCommand(typeof step['run'] === 'string' ? step['run'].trim() : '')
     .replace(jobPrefix, '').split(/\s+--next\s+/);
   const commandOf = (step: { [key: string]: Yaml }): string => {
     const commands = commandsOf(step);
-    return commands.find(command => /^npm test\s/.test(command)) ?? commands[0] ?? '';
+    return commands.find(command => /^npm (?:test\s|run test:harness(?:\s|$))/.test(command)) ?? commands[0] ?? '';
   };
   // Product, optional harness and no-pending remain ordered inside the finite
   // job invocation. Its public command is exercised below, including failures.
@@ -218,9 +234,9 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
       condition = condition.replace(/^always\(\)\s*&&\s+/, '');
     }
     return condition.split(/\s*\|\|\s*/).some(alternative => alternative.split(/\s*&&\s*/).every(term => {
-      const equal = /^matrix\.(os|shard) == '([^']+)'$/.exec(term);
+      const equal = /^matrix\.([\w-]+) == '([^']+)'$/.exec(term);
       if (equal) return combo[equal[1] ?? ''] === equal[2];
-      const prefix = /^startsWith\(matrix\.(os|shard), '([^']+)'\)$/.exec(term);
+      const prefix = /^startsWith\(matrix\.([\w-]+), '([^']+)'\)$/.exec(term);
       if (prefix) return (combo[prefix[1] ?? ''] ?? '').startsWith(prefix[2] ?? '');
       throw new Error(`unsupported CI shard condition: ${condition}`);
     }));
@@ -239,39 +255,67 @@ it('CP-001/B11 the CI workflow has the triggers, permissions, matrix, pinned act
     if (file === undefined) throw new Error(`${k} names no JSON output file`);
     return file.replace(/^["']|["']$/g, '');
   };
+  const linuxCoverage = new Map<string, string[]>();
   for (const combo of combos) {
     const ordered = steps.filter(s => kind(s) !== null && active(s, combo));
-    const windows = combo['os'] === 'windows-latest';
+    const windows = subst(runsOn, combo) === 'windows-latest';
     const core = combo['shard'] === 'core' || combo['shard'] === 'core-1' || combo['shard'] === 'core-2';
-    const harness = combo['shard'] === 'core' || combo['shard'] === 'core-1';
+    const harness = windows && combo['shard'] === 'core-1';
+    const harnessOnly = !windows && ordered.some(step => kind(step) === 'harness');
+    const suite = harnessOnly ? 'harness' : 'product';
     expect(ordered.map(kind), JSON.stringify(combo)).toEqual([
-      'checkout', 'setup-node', 'npm ci', 'product',
+      'checkout', 'setup-node', 'npm ci', suite,
     ]);
-    const productStep = ordered.find(s => kind(s) === 'product') ?? {};
+    const productStep = ordered.find(s => kind(s) === suite) ?? {};
     const wrapped = String(productStep['run']);
     expect(captureCommand(wrapped), 'one transparent finite wrapper encloses the job').not.toBe(wrapped);
     const job = captureCommand(subst(wrapped, combo)).replace(/\$\{\{ matrix\.shard == 'core-1' && '--harness-before-final' \|\| '' \}\}/g,
       combo['shard'] === 'core-1' ? '--harness-before-final' : '').replace(/\s+/g, ' ');
-    expect(job.startsWith(`node scripts/ci-job.mjs ${harness ? '--harness-before-final ' : ''}-- node scripts/ci-install.mjs verify --root "$PWD" --next `), 'capture starts with the original installer failure gate and retains each shard harness selection').toBe(true);
+    expect(job.startsWith(`node scripts/ci-job.mjs ${harnessOnly ? '--commands-only ' : harness ? '--harness-before-final ' : ''}-- node scripts/ci-install.mjs verify --root "$PWD" --next `), 'capture starts with the original installer failure gate and retains each shard harness selection').toBe(true);
     const stages = commandsOf(productStep);
-    expect(stages.slice(0, -1), 'all original preparation stages are inside capture in their original order').toEqual([
+    expect(stages.slice(0, harnessOnly ? -2 : -1), 'all original preparation stages are inside capture in their original order').toEqual([
       'node scripts/ci-install.mjs verify --root "$PWD"', 'npm run lint', 'npm run build', 'node scripts/ci-database-check.mjs',
       ...(windows && core ? ['node scripts/ci-windows-core.mjs'] : []),
     ]);
-    expect(stages.at(-1), 'product follows all captured preparation stages').toBe(commandOf(productStep));
+    expect(stages.at(harnessOnly ? -2 : -1), 'the selected suite follows all captured preparation stages').toBe(commandOf(productStep));
+    if (harnessOnly) {
+      const final = stages.at(-1) ?? '';
+      const args = (final.match(/"[^"]*"|'[^']*'|[^\s]+/g) ?? []).map(arg => arg.replace(/^(["'])(.*)\1$/, '$2'));
+      expect(args, 'the independent harness accepts only its own complete report').toEqual([
+        'node', 'scripts/no-pending.mjs', '$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json',
+      ]);
+    }
     const productRun = commandOf(productStep);
     expect(productRun, 'no title or additional subset filtering').not.toMatch(/--(?:testNamePattern|exclude|include|dir|project|changed|related)\b|(?:^|\s)-t(?:\s|$)/);
-    expect(productRun.match(/--maxWorkers(?:=|\s+)\S+/g), 'bounded worker allocation').toEqual([`--maxWorkers=${windows ? '1' : '2'}`]);
-    if (windows) expect(productRun.match(/--fileParallelism(?:=|\s+)\S+/g), 'Windows files run serially').toEqual(['--fileParallelism=false']);
+    expect(productRun.match(/--maxWorkers(?:=|\s+)\S+/g), 'bounded worker allocation').toEqual([`--maxWorkers=${windows || harnessOnly ? '1' : '2'}`]);
+    if (windows || harnessOnly) expect(productRun.match(/--fileParallelism(?:=|\s+)\S+/g), 'Windows and harness files run serially').toEqual(['--fileParallelism=false']);
     if (windows && core) {
       expect(productRun.match(/--shard\b/g), 'one explicit Windows core shard').toHaveLength(1);
       expect(productRun).toContain('--shard=${{ matrix.coreShard }}');
       expect(subst(productRun, combo)).toContain(`--shard=${combo['coreShard'] ?? '<unset>'}`);
-    } else {
+    } else if (windows) {
       expect(productRun).not.toMatch(/--shard\b/);
       expect(productRun).not.toMatch(/--config\b/);
+    } else {
+      const shards = [...subst(productRun, combo).matchAll(/--shard(?:=|\s+)(\S+)/g)];
+      expect(shards, 'one explicit independent Linux suite shard').toHaveLength(1);
+      const shard = shards[0]?.[1];
+      expect(shard).toMatch(/^[12]\/2$/);
+      expect(productRun).not.toMatch(/--config\b|\btest\/[\w./-]+\.test\.[cm]?[jt]s\b/);
+      const version = subst(nodeVersionExpr, combo);
+      linuxCoverage.set(version, [...(linuxCoverage.get(version) ?? []), `${suite} ${shard ?? '<unset>'}`]);
     }
-    expect(reportOf(ordered, 'product'), 'the active product report remains in scanned evidence').toBe('$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json');
+    expect(reportOf(ordered, suite), 'the active suite report remains in scanned evidence').toBe(`$FLUXWARDEN_EVIDENCE_DIR/vitest-${suite}.json`);
+    const verification = steps.filter(step => active(step, combo)
+      && String(step['run'] ?? '').trim() === 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"');
+    expect(verification, 'every independent invocation has its own final verification').toHaveLength(1);
+    expect(verification[0]?.['if']).toBe('always()');
+    expect(steps.indexOf(verification[0] ?? {})).toBeGreaterThan(steps.indexOf(productStep));
+  }
+  for (const version of linuxVersions) {
+    expect(linuxCoverage.get(version)?.sort(), `${version}: complete product and harness coverage occurs exactly once`).toEqual([
+      'harness 1/2', 'harness 2/2', 'product 1/2', 'product 2/2',
+    ]);
   }
 
   // Execute the real public job runner with a finite owned npm fixture. The
@@ -359,10 +403,10 @@ process.exitCode = mode === 'fail' ? 7 : 0;
   expect(existsSync(coreConfig), 'actual extracted stage creates the selected core configuration').toBe(true);
   expect(dirname(coreConfig)).toBe(scratch);
   expect(String(coreProduct['run'])).toContain('--config="$FLUXWARDEN_CI_CORE_CONFIG"');
-  const productFiles = (args: readonly string[] = []): string[] => {
+  const projectFiles = (project: 'product' | 'harness-docs', args: readonly string[] = []): string[] => {
     const outputFile = join(scratchDir('ci-product-files'), 'inventory.json');
     const result = spawnSync(process.execPath, [join(repoRoot, 'node_modules', 'vitest', 'vitest.mjs'),
-      'list', '--project', 'product', '--filesOnly', ...args, `--json=${outputFile}`], {
+      'list', '--project', project, '--filesOnly', ...args, `--json=${outputFile}`], {
       cwd: repoRoot, env: childEnv(), encoding: 'utf8', windowsHide: true, timeout: 10000,
     });
     expect(result.error).toBeUndefined();
@@ -371,20 +415,28 @@ process.exitCode = mode === 'fail' ? 7 : 0;
     if (!Array.isArray(files)) throw new Error('product file inventory is not a list');
     return files.map(value => {
       const file = asRecord(value, 'product file');
-      expect(file['projectName']).toBe('product');
+      expect(file['projectName']).toBe(project);
       if (typeof file['file'] !== 'string') throw new Error('product file path is missing');
       return relative(repoRoot, file['file']).replace(/\\/g, '/');
     }).sort();
   };
+  const productFiles = (args: readonly string[] = []): string[] => projectFiles('product', args);
   const complete = productFiles(), coreFiles = productFiles(['--config', coreConfig]), native = productFiles(nativeArgs);
+  const fullHarness = projectFiles('harness-docs');
   // `list --filesOnly` lists eligible files without applying execution sharding.
   // Exercise the pinned public sequencer over that inventory instead.
   const partition = spawnSync(process.execPath, ['--input-type=module'], {
-    cwd: repoRoot, env: { ...childEnv(), CI_CORE_FILES: JSON.stringify(coreFiles) },
+    cwd: repoRoot, env: { ...childEnv(), CI_CORE_FILES: JSON.stringify(coreFiles),
+      CI_LINUX_PRODUCT_FILES: JSON.stringify(complete), CI_LINUX_HARNESS_FILES: JSON.stringify(fullHarness) },
     input: `import { BaseSequencer } from 'vitest/node';
-const files = JSON.parse(process.env.CI_CORE_FILES).map(moduleId => ({ moduleId }));
-const groups = await Promise.all([1, 2].map(index => new BaseSequencer({ config: { root: process.cwd(), shard: { index, count: 2 } } }).shard(files)));
-console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second: groups[1].map(file => file.moduleId) }));`,
+const split = async value => {
+ const files = JSON.parse(value).map(moduleId => ({ moduleId }));
+ return Promise.all([1, 2].map(index => new BaseSequencer({ config: { root: process.cwd(), shard: { index, count: 2 } } }).shard(files)));
+};
+const [groups, product, harness] = await Promise.all([split(process.env.CI_CORE_FILES), split(process.env.CI_LINUX_PRODUCT_FILES), split(process.env.CI_LINUX_HARNESS_FILES)]);
+console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second: groups[1].map(file => file.moduleId),
+ productFirst: product[0].map(file => file.moduleId), productSecond: product[1].map(file => file.moduleId),
+ harnessFirst: harness[0].map(file => file.moduleId), harnessSecond: harness[1].map(file => file.moduleId) }));`,
     encoding: 'utf8', windowsHide: true, timeout: 10000,
   });
   expect(partition.error).toBeUndefined();
@@ -407,6 +459,13 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
   expect([...firstCore, ...secondCore].sort(), 'Windows core shards cover the complete core inventory').toEqual(coreFiles);
   expect(coreFiles.filter(file => native.includes(file)), 'Windows shards are disjoint').toEqual([]);
   expect([...coreFiles, ...native].sort(), 'Windows shards cover the complete product inventory').toEqual(complete);
+  for (const [suite, inventory] of [['product', complete], ['harness', fullHarness]] as const) {
+    const first = shardFiles(`${suite}First`), second = shardFiles(`${suite}Second`);
+    expect(first.length, `${suite} first Linux shard is nonempty`).toBeGreaterThan(0);
+    expect(second.length, `${suite} second Linux shard is nonempty`).toBeGreaterThan(0);
+    expect(first.filter(file => second.includes(file)), `${suite} Linux shards are disjoint`).toEqual([]);
+    expect([...first, ...second].sort(), `${suite} Linux shards preserve the complete original project inventory`).toEqual(inventory);
+  }
 
   for (const [name, script] of [['lab', 'test:lab'], ['chaos', 'test:chaos']] as const) {
     const job = map(jobs[name], name);

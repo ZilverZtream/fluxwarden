@@ -4,8 +4,8 @@
 // Public helper: ci-secret-output.mjs authorizeSecretOutput({path,command,args}).
 import { spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey, createPublicKey, randomBytes } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, binPath, childEnv, repoRoot } from '../helpers/cli.js';
@@ -21,6 +21,14 @@ const records = (value: unknown): Record<string, unknown>[] => {
   if (!Array.isArray(value)) throw new Error('retained census must be an array');
   return value.map(row => asRecord(row, 'census row'));
 };
+
+function runtimeFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : runtimeFiles(path);
+    return entry.isFile() && /\.(?:js|json)$/.test(entry.name) ? [path] : [];
+  });
+}
 
 async function fixture(mode: string, registerKey = true) {
   const parent = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ko-'));
@@ -39,13 +47,26 @@ async function fixture(mode: string, registerKey = true) {
   declareFixtureCapture(capture, [seed], []);
   writeFileSync(source, seed, { mode: 0o600 });
   writeFileSync(join(root, 'test/sentinels.json'), JSON.stringify(['test/control.bin']));
-  for (const name of ['leak-check.mjs', 'private-scratch.mjs']) copyFileSync(join(repoRoot, 'scripts', name), join(root, 'scripts', name));
-  cpSync(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  const support = ['leak-check.mjs', 'private-scratch.mjs'];
+  for (const name of support) copyFileSync(join(repoRoot, 'scripts', name), join(root, 'scripts', name));
+  const built = runtimeFiles(join(repoRoot, 'dist'));
+  for (const path of built) {
+    const destination = join(root, relative(repoRoot, path));
+    mkdirSync(dirname(destination), { recursive: true });
+    copyFileSync(path, destination);
+  }
   const binary = join(root, relative(repoRoot, binPath()));
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'owned-key-output-fixture', version: '1.0.0', type: 'module',
     bin: { fluxwarden: relative(root, binary).replace(/\\/g, '/') } }));
-  const git = (...args: string[]) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
-  for (const args of [['init', '--quiet'], ['config', 'core.longpaths', 'true'], ['add', '--', 'package.json', 'test', 'scripts', 'dist'],
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    appendFileSync(join(parent, 'git-setup.jsonl'), JSON.stringify({ stage: args[0], status: result.status, signal: result.signal,
+      errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null }) + '\n');
+    return result;
+  };
+  const inputs = ['package.json', 'test/control.bin', 'test/sentinels.json', ...support.map(name => `scripts/${name}`),
+    ...built.map(path => relative(repoRoot, path).replace(/\\/g, '/'))];
+  for (const args of [['init', '--quiet'], ['config', 'core.longpaths', 'true'], ['add', '--', ...inputs],
     ['-c', 'user.name=Key output fixture', '-c', 'user.email=fixture@invalid', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'owned key output fixture']]) {
     expect(git(...args).status, 'genuine built CLI fixture has original immutable Git identity').toBe(0);
   }

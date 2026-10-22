@@ -222,9 +222,11 @@ if (capture) {
       incomplete();
     } finally { busy = false; }
   };
-  const operations = ['writeFile', 'appendFile', 'copyFile', 'rename', 'unlink', 'rm', 'rmdir', 'truncate', 'mkdir'];
+  // A hard link publishes existing bytes at its destination, including the
+  // Windows owner-only writer's staged file. Observe it before publication.
+  const operations = ['writeFile', 'appendFile', 'copyFile', 'link', 'rename', 'unlink', 'rm', 'rmdir', 'truncate', 'mkdir'];
   for (const name of operations) {
-    const target = name === 'copyFile' || name === 'rename' ? 1 : 0;
+    const target = name === 'copyFile' || name === 'link' || name === 'rename' ? 1 : 0;
     const originalSync = fs[name + 'Sync'];
     if (originalSync) fs[name + 'Sync'] = function (...args) {
       observe(args[0], true); if (target) observe(args[target], true);
@@ -252,10 +254,10 @@ if (capture) {
   }
   // These public APIs do not establish source writes, but must not bypass the
   // recorder's private namespace through metadata or link changes.
-  for (const name of ['chmod', 'chown', 'utimes', 'lutimes', 'lchown', 'link', 'symlink', 'cp', 'mkdtemp']) {
+  for (const name of ['chmod', 'chown', 'utimes', 'lutimes', 'lchown', 'symlink', 'cp', 'mkdtemp']) {
     const guarded = args => {
       if (busy) return;
-      for (const value of args.slice(0, ['link', 'symlink', 'cp'].includes(name) ? 2 : 1)) {
+      for (const value of args.slice(0, ['symlink', 'cp'].includes(name) ? 2 : 1)) {
         const path = pathOf(value);
         if (path) guardMutation(path);
       }
