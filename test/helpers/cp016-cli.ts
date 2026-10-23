@@ -248,6 +248,8 @@ export interface LndSetup {
   identity?: Identity;
   /** The macaroon the fake accepts, as hex (default: a fresh random one, written to `macaroon`). */
   macaroonHex?: string;
+  /** Declare this exact synthetic input path before its first physical write. */
+  beforeCredentialWrite?: (path: string) => void;
 }
 
 export interface LndNode { fake: FakeLnd; macaroon: string; macaroonHex: string; url: string }
@@ -256,6 +258,7 @@ export interface LndNode { fake: FakeLnd; macaroon: string; macaroonHex: string;
 export async function lndNode(dir: string, open: FakeServer[], setup: LndSetup = {}): Promise<LndNode> {
   const bytes = Buffer.concat([Buffer.from('0201', 'hex'), randomBytes(58)]);
   const macaroon = join(dir, `${randomBytes(4).toString('hex')}.macaroon`);
+  setup.beforeCredentialWrite?.(macaroon);
   writeFileSync(macaroon, bytes);
   const macaroonHex = setup.macaroonHex ?? bytes.toString('hex');
   const fake = await startFakeLnd({

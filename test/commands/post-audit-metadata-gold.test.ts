@@ -1,6 +1,7 @@
 // AUDIT-03 / SPEC output / SECURITY output redaction: a successful node reply
 // cannot return a credential which the same command has just loaded.
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import type { FakeServer } from '../fakes/https.js';
@@ -8,6 +9,7 @@ import { getinfo } from '../fakes/cln/responses.js';
 import { getInfo, LND_PUBKEY } from '../fakes/lnd/responses.js';
 import { demo, jsonDocument, rec } from '../helpers/cpw-cli.js';
 import { createDatabase, lndNode, nodeCert, runCli, scratch, writeConfig } from '../helpers/cp016-cli.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
 
 const open: FakeServer[] = [];
@@ -42,7 +44,10 @@ for (const json of [true, false]) {
   it(`CP-003/AUDIT-03 successful LND metadata redacts its loaded macaroon echo in ${json ? 'JSON' : 'text'}`, async () => {
     const dir = scratch('audit-metadata-lnd');
     const info = getInfo();
-    const lnd = await lndNode(dir, open, { info });
+    const lnd = await lndNode(dir, open, { info, beforeCredentialWrite: path => {
+      expect(existsSync(path), 'synthetic credential is declared before its first write').toBe(false);
+      declareFixturePaths([path]);
+    } });
     registerMoneySafetyCredentials([lnd.macaroon]);
     // Native GetInfo alias is node-controlled. Echo the HTTP authentication
     // representation (hex), rather than the underlying binary credential.
