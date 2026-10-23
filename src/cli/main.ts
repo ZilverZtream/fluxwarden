@@ -1,6 +1,6 @@
 // The CLI over argv with injected dependencies. A failure propagates to the caller, which owns the single
 // internal-error report and the exit-code precedence in bin.ts.
-import { envelope, renderEnvelope, type Output, type RenderOutput } from '../output/index.js';
+import { envelope, renderEnvelope, withOutputSecrets, type Output, type RenderOutput } from '../output/index.js';
 import { channels } from '../commands/channels.js';
 import { doctor } from '../commands/doctor.js';
 import { nodesInspect, nodesList } from '../commands/nodes.js';
@@ -39,6 +39,10 @@ export interface Deps {
 const CREDENTIAL_ARGUMENT = 'an argument looks like a credential value; credentials are given by file path only (--macaroon-path, --rune-path)';
 
 export function main(argv: readonly string[], deps: Deps): number | Promise<number> {
+  return withOutputSecrets(() => mainWithSecrets(argv, deps));
+}
+
+function mainWithSecrets(argv: readonly string[], deps: Deps): number | Promise<number> {
   const json = argv.includes('--json');
   // SECURITY.md §3.3: refused before anything else runs, and never echoed.
   if (argv.some(looksLikeCredential)) {
@@ -141,7 +145,10 @@ async function collectDaemon(command: Command, deps: Deps, io: Io, controller: A
     ...((command.kind !== 'daemon' || command.collect) ? {} : { onCycle: async (cycle: { nodes: readonly { name: string; state: string }[] }) => {
       for (const node of cycle.nodes) {
         if (node.state !== 'ONLINE' || controller.signal.aborted) continue;
-        await workflow({ ...command, kind: 'liquidity plan', node: node.name, horizon: null, policy: null, refresh: false }, silent, deps.env ?? {}, controller.signal);
+        const code = await workflow({ ...command, kind: 'liquidity plan', node: node.name, horizon: null, policy: null, refresh: false }, silent, deps.env ?? {}, controller.signal);
+        if (code !== ExitCode.SUCCESS && !stopped()) {
+          await output.write(`fluxwarden daemon: warning planning-failed ${node.name} (exit ${String(code)})\n`, { stream: 'stderr' });
+        }
       }
       if (!stopped()) {
         const config = configStage(command.config);

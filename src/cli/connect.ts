@@ -7,6 +7,7 @@ import { openClnReader } from '../node-cln/reader.js';
 import { openLndReader } from '../node-lnd/reader.js';
 import { CONNECTION_FLAGS, type ConnectionFlags } from './args.js';
 import { looksLikeCredential } from './environment.js';
+import { registerOutputSecret } from '../output/index.js';
 
 export type Environment = Readonly<Record<string, string | undefined>>;
 
@@ -83,6 +84,6 @@ export function resolveConnection(node: NodeConfig, flags: ConnectionFlags, env:
 export function openReader(node: NodeConfig, connection: Connection): Promise<NodeReader> {
   const { host, port } = connection.endpoint;
   return node.implementation === 'lnd'
-    ? openLndReader({ host, port, tlsCertPath: connection.tlsCertPath, macaroonPath: connection.credentialPath })
-    : openClnReader({ host, port, tlsCertPath: connection.tlsCertPath, runePath: connection.credentialPath });
+    ? openLndReader({ host, port, tlsCertPath: connection.tlsCertPath, macaroonPath: connection.credentialPath, onSecret: registerOutputSecret })
+    : openClnReader({ host, port, tlsCertPath: connection.tlsCertPath, runePath: connection.credentialPath, onSecret: registerOutputSecret });
 }

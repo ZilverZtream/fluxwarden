@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
-  invoiceLabel, isApprovedRoute, reportedFeeBreach,
+  invoiceLabel, isApprovedRoute, reportedFeeBreach, sourceReserveFloor,
   type Alert, type ApprovedRoute, type CancelResult, type CircularRoute, type ExecutionAdapter, type ExecutionPolicy, type ExecutionStatus, type InvoiceResult, type InvoiceState, type PaymentObservation,
 } from '../core/execution.js';
 import type { VerifiedApproval } from '../approval/verified.js';
@@ -214,6 +214,13 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       return outcome(ExitCode.SAFETY_REFUSAL, 'STALE_SNAPSHOT');
     }
 
+    // The branded route may have been approved against an older, richer snapshot.
+    const source = baseline?.find(channel => channel.channelKey === route.sourceChannelKey);
+    if (source === undefined || source.spendableMsat - (route.principalMsat + route.totalFeeMsat) < sourceReserveFloor(input.policy)) {
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'RESERVE_FLOOR' });
+      return outcome(ExitCode.SAFETY_REFUSAL, 'RESERVE_FLOOR');
+    }
+
     const preimage = deps.randomBytes(PREIMAGE_BYTES);
     if (preimage.length !== PREIMAGE_BYTES) throw new Error('the random source returned a preimage of the wrong length');
     hash = sha256(preimage);
@@ -270,19 +277,30 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       throw error;
     }
     if (stopped()) return await interrupt();
-    let submitted: { status: 'SUBMITTING' | 'CANCELLED'; fenceEpoch: bigint };
+    let submitted: ReturnType<Database['executions']['submit']>;
     try {
       const sourceLocalMsat = localBalance(baseline, route.sourceChannelKey);
       const targetLocalMsat = localBalance(baseline, route.targetChannelKey);
       submitted = db.executions.submit(executionId, epoch, input.policy.maxInFlight, deps.leaseMs, {
         routeJson: routeJson(route),
         ...(sourceLocalMsat === null || targetLocalMsat === null ? {} : { baseline: { sourceLocalMsat, targetLocalMsat } }),
-      });
+      }, input.policy);
     } catch (error) {
       if (error instanceof PersistenceError && error.code === 'LEASE_LOST') throw new LeaseLost();
       throw error;
     }
     epoch = submitted.fenceEpoch;
+    if (submitted.status === 'BUDGET_REFUSED') {
+      if (!db.executions.holds(executionId, epoch)) throw new LeaseLost();
+      let closed: CancelResult | null;
+      try { closed = await adapter.cancelUnpaidInvoice(hash, label); } catch { closed = null; }
+      if (!db.executions.holds(executionId, epoch)) throw new LeaseLost();
+      if (closed === 'ALREADY_PAID') return paidPreparation(baseline);
+      // Ambiguous invoice closure retains the reservation and the recoverable unsent intent.
+      if (closed === null) return outcome(ExitCode.SAFETY_REFUSAL, 'INVOICE_UNCONFIRMED');
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'BUDGET_EXHAUSTED' });
+      return outcome(ExitCode.SAFETY_REFUSAL, 'BUDGET_EXHAUSTED');
+    }
     if (submitted.status === 'CANCELLED') {
       if (await closeInvoice()) return paidPreparation(baseline);
       return outcome(ExitCode.SAFETY_REFUSAL, db.executions.view(executionId)?.errorCode ?? 'BUDGET_EXHAUSTED');

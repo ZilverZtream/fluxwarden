@@ -1,7 +1,7 @@
 // `fluxwarden nodes list` and `fluxwarden nodes inspect <name> [--capabilities]` (SPEC.md §10.3 item 2).
 import { missingCapabilityReason, REQUIRED_CAPABILITIES, type NodeCapability } from '../core/capabilities.js';
 import { ExitCode } from '../core/exit-codes.js';
-import { nodeText } from '../output/index.js';
+import { nodeText, redactLoadedSecrets } from '../output/index.js';
 import type { ConnectionFlags } from '../cli/args.js';
 import { resolveConnection, type Environment } from '../cli/connect.js';
 import { handshake, networkName, nodeFailure, quarantineWarning } from './handshake.js';
@@ -104,7 +104,7 @@ export async function nodesInspect(io: Io, request: InspectRequest): Promise<num
       return emitJson(io, command, {
         code, warnings, error: null,
         result: {
-          name: node.name, implementation: node.implementation, alias: boundedUtf8(done.alias, 256),
+          name: node.name, implementation: node.implementation, alias: boundedUtf8(redactLoadedSecrets(done.alias), 256),
           pubkey: identity.pubkey, network: networkName(node, identity.network), version: identity.version, synced: identity.syncedToChain,
           block_height: identity.blockHeight, capabilities: request.capabilities ? sorted : null,
         },

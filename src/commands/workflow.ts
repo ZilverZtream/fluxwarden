@@ -19,7 +19,7 @@ import { bootstrapAlerts } from '../daemon/bootstrap.js';
 import { openClnController } from '../node-cln/controller.js';
 import { openLndController } from '../node-lnd/controller.js';
 import { LND_FINAL_CLTV_DELTA } from '../node-lnd/execute.js';
-import { envelope, renderEnvelope, terminalText } from '../output/index.js';
+import { envelope, registerOutputSecret, renderEnvelope, terminalText } from '../output/index.js';
 import type { Database, StoredProposal } from '../persistence/index.js';
 import type { PlanningPolicy } from '../planner/diagnose.js';
 import { renderProposal } from '../planner/proposal.js';
@@ -81,8 +81,8 @@ export function selectNodes(config: Config, name: string | null): readonly NodeC
 export async function controller(node: NodeConfig, config: Config, session: Handshake, clock: { now(): number } = { now: () => Date.now() }) {
   const connection = session.connection;
   const payment = node.implementation === 'cln'
-    ? await openClnController({ ...connection.endpoint, tlsCertPath: connection.tlsCertPath, runePath: connection.credentialPath, timeoutMs: Math.min(30_000, config.attemptDeadlineMs) }, node.expectedPubkey, config.attemptDeadlineMs)
-    : await openLndController({ ...connection.endpoint, tlsCertPath: connection.tlsCertPath, macaroonPath: connection.credentialPath }, config.attemptDeadlineMs);
+    ? await openClnController({ ...connection.endpoint, tlsCertPath: connection.tlsCertPath, runePath: connection.credentialPath, timeoutMs: Math.min(30_000, config.attemptDeadlineMs), onSecret: registerOutputSecret }, node.expectedPubkey, config.attemptDeadlineMs)
+    : await openLndController({ ...connection.endpoint, tlsCertPath: connection.tlsCertPath, macaroonPath: connection.credentialPath, onSecret: registerOutputSecret }, config.attemptDeadlineMs);
   const listChannels = () => session.reader.listChannels({ nodeId: session.rowId, observedAt: clock.now(), blockHeight: session.result.identity.blockHeight });
   const capabilities = new Set<NodeCapability>();
   for (const capability of ['CHANNEL_READ', 'PAYMENT_READ', 'INVOICE_CREATE', 'INVOICE_CANCEL', 'PAYMENT_TRACK'] as const) {
@@ -203,7 +203,9 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
       const leaseMs = config.attemptDeadlineMs + 60_000;
       const executionPolicy: ExecutionPolicy = { sha256: context.policy.sha256, network: policy.network, maxFeeMsat: policy.fees.max_fee_msat,
         maxFeePpm: BigInt(policy.fees.max_fee_ppm), exemptFeeMsat: policy.fees.exempt_fee_msat, maxCltvDelta: policy.routing.max_cltv_delta,
-        minChannelReserveMsat: policy.amounts.min_channel_reserve_msat, budget: { msat: policy.budget.msat, periodMs: policy.budget.period * 1000 },
+        minChannelReserveMsat: policy.amounts.min_channel_reserve_msat,
+        minSourceOutboundMsat: policy.targets[node.name]?.[context.proposal.sourceChannelKey]?.min_outbound_msat ?? 0n,
+        budget: { msat: policy.budget.msat, periodMs: policy.budget.period * 1000 },
         cooldownAfterFailureMs: policy.cooldown_after_failure * 1000, cooldownAfterSuccessMs: policy.cooldown_after_success * 1000,
         maxInFlight: policy.max_in_flight, maxSnapshotAgeMs: policy.max_snapshot_age * 1000, excludeChannels: policy.exclude_channels };
       const ready = await prepareExecution({ db, adapter: payment.adapter, workerId, leaseMs }, { approval, policy: executionPolicy, approvalKeyIds: config.approvalKeys.map(key => key.keyId) });
@@ -237,7 +239,7 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
         let channels = stored === undefined ? [] : db.commandData.snapshots(stored.id);
         const now = db.now();
         const stale = channels.length === 0 || channels.some(channel => now - channel.observedAt > policy.max_snapshot_age * 1000);
-        const session = command.kind === 'liquidity plan' || stale ? await handshake(db, node, resolveConnection(node, command.connection, env)) : null;
+        const session = command.kind === 'liquidity plan' || policy.demand.mode === 'ewma' || stale ? await handshake(db, node, resolveConnection(node, command.connection, env)) : null;
         if ((command.kind === 'liquidity diagnose' && stale) || command.refresh) {
           if (session === null) throw new Error('a refresh requires a handshake');
           channels = await session.reader.listChannels({ nodeId: session.rowId, observedAt: db.now(), blockHeight: session.result.identity.blockHeight });
@@ -245,8 +247,14 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
           stored = db.nodes.list().find(row => row.name === node.name);
           channels = db.commandData.snapshots(session.rowId);
         }
+        const incomingHistory = policy.demand.mode === 'ewma' ? await session?.reader.incomingHistory?.() : undefined;
         if (command.kind === 'liquidity diagnose') {
-          const result = liquidityDiagnose({ nodeName: node.name, channels, policy: planningPolicy(policy), horizonMs: horizon, clock: db });
+          const result = liquidityDiagnose({ nodeName: node.name, channels, policy: planningPolicy(policy), horizonMs: horizon, clock: db,
+            ...(incomingHistory === undefined ? {} : { incomingHistory }) });
+          if (!io.json && result.exitCode !== 0) {
+            const error = (JSON.parse(result.json) as { error: { step: string | null; message: string } }).error;
+            return refuse(io, command.kind, result.exitCode, error.step, error.message);
+          }
           io.output.write('stdout', io.json ? result.json : terminalText(`${JSON.stringify((JSON.parse(result.json) as { result: unknown }).result, null, 2)}\n`)); return result.exitCode;
         }
         if (session === null || stored === undefined) throw new StageFailure(5, 'STALE_SNAPSHOT', 'no channel snapshot is available');
@@ -254,7 +262,8 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
         const planningState = db.commandData.planningState(stored.id, policy.budget.period * 1000);
         const result = await liquidityPlan({ db, node: { id: stored.id, name: node.name, pubkey: node.expectedPubkey, implementation: node.implementation }, channels,
           policy: planningPolicy(policy, horizon), policySha256: policySha256(policy), policyCanonicalJson: canonicalPolicyJson(policy), blockHeight: session.result.identity.blockHeight,
-          finalCltvDelta: node.implementation === 'lnd' ? LND_FINAL_CLTV_DELTA : 18, ...planningState, routes: payment.routes, clock: db });
+          finalCltvDelta: node.implementation === 'lnd' ? LND_FINAL_CLTV_DELTA : 18, ...planningState, routes: payment.routes, clock: db,
+          ...(incomingHistory === undefined ? {} : { incomingHistory }) });
         io.output.write('stdout', io.json ? result.json : result.text); return result.exitCode;
       }
     }

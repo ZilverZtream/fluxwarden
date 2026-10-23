@@ -3,6 +3,7 @@
 import { ExitCode } from '../core/exit-codes.js';
 import type { Msat } from '../core/money.js';
 import type { NormalizedChannel } from '../core/normalize.js';
+import type { IncomingHistory } from '../core/node.js';
 import { isNoRoute, validateRoute, type CandidateRoute, type EffectivePolicy, type NoRoute, type RouteChannel, type RouteConstraints } from '../core/route.js';
 import { ulid } from '../core/ulid.js';
 import { envelope, renderEnvelope, terminalText } from '../output/index.js';
@@ -37,6 +38,7 @@ export interface LiquidityPlanInput {
   readonly reservations: readonly BudgetReservation[];
   readonly routes: RouteFinder;
   readonly clock: Clock;
+  readonly incomingHistory?: IncomingHistory;
 }
 
 function refusal(message: string, step: string, code: number): CommandOutcome {
@@ -62,11 +64,16 @@ export async function liquidityPlan(input: LiquidityPlanInput): Promise<CommandO
   const { policy, node } = input;
   if (!Number.isSafeInteger(policy.proposal_ttl) || policy.proposal_ttl <= 0) throw new RangeError('proposal_ttl must be a positive number of milliseconds');
   const now = input.clock.now();
-  const diagnosis = diagnose({ nodeName: node.name, channels: input.channels, policy, horizonMs: null, clock: input.clock });
+  const diagnosis = diagnose({ nodeName: node.name, channels: input.channels, policy, horizonMs: null, clock: input.clock,
+    ...(input.incomingHistory === undefined ? {} : { incomingHistory: input.incomingHistory }) });
   if (diagnosis.status === 'STALE_SNAPSHOT') {
     const listed = diagnosis.stale.map(entry => `${entry.channelKey} (${String(entry.ageMs)} ms)`).join(', ');
     return refusal(`snapshot age outside 0..${String(policy.max_snapshot_age)} ms for ${node.name}: ${listed}`, 'STALE_SNAPSHOT', ExitCode.SAFETY_REFUSAL);
   }
+  if (diagnosis.status === 'INSUFFICIENT_HISTORY' && policy.demand.mode === 'ewma') {
+    return refusal('settled incoming history is insufficient for EWMA demand', 'INSUFFICIENT_HISTORY', ExitCode.SAFETY_REFUSAL);
+  }
+  const demandSource = diagnosis.status === 'OK' ? diagnosis.demandSource : 'TARGETS';
 
   const candidates: CandidateDocument[] = [];
   const valid: AssessedPair[] = [];
@@ -144,7 +151,7 @@ export async function liquidityPlan(input: LiquidityPlanInput): Promise<CommandO
     expiresAt,
   });
   const explanation: ExplanationTree = {
-    demand_source: 'TARGETS',
+    demand_source: demandSource,
     exempt_fee_msat: fees.exempt_fee_msat.toString(),
     inputs: inputs(input.channels, now),
     candidates: sorted,
@@ -161,7 +168,7 @@ export async function liquidityPlan(input: LiquidityPlanInput): Promise<CommandO
     maxFeePpm: fees.max_fee_ppm,
     maxCltvDelta: policy.routing.max_cltv_delta,
     routeJson: chosen === undefined ? null : JSON.stringify(routeDocument(chosen.verdict)),
-    demandSource: 'TARGETS',
+    demandSource,
     digest,
     reasonJson: JSON.stringify(explanation),
     createdAt: now,

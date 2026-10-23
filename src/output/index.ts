@@ -1,6 +1,26 @@
 // All user-visible writes pass through this module.
 import type { Writable } from 'node:stream';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Secret } from '../core/secret.js';
+
+const commandSecrets = new AsyncLocalStorage<{ secrets: Secret[]; redactor: ReturnType<typeof Secret.redactor> }>();
+
+/** Each CLI invocation owns its loaded credentials, including asynchronous daemon work. */
+export function withOutputSecrets<T>(run: () => T): T {
+  return commandSecrets.run({ secrets: [], redactor: Secret.redactor([]) }, run);
+}
+
+/** Register the actual loaded Secret before any node response can reach output. */
+export function registerOutputSecret(secret: Secret): void {
+  const scope = commandSecrets.getStore();
+  if (scope === undefined || scope.secrets.some(known => known.fingerprint === secret.fingerprint)) return;
+  scope.secrets.push(secret);
+  scope.redactor = Secret.redactor(scope.secrets);
+}
+
+export function redactLoadedSecrets(text: string): string {
+  return commandSecrets.getStore()?.redactor.redact(text) ?? text;
+}
 
 export type Stream = 'stdout' | 'stderr';
 
@@ -39,7 +59,7 @@ export function envelope(
  * restyle the terminal.
  */
 export function nodeText(value: string, maxBytes = 256): string {
-  let text = value;
+  let text = redactLoadedSecrets(value);
   if (Buffer.byteLength(text, 'utf8') > maxBytes) {
     let end = Math.min(text.length, maxBytes);
     while (end > 0 && Buffer.byteLength(text.slice(0, end), 'utf8') > maxBytes) end -= 1;
@@ -51,12 +71,12 @@ export function nodeText(value: string, maxBytes = 256): string {
 
 /** One JSON document on one line, newline-terminated. */
 export function renderEnvelope(doc: Envelope): string {
-  return `${jsonText(doc, redactPatterns)}\n`;
+  return `${jsonText(doc, text => redactPatterns(redactLoadedSecrets(text)))}\n`;
 }
 
 /** Text for a terminal: control and bidirectional characters become printable escapes, newlines stay. */
 export function terminalText(text: string): string {
-  return escapeText(redactPatterns(text), true);
+  return escapeText(redactPatterns(redactLoadedSecrets(text)), true);
 }
 
 export interface RenderOutput {
@@ -70,12 +90,19 @@ export interface RenderOutput {
 
 /** UTF-8 rendering over injected transports, including pipes with closed readers. */
 export function createOutput(options: { stdout: Writable; stderr: Writable; secrets: readonly Secret[] }): RenderOutput {
-  const secrets = Secret.redactor(options.secrets);
-  const overlap = Math.max(PAYMENT_REQUEST_CONTEXT, secrets.overlap);
+  const scope = commandSecrets.getStore();
+  let known = scope?.redactor;
+  let secrets = Secret.redactor([...options.secrets, ...(scope?.secrets ?? [])]);
+  const refresh = (): void => {
+    if (known === scope?.redactor) return;
+    known = scope?.redactor;
+    secrets = Secret.redactor([...options.secrets, ...(scope?.secrets ?? [])]);
+  };
   type Transport = { context: string; suffix: string; held: string; pending: Promise<void> };
   const streams = new Map<Writable, Transport>();
   let finalized: Promise<void> | undefined;
   const redact = (text: string): string => {
+    refresh();
     text = secrets.redact(text);
     return redactPatterns(text);
   };
@@ -86,6 +113,7 @@ export function createOutput(options: { stdout: Writable; stderr: Writable; secr
     target.on('error', () => { closed.add(target); });
   }
   const emit = async (target: Writable, transport: Transport, credentialFree: string): Promise<void> => {
+    const overlap = Math.max(PAYMENT_REQUEST_CONTEXT, secrets.overlap);
     const rendered = redactPatterns(credentialFree, transport.suffix);
     for (const [piece, chunk] of utf8Chunks(rendered, value => escapeText(value, true))) {
       if (closed.has(target) || target.destroyed || !target.writable) return;
@@ -124,6 +152,7 @@ export function createOutput(options: { stdout: Writable; stderr: Writable; secr
     }
     const transport = state;
     const completed = transport.pending.then(async () => {
+      refresh();
       // Match registered values before pattern redaction can obscure their starts. Only an undecidable suffix is
       // retained; write completion acknowledges this bounded acceptance, independently for each transport.
       const credentialFree = secrets.redact(transport.held + text, transport.context);
@@ -314,7 +343,7 @@ export function processOutput(): Output {
       const before = bytesWritten(target);
       let returned = false;
       try {
-        const chunks = utf8Chunks(redactPatterns(text), piece => escapeText(piece, true));
+        const chunks = utf8Chunks(redactPatterns(redactLoadedSecrets(text)), piece => escapeText(piece, true));
         const next = (): void => {
           const chunk = chunks.next();
           if (chunk.done || target.destroyed || !target.writable) { done?.(); return; }

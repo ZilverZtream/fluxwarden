@@ -30,6 +30,8 @@ export interface ClnRestOptions {
   port: number;
   tlsCertPath: string;
   runePath: string;
+  /** The output owner registers the credential without obtaining its bytes. */
+  onSecret?: (secret: Secret) => void;
   /** Bound on one call (default 30000 ms). */
   timeoutMs?: number;
 }
@@ -208,7 +210,9 @@ export function openClnRest(options: ClnRestOptions): Promise<ClnRest> {
     const ca = readBoundedFile(options.tlsCertPath, 'TLS certificate');
     const rune = readBoundedFile(options.runePath, 'rune').toString('utf8').trim();
     if (rune === '' || !/^[\x21-\x7e]+$/.test(rune)) throw new Error('rune file must hold one rune');
-    return Promise.resolve(new ClnRestClient(options, ca, new Secret(Buffer.from(rune, 'utf8'))));
+    const secret = new Secret(Buffer.from(rune, 'utf8'));
+    options.onSecret?.(secret);
+    return Promise.resolve(new ClnRestClient(options, ca, secret));
   } catch (error) {
     return Promise.reject(error instanceof Error ? error : new Error('credential files could not be read'));
   }

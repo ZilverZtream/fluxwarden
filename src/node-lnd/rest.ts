@@ -27,6 +27,8 @@ export interface LndRestOptions {
   port: number;
   tlsCertPath: string;
   macaroonPath: string;
+  /** The output owner registers the credential without obtaining its bytes. */
+  onSecret?: (secret: Secret) => void;
   /** Bound on a unary call, and on a stream until its answer begins (default 30000 ms). */
   timeoutMs?: number;
   /** Bound on the time to a TLS session for a stream; the stream itself is not bounded by it (default 10000 ms). */
@@ -279,6 +281,7 @@ export function openLndRest(options: LndRestOptions): Promise<LndRest> {
     }
     const ca = readBoundedFile(options.tlsCertPath, 'TLS certificate');
     const macaroon = new Secret(readBoundedFile(options.macaroonPath, 'macaroon'));
+    options.onSecret?.(macaroon);
     return Promise.resolve(new LndRestClient(options, ca, macaroon));
   } catch (error) {
     return Promise.reject(error instanceof Error ? error : new Error('credential files could not be read'));

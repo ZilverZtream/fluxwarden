@@ -92,7 +92,8 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
       journal_id: journals.find(journal => journal.eventType === 'RECON_DIFFERENCE' && journal.executionId === difference.executionId)?.id ?? runId }));
     const report = { run_id: runId, since: window.window.sinceMs, nodes: accounting.nodes.map(node => ({ name: node.node, result: node.status })), executions: changes, differences,
       steps: [1, 2, 3, 4].map(step => ({ step, result: step === 4 && accounting.nodes.some(node => node.status !== 'compared') ? 'incomplete' : 'compared' })) };
-    const proposals = db.commandData.proposalIds().map(id => database.proposals.find(id)).filter(proposal => proposal !== null).map(proposal => proposalDocument(proposal, database.now()));
+    const proposals = db.commandData.proposalIds({ nodeIds: [...adapters.keys()], ...window.window })
+      .map(id => database.proposals.find(id)).filter(proposal => proposal !== null).map(proposal => proposalDocument(proposal, database.now()));
     const policy = activePolicy(config);
     const build = buildIdentity();
     const input: EvidenceInput = {
@@ -103,7 +104,8 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
           tlsFingerprint: fingerprints.get(node.name)?.tlsFingerprint ?? 'unavailable: adapter did not expose certificate fingerprint' })),
         seeds: [], policySha256: policySha256(policy), approvalKeyIds: config.approvalKeys.map(key => key.keyId), chaosScenarioIds: [],
         unavailableEvidence: { image_digests: 'node RPC does not expose container image digests', seeds: 'reconciliation uses no simulation seed',
-          chaos_scenario_ids: 'no chaos scenario was supplied for this run' } },
+          chaos_scenario_ids: 'no chaos scenario was supplied for this run',
+          proposal_history: 'proposals cover the selected nodes and reconciliation window, plus all execution inputs; unrelated planner history is omitted' } },
       topologyBefore, topologyAfter: nodes.flatMap(node => { const stored = database.nodes.list().find(row => row.name === node.name); return stored === undefined ? [] : database.commandData.snapshots(stored.id); }),
       proposals, executionTrace: ids.flatMap(id => database.executions.events(id).map(event => ({ execution_id: id, ...event }))),
       ledgerAudit: { journals, balances: Object.fromEntries(db.ledger.balances()), steps: report.steps }, reconciliation: report, chaosResults: [],

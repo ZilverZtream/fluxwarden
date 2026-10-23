@@ -1,7 +1,7 @@
 import type { VerifiedApproval } from '../approval/verified.js';
 import { LndError, ProtocolError, TransportError } from '../core/errors.js';
 import {
-  approveRoute, invoiceLabel, proveRegtest,
+  approveRoute, invoiceLabel, proveRegtest, sourceReserveFloor,
   type ApprovedRoute, type CancelResult, type CircularRoute, type ExecutionAdapter, type ExecutionPolicy, type InvoiceState, type NodeCapability, type PreflightAdapter,
 } from '../core/execution.js';
 import type { NormalizedChannel } from '../core/normalize.js';
@@ -97,7 +97,7 @@ function routeRefusal(
   }
   // V8 and V9 on the fresh snapshot
   if (source.spendableMsat < principal + fee) return 'FIRST_HOP_SPENDABLE';
-  if (source.spendableMsat - (principal + fee) < policy.minChannelReserveMsat) return 'RESERVE_FLOOR';
+  if (source.spendableMsat - (principal + fee) < sourceReserveFloor(policy)) return 'RESERVE_FLOOR';
   if (target.receivableMsat < principal) return 'LAST_HOP_RECEIVABLE';
   return null;
 }
@@ -183,7 +183,7 @@ export async function prepareExecution(deps: PreflightDeps, input: PreflightInpu
     const source = channels.find(channel => channel.channelKey === plan.sourceChannelKey);
     const target = channels.find(channel => channel.channelKey === plan.targetChannelKey);
     if (!fresh(source) || !fresh(target)) return refuse('STALE_SNAPSHOT');
-    if (source.spendableMsat - (plan.principalMsat + approval.approvedMaxFeeMsat) < policy.minChannelReserveMsat) return refuse('RESERVE_FLOOR');
+    if (source.spendableMsat - (plan.principalMsat + approval.approvedMaxFeeMsat) < sourceReserveFloor(policy)) return refuse('RESERVE_FLOOR');
 
     const answer = await adapter.findCircularRoute({
       sourceChannelKey: plan.sourceChannelKey,

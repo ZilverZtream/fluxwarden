@@ -21,9 +21,9 @@
     {
       "upstreamPath": "examples/payment-lab/src/lnd/errors.ts",
       "path": "src/core/errors.ts",
-      "changes": "Source attribution, explicit number formatting for strict lint, TLS, authentication and CLN error classes, and a shared transport failure classifier.",
+      "changes": "Source attribution, explicit number formatting for strict lint, TLS, authentication and CLN error classes, and a shared transport failure classifier. Native gRPC NotFound classification requires an absent HTTP status, 200 or 404, preserving ambiguity for transport and authentication failures.",
       "upstreamSha256": "c8835fd77e2dcbe89bfa6ec880a760597c8d78ed8e0339827d7fff7fd0d3f5a7",
-      "importedSha256": "31dd82c73fafeb10b92c68310996c14dcd26202171a01cb60f39d3661a1ef9e2",
+      "importedSha256": "0db15b8e97357f1a0ae17d213bc32253661e426d600c8fb053d0f73f975f5901",
       "disposition": "adapted"
     },
     {
@@ -69,9 +69,9 @@
     {
       "upstreamPath": "examples/payment-lab/src/lnd/rest.ts",
       "path": "src/node-lnd/rest.ts",
-      "changes": "Credential kept in a Secret with redacted peer text, bounded descriptor reads, TLS and request phases, a mandatory stream deadline and stream end outcomes; envelope and line parsing moved to src/node-lnd/stream.ts, and the unary transport mirrored in src/node-cln/rest.ts, both attributed in their headers; an optional callback once a unary request is written.",
+      "changes": "Credential kept in a Secret with redacted peer text, bounded descriptor reads, TLS and request phases, a mandatory stream deadline and stream end outcomes; envelope and line parsing moved to src/node-lnd/stream.ts, and the unary transport mirrored in src/node-cln/rest.ts, both attributed in their headers; an optional callback once a unary request is written. An optional Secret registration callback registers the loaded macaroon for command-scoped output redaction without exposing credential bytes.",
       "upstreamSha256": "af0b78f1ab56466f1e33681081496b815a0a326f66c93fca053fe4225ec3af76",
-      "importedSha256": "6f341e3d9cc617df4b78e14db6d3ff2d3c19e3fc9cd6416d47717cadc32260f1",
+      "importedSha256": "4fbe03635e098b2ebca7dad56563bd283f77f66b59ec2a174bf6e8317b3fe54b",
       "disposition": "adapted"
     },
     {

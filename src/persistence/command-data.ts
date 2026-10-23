@@ -95,8 +95,19 @@ export function commandData(db: DatabaseSync, writable: (what: string) => void, 
         observedAt: numberColumn(row, 'observed_at'), blockHeight: numberColumn(row, 'block_height'), provenance: JSON.parse(textColumn(row, 'provenance_json')) as Record<string, string>,
       })));
     },
-    // MySQL: same
-    proposalIds(): string[] { return run(() => db.prepare('SELECT id FROM liquidity_proposals ORDER BY created_at, id').all().map(row => textColumn(row, 'id'))); },
+    /** Window proposals for selected nodes, plus every execution's inputs to close trace and ledger references. */
+    proposalIds(scope?: { readonly nodeIds: readonly string[]; readonly sinceMs: number; readonly untilMs: number }): string[] {
+      return run(() => {
+        // MySQL: same. Scope unrelated planner history before loading route and explanation documents.
+        const rows = scope === undefined
+          ? db.prepare('SELECT id FROM liquidity_proposals ORDER BY created_at, id').all()
+          : db.prepare(`SELECT p.id FROM liquidity_proposals p WHERE
+              (p.node_id IN (${scope.nodeIds.map(() => '?').join(',') || 'NULL'}) AND p.created_at >= ? AND p.created_at < ?)
+              OR EXISTS (SELECT 1 FROM executions e WHERE e.proposal_id = p.id)
+            ORDER BY p.created_at, p.id`).all(...scope.nodeIds, scope.sinceMs, scope.untilMs);
+        return rows.map(row => textColumn(row, 'id'));
+      });
+    },
     // MySQL: same
     executionIds(): string[] { return run(() => db.prepare('SELECT id FROM executions ORDER BY created_at, id').all().map(row => textColumn(row, 'id'))); },
   };

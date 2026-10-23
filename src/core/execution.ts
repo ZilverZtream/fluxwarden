@@ -64,12 +64,20 @@ export interface ExecutionPolicy {
   readonly exemptFeeMsat: bigint;
   readonly maxCltvDelta: number;
   readonly minChannelReserveMsat: bigint;
+  /** Configured outbound target of this execution's source channel under the signed policy. */
+  readonly minSourceOutboundMsat?: bigint;
   readonly budget: { readonly msat: bigint; readonly periodMs: number };
   readonly cooldownAfterFailureMs: number;
   readonly cooldownAfterSuccessMs: number;
   readonly maxInFlight: number;
   readonly maxSnapshotAgeMs: number;
   readonly excludeChannels?: readonly string[];
+}
+
+/** The policy reserve and the source's outbound target both survive every execution liquidity check. */
+export function sourceReserveFloor(policy: Pick<ExecutionPolicy, 'minChannelReserveMsat' | 'minSourceOutboundMsat'>): bigint {
+  const target = policy.minSourceOutboundMsat ?? 0n;
+  return target > policy.minChannelReserveMsat ? target : policy.minChannelReserveMsat;
 }
 
 export interface RouteHop {
@@ -289,7 +297,7 @@ function contextRefusal(route: CircularRoute, terms: RouteTerms, policy: Executi
   const target = context.channels.find(channel => channel.channelKey === terms.targetChannelKey);
   if (source === undefined || target === undefined || source.peerPubkey !== route.outPeer || target.peerPubkey !== route.inPeer) return 'NO_FEASIBLE_ROUTE';
   if (source.spendableMsat < first.amountOutMsat) return 'FIRST_HOP_SPENDABLE';
-  if (source.spendableMsat - first.amountOutMsat < policy.minChannelReserveMsat) return 'RESERVE_FLOOR';
+  if (source.spendableMsat - first.amountOutMsat < sourceReserveFloor(policy)) return 'RESERVE_FLOOR';
   if (target.receivableMsat < terms.principalMsat) return 'LAST_HOP_RECEIVABLE';
   if (source.state !== 'ACTIVE' || target.state !== 'ACTIVE') return 'NO_FEASIBLE_ROUTE';
   return null;

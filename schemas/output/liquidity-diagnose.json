@@ -67,7 +67,7 @@
         "action": { "enum": ["DEFICIT", "NO_ACTION"] },
         "reason": { "enum": [null, "BALANCED_OR_INSUFFICIENT_SURPLUS", "INSUFFICIENT_HISTORY"] },
         "node": { "type": "string", "minLength": 1 },
-        "demand_source": { "enum": [null, "TARGETS"] },
+        "demand_source": { "enum": [null, "TARGETS", "EWMA"] },
         "horizon_seconds": { "type": "integer", "minimum": 0 },
         "evaluated_at": { "type": "integer", "minimum": 0 },
         "channels": { "type": "array", "items": { "$ref": "#/$defs/channel" } },
@@ -75,8 +75,8 @@
         "donors": { "type": "array", "items": { "$ref": "#/$defs/channelKey" } }
       },
       "oneOf": [
-        { "properties": { "action": { "const": "DEFICIT" }, "reason": { "type": "null" }, "demand_source": { "const": "TARGETS" } } },
-        { "properties": { "action": { "const": "NO_ACTION" }, "reason": { "const": "BALANCED_OR_INSUFFICIENT_SURPLUS" }, "demand_source": { "const": "TARGETS" } } },
+        { "properties": { "action": { "const": "DEFICIT" }, "reason": { "type": "null" }, "demand_source": { "enum": ["TARGETS", "EWMA"] } } },
+        { "properties": { "action": { "const": "NO_ACTION" }, "reason": { "const": "BALANCED_OR_INSUFFICIENT_SURPLUS" }, "demand_source": { "enum": ["TARGETS", "EWMA"] } } },
         { "properties": { "action": { "const": "NO_ACTION" }, "reason": { "const": "INSUFFICIENT_HISTORY" }, "demand_source": { "type": "null" }, "channels": { "type": "array", "maxItems": 0 } } }
       ]
     }

@@ -33,6 +33,12 @@ export interface PaymentsPage {
   readonly cursor: bigint;
 }
 
+/** A complete bounded scan of settled receipts, attributed by the receiving node. */
+export interface IncomingHistory {
+  readonly complete: boolean;
+  readonly receipts: readonly { readonly channelKey: string; readonly settledAt: number; readonly amountMsat: bigint }[];
+}
+
 export interface NodeReader {
   readonly implementation: Implementation;
   /** Connect-time handshake (SPEC.md §5.2 H2 to H8), with the alias the identity call reported. */
@@ -43,4 +49,6 @@ export interface NodeReader {
   listChannels(context: NormalizeContext): Promise<NormalizedChannel[]>;
   /** One page of the payment history, oldest first, starting after `cursor`. */
   paymentsPage(cursor: bigint, pageSize: number): Promise<PaymentsPage>;
+  /** No bytes, preimages or payment requests are retained in demand history. */
+  incomingHistory?(): Promise<IncomingHistory>;
 }

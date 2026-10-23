@@ -28,7 +28,7 @@ export class LndError extends Error {
   }
 
   /**
-   * LND itself answered NotFound: gRPC code 5, whatever the HTTP status. LND's REST gateway
+   * LND itself answered NotFound: gRPC code 5 with a native lookup HTTP status. LND's REST gateway
    * (grpc-gateway) always sends the gRPC code with its error body (`{"code":5,"message":...}`).
    * A 404 without a code, bodiless or with a body such as `{"message":"Not Found"}` (an API
    * gateway) or `{"message":"no Route matched with those values"}` (Kong), comes from a proxy
@@ -36,7 +36,7 @@ export class LndError extends Error {
    * not NotFound (the caller treats it as unknown), and definiteRefusal treats it as ambiguous.
    */
   get notFound(): boolean {
-    return this.grpcCode === NOT_FOUND;
+    return this.grpcCode === NOT_FOUND && (this.httpStatus === undefined || this.httpStatus === 200 || this.httpStatus === 404);
   }
 }
 

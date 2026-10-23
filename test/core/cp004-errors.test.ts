@@ -9,7 +9,9 @@ it('CP-004/B4 only documented gRPC refusals are definite and proxy timeouts rema
     for (const status of [undefined, 200, 400, 404, 408, 499, 500, 502, 503, 504]) {
       const error = new errors.LndError('node refused', code, status);
       expect(errors.definiteRefusal(error), `gRPC ${String(code)} HTTP ${String(status)}`).toBe(definite.includes(code) && !ambiguous.includes(status ?? 0));
-      expect(error.notFound).toBe(code === 5);
+      // Authorized post-audit oracle correction: a proxy/authentication HTTP
+      // failure cannot turn a coincidental gRPC code into native absence.
+      expect(error.notFound).toBe(code === 5 && (status === undefined || status === 200 || status === 404));
     }
   }
   for (const status of [400, 404, 408, 499, 500, 502, 503, 504]) {

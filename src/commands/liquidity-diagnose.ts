@@ -45,6 +45,11 @@ export function liquidityDiagnose(input: DiagnoseInput): { readonly exitCode: nu
       return { exitCode: ExitCode.SAFETY_REFUSAL, json: renderEnvelope(envelope(COMMAND, null, { code: ExitCode.SAFETY_REFUSAL, step: 'STALE_SNAPSHOT', message })) };
     }
     case 'INSUFFICIENT_HISTORY': {
+      if (input.policy.demand.mode === 'ewma') {
+        return { exitCode: ExitCode.SAFETY_REFUSAL, json: renderEnvelope(envelope(COMMAND, null, {
+          code: ExitCode.SAFETY_REFUSAL, step: 'INSUFFICIENT_HISTORY', message: 'settled incoming history is insufficient for EWMA demand',
+        })) };
+      }
       const evaluatedAt = input.clock.now();
       return {
         exitCode: ExitCode.SUCCESS,

@@ -312,7 +312,7 @@ function feeCorrections(journals: readonly StoredJournal[], executionId: string,
   for (const journal of journals) {
     if (journal.eventType !== 'RECON_DIFFERENCE' || journal.executionId !== executionId) continue;
     const ownReference = journal.reference === base || (journal.reference.startsWith(`${base}:`) && /^[1-9][0-9]*$/.test(journal.reference.slice(base.length + 1)));
-    const feeReference = ['listpayments', 'listsendpays', 'bkpr'].some(name => {
+    const feeReference = journal.reference === `fee-attribution-offset:${executionId}` || ['listpayments', 'listsendpays', 'bkpr'].some(name => {
       const prefix = `${executionId}:fee:${name}`;
       return journal.reference === prefix || (journal.reference.startsWith(`${prefix}:`) && /^[1-9][0-9]*$/.test(journal.reference.slice(prefix.length + 1)));
     });
@@ -333,6 +333,8 @@ function compareNullable(a: string | null, b: string | null): number {
 export async function reconcileAccounting(input: {
   window: ReconcileWindow; journals: readonly StoredJournal[]; executions: readonly ReconExecution[];
   sources: readonly AccountingSource[]; occurredAt: number;
+  /** Absolute fees selected by the same source arbitration as the report; persistence rebases them at commit time. */
+  observeFee?: (observation: { executionId: string; reference: string; feeMsat: bigint; occurredAt: number }) => void;
 }): Promise<AccountingReport> {
   const sides = ledgerSides(input.journals, input.window);
   const nodes: NodeReadStatus[] = [];
@@ -391,6 +393,7 @@ export async function reconcileAccounting(input: {
               return observed?.unusable === null && observed.feeMsat !== record.feeMsat;
             })) continue;
           corrected.add(execution.id);
+          input.observeFee?.({ executionId: execution.id, reference: `${execution.id}:fee:${name}`, feeMsat: record.feeMsat, occurredAt: input.occurredAt });
           if (record.feeMsat !== expensedMsat) {
             const reference = corrections.count === 0 ? `${execution.id}:fee:${name}` : `${execution.id}:fee:${name}:${String(corrections.count + 1)}`;
             journals.push(feeJournal(execution.id, reference, expensedMsat, record.feeMsat, input.occurredAt));

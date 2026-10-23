@@ -1,10 +1,11 @@
 import { ProtocolError } from '../core/errors.js';
-import { CredentialFileError, MAX_CHANNELS_PER_LISTING, type NodeInfo, type NodeReader, type PaymentsPage } from '../core/node.js';
+import { identifier, type JsonObject } from '../core/json.js';
+import { CredentialFileError, MAX_CHANNELS_PER_LISTING, type IncomingHistory, type NodeInfo, type NodeReader, type PaymentsPage } from '../core/node.js';
 import { normalizeClnChannel, type NormalizeContext, type NormalizedChannel } from '../core/normalize.js';
 import { ClnReadApi } from './api.js';
 import { clnSynced, probeClnWithAlias } from './probe.js';
 import { openClnRest, type ClnRest, type ClnRestOptions } from './rest.js';
-import { objects, parseSendPay } from './types.js';
+import { msat, objects, parseInvoice, parseSendPay, text, type ClnAccountEvent } from './types.js';
 
 class ClnReader implements NodeReader {
   readonly implementation = 'cln' as const;
@@ -43,6 +44,93 @@ class ClnReader implements NodeReader {
       next = index + 1n;
     }
     return { count: payments.length, cursor: next };
+  }
+
+  async incomingHistory(): Promise<IncomingHistory> {
+    // CLN v26.06.9 doc/schemas/{listinvoices,listhtlcs}.json: created start is inclusive.
+    // As in the collector, bound each scan to 200 pages of 500; an unfinished scan supplies no demand.
+    const scan = async (method: string, field: string) => {
+      const entries = [];
+      let cursor = 0n;
+      for (let page = 0; page < 200; page++) {
+        const start = Number(cursor);
+        if (!Number.isSafeInteger(start)) return null;
+        const batch = objects(await this.#rest.call(method, { index: 'created', start, limit: 500 }), field);
+        if (batch.length > 500) throw new ProtocolError('incoming history page longer than requested');
+        for (const entry of batch) {
+          if (entry['created_index'] === undefined) throw new ProtocolError('incoming history index is missing');
+          const index = BigInt(identifier(entry, 'created_index'));
+          if (index < cursor) throw new ProtocolError('incoming history page does not advance');
+          cursor = index + 1n;
+          entries.push(entry);
+        }
+        if (batch.length < 500) return entries;
+      }
+      return null;
+    };
+    const invoices = await scan('listinvoices', 'invoices');
+    const htlcs = await scan('listhtlcs', 'htlcs');
+    if (invoices === null || htlcs === null) return { complete: false, receipts: [] };
+    const events = await new ClnReadApi(this.#rest).listAccountEvents();
+    if (events.length > 100_000) return { complete: false, receipts: [] };
+    const channels = await new ClnReadApi(this.#rest).listPeerChannels();
+    if (channels.length > MAX_CHANNELS_PER_LISTING) return { complete: false, receipts: [] };
+    const channelKeys = new Map<string, string>();
+    for (const channel of channels) {
+      if (channel.channelId === null) continue;
+      if (channelKeys.has(channel.channelId)) throw new ProtocolError('incoming history names a channel account twice');
+      channelKeys.set(channel.channelId, channel.shortChannelId ?? channel.channelId);
+    }
+    const receipts: IncomingHistory['receipts'][number][] = [];
+    const byHash = new Map<string, JsonObject[]>();
+    for (const htlc of htlcs) {
+      if (text(htlc, 'direction') !== 'in' || text(htlc, 'state') !== 'SENT_REMOVE_ACK_REVOCATION') continue;
+      const hash = text(htlc, 'payment_hash');
+      const list = byHash.get(hash) ?? [];
+      list.push(htlc); byHash.set(hash, list);
+    }
+    const creditsByHash = new Map<string, ClnAccountEvent[]>();
+    for (const event of events) {
+      if (event.paymentId === null || event.type !== 'channel' || event.creditMsat <= 0n) continue;
+      const list = creditsByHash.get(event.paymentId) ?? [];
+      list.push(event); creditsByHash.set(event.paymentId, list);
+    }
+    const seen = new Set<string>();
+    for (const raw of invoices) {
+      const invoice = parseInvoice(raw);
+      if (seen.has(invoice.paymentHash)) throw new ProtocolError('incoming history names an invoice twice');
+      seen.add(invoice.paymentHash);
+      if (invoice.status !== 'paid' || invoice.paidAt === null || invoice.amountReceivedMsat === null) continue;
+      const at = invoice.paidAt * 1000;
+      if (!Number.isSafeInteger(at)) throw new ProtocolError('incoming settlement time is out of range');
+      const matching = byHash.get(invoice.paymentHash) ?? [];
+      const credits = creditsByHash.get(invoice.paymentHash) ?? [];
+      if (credits.some(event => event.isRebalance === true)) continue;
+      // CLN v26.06.9 lightningd/peer_htlcs.c remove_htlc_in credits only a fulfilled HTLC;
+      // SENT_REMOVE_ACK_REVOCATION also retains failed attempts, so those are attribution hints only.
+      // plugins/bkpr/channel_event.c exposes the credited account and amount, not a listhtlcs success flag.
+      if (credits.length === 0 || credits.some(event => event.isRebalance !== false || event.tag !== 'invoice' || event.debitMsat !== 0n)
+        || credits.reduce((total, event) => total + event.creditMsat, 0n) !== invoice.amountReceivedMsat) return { complete: false, receipts: [] };
+      const hints = new Map<string, number>();
+      for (const htlc of matching) {
+        const key = `${text(htlc, 'short_channel_id')}:${msat(htlc, 'amount_msat').toString()}`;
+        hints.set(key, (hints.get(key) ?? 0) + 1);
+      }
+      for (const credit of credits) {
+        // Bookkeeper retains the full channel account after it closes, while listhtlcs need not retain its
+        // HTLCs. Keep that actual identity; it cannot contribute volume to a different, current channel.
+        const current = channelKeys.get(credit.account);
+        if (current === undefined && !/^[0-9a-f]{64}$/.test(credit.account)) return { complete: false, receipts: [] };
+        if (current !== undefined) {
+          const key = `${current}:${credit.creditMsat.toString()}`;
+          const available = hints.get(key) ?? 0;
+          if (available === 0) return { complete: false, receipts: [] };
+          hints.set(key, available - 1);
+        }
+        receipts.push({ channelKey: current ?? credit.account, settledAt: at, amountMsat: credit.creditMsat });
+      }
+    }
+    return { complete: true, receipts };
   }
 }
 

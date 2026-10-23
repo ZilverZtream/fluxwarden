@@ -1,5 +1,5 @@
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
-import { reportedFeeBreach, transitionAllowed, type ExecutionStatus } from '../core/execution.js';
+import { reportedFeeBreach, transitionAllowed, type ExecutionPolicy, type ExecutionStatus } from '../core/execution.js';
 import { committedMsat, inFlightCount, lastTerminal, type TerminalTimes } from './budget.js';
 import { PersistenceError } from './errors.js';
 import { bigintColumn, checkedMsat, DB_NOW, dbNow, immediate, newUlid, numberColumn, textColumn } from './sql.js';
@@ -148,9 +148,12 @@ export interface ExecutionsRepository {
    * SUBMITTING, IN_FLIGHT or UNKNOWN; otherwise the same fenced write cancels the execution with BUDGET_EXHAUSTED and
    * releases its reservation. The row must already carry its payment hash; SUBMITTING sets submitted_at and renews the
    * lease to database now + leaseMs only if the current lease is still live. One transaction; a stale epoch or expired
-   * dispatch lease throws LEASE_LOST.
+   * dispatch lease throws LEASE_LOST. A global budget refusal retains PREFLIGHT and HELD until definite invoice closure.
    */
-  submit(executionId: string, fenceEpoch: bigint, maxInFlight: number, leaseMs: number, fields?: TransitionFields): { status: 'SUBMITTING' | 'CANCELLED'; fenceEpoch: bigint };
+  submit(executionId: string, fenceEpoch: bigint, maxInFlight: number, leaseMs: number, fields?: TransitionFields,
+    policy?: Pick<ExecutionPolicy, 'cooldownAfterFailureMs' | 'cooldownAfterSuccessMs' | 'budget'>): { status: 'SUBMITTING' | 'CANCELLED' | 'BUDGET_REFUSED'; fenceEpoch: bigint };
+  /** Append accounting corrections with consumed-budget replacement and signed fee-cap quarantine in one transaction. */
+  postFeeCorrections(observations: readonly { executionId: string; reference: string; feeMsat: bigint; occurredAt: number }[]): { postedJournalIds: string[]; feeBreach: boolean };
   /** Records an already-paid stored intent for observation only; this never authorizes a send or renews a lease. */
   recordPaidIntent(executionId: string, fenceEpoch: bigint, paymentHash: string, fields?: TransitionFields): bigint;
   /** Fenced lease renewal; an expired CLAIMED/PREFLIGHT lease cannot be revived. Returns the new epoch. */
@@ -224,7 +227,7 @@ function storedFeeExemption(row: Record<string, SQLOutputValue>): bigint {
 }
 
 /** Quarantine is committed with paid truth and accounting, even if the alert consumer fails. */
-function quarantineFeeBreach(db: DatabaseSync, executionId: string, feeMsat: bigint): void {
+function quarantineFeeBreach(db: DatabaseSync, executionId: string, feeMsat: bigint): boolean {
   // MySQL: same
   const row = db.prepare(`SELECT p.node_id, p.principal_msat, p.max_fee_ppm, p.reason_json, v.policy_canonical_json,
       a.max_fee_msat AS approved_max_fee_msat FROM executions e
@@ -235,7 +238,17 @@ function quarantineFeeBreach(db: DatabaseSync, executionId: string, feeMsat: big
     maxFeePpm: bigintColumn(row, 'max_fee_ppm'), exemptFeeMsat: storedFeeExemption(row) })) {
     // MySQL: same; this side effect shares the execution's fenced transaction.
     db.prepare("UPDATE nodes SET state = 'QUARANTINED' WHERE id = ?").run(textColumn(row, 'node_id'));
+    return true;
   }
+  return false;
+}
+
+/** Effective fee includes every append-only accounting correction, without SQLite int64 SUM overflow. */
+function effectiveFeeMsat(db: DatabaseSync, executionId: string): bigint {
+  // MySQL: same
+  const lines = db.prepare(`SELECT l.debit_msat, l.credit_msat FROM ledger_lines l JOIN ledger_journals j ON j.id = l.journal_id
+    WHERE j.execution_id = ? AND l.account_code = ?`).all(executionId, EXPENSE_ROUTING_FEES);
+  return checkedMsat(lines.reduce((total, line) => total + bigintColumn(line, 'debit_msat') - bigintColumn(line, 'credit_msat'), 0n), 'correctedFeeMsat');
 }
 
 function deltaColumn(row: Record<string, SQLOutputValue>, key: string): DeltaStatus | null {
@@ -490,7 +503,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       });
     },
 
-    submit(executionId, fenceEpoch, maxInFlight, leaseMs, fields = {}) {
+    submit(executionId, fenceEpoch, maxInFlight, leaseMs, fields = {}, policy) {
       writable('executions.submit');
       if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 0) throw new PersistenceError('OUT_OF_RANGE', 'maxInFlight is not a non-negative integer');
       checkedLease(leaseMs);
@@ -504,7 +517,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
           return { status: 'CANCELLED' as const, fenceEpoch: fencedTransition(db, executionId, fenceEpoch, 'PREFLIGHT', 'CANCELLED', { errorCode: 'APPROVAL_INVALID' }) };
         }
         // MySQL: same
-        const node = db.prepare(`SELECT p.node_id, e.payment_hash, n.state AS node_state FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id
+        const node = db.prepare(`SELECT p.node_id, p.source_channel_id, p.target_channel_id, e.payment_hash, n.state AS node_state FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id
           JOIN nodes n ON n.id = p.node_id
           WHERE e.id = ?`).get(executionId);
         if (node === undefined) throw leaseLost(executionId);
@@ -514,11 +527,71 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
         if (node['payment_hash'] === null) {
           throw new PersistenceError('INVALID_TRANSITION', 'SUBMITTING needs the payment hash stored first');
         }
+        if (policy !== undefined) {
+          // Every held reservation, including this execution's own exactly once, shares the global budget.
+          // Leave the unsent intent held until its invoice is definitely closed by the dispatcher.
+          if (committedMsat(db, checkedPeriod(policy.budget.periodMs)) > policy.budget.msat) {
+            return { status: 'BUDGET_REFUSED' as const, fenceEpoch };
+          }
+          const last = lastTerminal(db, textColumn(node, 'source_channel_id'), textColumn(node, 'target_channel_id'));
+          const now = dbNow(db);
+          if ((last.failureAt !== null && now - last.failureAt < policy.cooldownAfterFailureMs)
+            || (last.successAt !== null && now - last.successAt < policy.cooldownAfterSuccessMs)) {
+            return { status: 'CANCELLED' as const, fenceEpoch: fencedTransition(db, executionId, fenceEpoch, 'PREFLIGHT', 'CANCELLED', { errorCode: 'COOLDOWN_ACTIVE' }) };
+          }
+        }
         if (inFlightCount(db, textColumn(node, 'node_id'), executionId) >= maxInFlight) {
           const epoch = fencedTransition(db, executionId, fenceEpoch, 'PREFLIGHT', 'CANCELLED', { errorCode: 'BUDGET_EXHAUSTED' });
           return { status: 'CANCELLED' as const, fenceEpoch: epoch };
         }
         return { status: 'SUBMITTING' as const, fenceEpoch: fencedTransition(db, executionId, fenceEpoch, 'PREFLIGHT', 'SUBMITTING', { ...fields, leaseMs }) };
+      });
+    },
+
+    postFeeCorrections(observations) {
+      writable('executions.postFeeCorrections');
+      return immediate(db, () => {
+        let active = true;
+        const tx = ledgerTransaction(db, newUlid, () => active);
+        const postedJournalIds: string[] = [];
+        let feeBreach = false;
+        try {
+          for (const observation of observations) {
+            const observedFee = checkedMsat(observation.feeMsat, 'observedFeeMsat');
+            // Node reads await outside the transaction. Rebase their absolute fee on the currently committed expense.
+            const delta = observedFee - effectiveFeeMsat(db, observation.executionId);
+            if (delta === 0n) continue;
+            const base = /^(.*:fee:(?:listpayments|listsendpays|bkpr))$/.exec(observation.reference)?.[1];
+            if (base === undefined) throw new PersistenceError('INVALID_TRANSITION', 'a fee correction needs its accounting source');
+            let reference = base;
+            let sequence = 1;
+            while (tx.findJournal('RECON_DIFFERENCE', reference) !== null) {
+              sequence += 1;
+              reference = `${base}:${String(sequence)}`;
+            }
+            const result = post(tx, { eventType: 'RECON_DIFFERENCE', executionId: observation.executionId, occurredAt: observation.occurredAt, reference,
+              lines: delta > 0n
+                ? [{ account: EXPENSE_ROUTING_FEES, debitMsat: delta, creditMsat: 0n }, { account: RECON_DIFFERENCE, debitMsat: 0n, creditMsat: delta }]
+                : [{ account: RECON_DIFFERENCE, debitMsat: -delta, creditMsat: 0n }, { account: EXPENSE_ROUTING_FEES, debitMsat: 0n, creditMsat: -delta }] });
+            if (result.posted) postedJournalIds.push(result.journalId);
+          }
+          for (const executionId of new Set(observations.map(observation => observation.executionId))) {
+            // Imported ledger history may have no execution budget. Operational paid attempts always do.
+            // MySQL: same SELECT with FOR UPDATE, protecting the epoch until the atomic correction commits.
+            const row = db.prepare(`SELECT e.fence_epoch FROM executions e JOIN budget_reservations r ON r.execution_id = e.id
+              WHERE e.id = ? AND e.status = 'VERIFIED_SUCCESS' AND r.state = 'CONSUMED'`).get(executionId);
+            if (row === undefined) continue;
+            const fee = effectiveFeeMsat(db, executionId);
+            const epoch = bigintColumn(row, 'fence_epoch');
+            // MySQL: same; the correction is guarded by the paid execution epoch read under the transaction lock.
+            const updated = db.prepare(`UPDATE budget_reservations SET consumed_msat = ? WHERE execution_id = ? AND state = 'CONSUMED'
+              AND EXISTS (SELECT 1 FROM executions e WHERE e.id = budget_reservations.execution_id AND e.fence_epoch = ? AND e.status = 'VERIFIED_SUCCESS')`)
+              .run(fee, executionId, epoch);
+            if (Number(updated.changes) !== 1) throw leaseLost(executionId);
+            feeBreach = quarantineFeeBreach(db, executionId, fee) || feeBreach;
+          }
+        } finally { active = false; }
+        return { postedJournalIds, feeBreach };
       });
     },
 
@@ -652,7 +725,10 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
           WHERE e.id = ? AND e.fence_epoch = ? AND e.status = 'VERIFIED_SUCCESS'`).get(executionId, fenceEpoch);
         if (row === undefined) throw leaseLost(executionId);
         const priorFee = row['actual_fee_msat'];
-        if (priorFee !== null && priorFee !== fee) throw new PersistenceError('INVALID_TRANSITION', 'a terminal reported fee cannot be replaced');
+        const effectiveFee = effectiveFeeMsat(db, executionId);
+        if (priorFee !== null && priorFee !== fee && effectiveFee !== fee) {
+          throw new PersistenceError('INVALID_TRANSITION', 'a terminal reported fee needs an accepted accounting correction');
+        }
         let active = true;
         const tx = ledgerTransaction(db, newUlid, () => active);
         try {
@@ -666,6 +742,11 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
           if (priorFee === null && fee > 0n) {
             post(tx, { eventType: 'RECON_DIFFERENCE', reference: `fee-reported:${executionId}`, executionId, occurredAt: dbNow(db),
               lines: [{ account: EXPENSE_ROUTING_FEES, debitMsat: fee, creditMsat: 0n }, { account: RECON_DIFFERENCE, debitMsat: 0n, creditMsat: fee }] });
+          }
+          if (priorFee === null && effectiveFee > 0n) {
+            // The now-known original fee replaces the provisional accounting expense; reverse it rather than charge twice.
+            post(tx, { eventType: 'RECON_DIFFERENCE', reference: `fee-attribution-offset:${executionId}`, executionId, occurredAt: dbNow(db),
+              lines: [{ account: RECON_DIFFERENCE, debitMsat: effectiveFee, creditMsat: 0n }, { account: EXPENSE_ROUTING_FEES, debitMsat: 0n, creditMsat: effectiveFee }] });
           }
           // MySQL: same fenced UPDATE, with NOW(6) for updated_at; changing the epoch changes the matched row.
           const result = db.prepare(`UPDATE executions SET actual_fee_msat = coalesce(actual_fee_msat, ?),
@@ -694,11 +775,12 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
         JOIN policy_versions v ON v.id = p.policy_version_id
         JOIN nodes n ON n.id = p.node_id
         WHERE e.status IN ('SUBMITTING','IN_FLIGHT','UNKNOWN') OR (e.status = 'VERIFIED_SUCCESS' AND (
-          e.actual_fee_msat IS NULL OR (EXISTS (SELECT 1 FROM ledger_journals j JOIN ledger_lines l ON l.journal_id = j.id
+          e.delta_status = 'PENDING' OR e.actual_fee_msat IS NULL OR (EXISTS (SELECT 1 FROM ledger_journals j JOIN ledger_lines l ON l.journal_id = j.id
             WHERE j.execution_id = e.id AND j.event_type = 'REBALANCE_SETTLED' AND l.account_code = 'clearing:unassigned')
             AND NOT EXISTS (SELECT 1 FROM ledger_journals j WHERE j.execution_id = e.id AND j.event_type = 'RECON_DIFFERENCE'
               AND j.reference = 'incoming:' || e.id || ':release'))))
-        ORDER BY e.id`).all();
+        ORDER BY coalesce((SELECT max(event.id) FROM execution_events event WHERE event.execution_id = e.id
+          AND json_extract(event.evidence_json, '$.reclaimedBy') IS NOT NULL), 0), e.id`).all();
       return rows.map(row => ({
         executionId: textColumn(row, 'id'),
         status: statusColumn(row, 'status'),

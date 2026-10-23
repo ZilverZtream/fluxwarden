@@ -7,7 +7,7 @@ import { minFinalCltvExpiry } from '../core/bolt11-cltv.js';
 import { assertHash } from '../core/encoding.js';
 import { ProtocolError } from '../core/errors.js';
 import type { CancelResult, CircularRoute, InvoiceResult, InvoiceState, PaymentObservation, RouteOwnership, RouteRequest, RoutingLayerClaim } from '../core/execution.js';
-import type { JsonObject } from '../core/json.js';
+import { identifier, type JsonObject } from '../core/json.js';
 import type { Msat } from '../core/money.js';
 import { isNoRoute, type CandidateRoute } from '../core/route.js';
 import { channelScid, scidToChanId } from '../core/scid.js';
@@ -334,16 +334,34 @@ export class ClnExecutionAdapter {
       const invoice = invoices.length === 1 ? invoices[0] : undefined;
       if (invoice?.status !== 'paid' || invoice.amountReceivedMsat !== principal || principal <= 0n) return null;
       const limit = 500;
-      const history = objects(await this.#rest.call('listhtlcs', { index: 'created', start: 0, limit }), 'htlcs');
-      // A full page does not prove that the remaining history contains no other matching incoming HTLC.
-      if (history.length >= limit) return null;
-      const incoming = history.filter(htlc => text(htlc, 'payment_hash') === hash && text(htlc, 'direction') === 'in' &&
-        text(htlc, 'state') === 'SENT_REMOVE_ACK_REVOCATION' && msat(htlc, 'amount_msat') === principal);
-      const htlc = incoming.length === 1 ? incoming[0] : undefined;
-      if (htlc === undefined) return null;
-      const channel = text(htlc, 'short_channel_id');
-      if (scidToChanId(channel) === '0') return null;
-      return channel;
+      let cursor = 0n;
+      let incoming: JsonObject | undefined;
+      // Core Lightning doc/schemas/listhtlcs.json uses an inclusive created-index start: continue after the last
+      // index, as for listsendpays in reader.ts. Keep the accounting reader's 200-page work bound, and retain no
+      // attribution unless a short final page proves the complete scan (including pages after an apparent match).
+      for (let page = 0; page < 200; page++) {
+        const start = Number(cursor);
+        if (!Number.isSafeInteger(start)) return null;
+        const history = objects(await this.#rest.call('listhtlcs', { index: 'created', start, limit }), 'htlcs');
+        if (history.length > limit) return null;
+        for (const htlc of history) {
+          if (htlc['created_index'] === undefined || htlc['created_index'] === null) return null;
+          const index = BigInt(identifier(htlc, 'created_index'));
+          if (index < cursor) return null;
+          cursor = index + 1n;
+          if (text(htlc, 'payment_hash') === hash && text(htlc, 'direction') === 'in' &&
+            text(htlc, 'state') === 'SENT_REMOVE_ACK_REVOCATION' && msat(htlc, 'amount_msat') === principal) {
+            if (incoming !== undefined) return null;
+            incoming = htlc;
+          }
+        }
+        if (history.length < limit) {
+          if (incoming === undefined) return null;
+          const channel = text(incoming, 'short_channel_id');
+          return scidToChanId(channel) === '0' ? null : channel;
+        }
+      }
+      return null;
     } catch {
       return null;
     }

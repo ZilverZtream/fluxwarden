@@ -1,5 +1,7 @@
 // Liquidity diagnosis from operator targets over the latest channel snapshots (SPEC.md §7.3).
 import type { ChannelState, Confidence, NormalizedChannel } from '../core/normalize.js';
+import type { IncomingHistory } from '../core/node.js';
+import { estimateDemand, type VolumeBucket } from './demand.js';
 
 /** Per-channel operator target, msat. */
 export interface ChannelTarget {
@@ -19,7 +21,8 @@ export interface PlanningPolicy {
   readonly max_snapshot_age: number;
   /** Lifetime of a proposal in milliseconds. */
   readonly proposal_ttl: number;
-  readonly demand: { readonly mode: 'targets' | 'ewma'; readonly horizon: number };
+  readonly demand: { readonly mode: 'targets' | 'ewma'; readonly horizon: number;
+    readonly burst_factor?: string; readonly ewma?: { readonly bucket_seconds: number; readonly alpha: string; readonly min_samples: number } };
   /** Node name → channel key → target. */
   readonly targets: Readonly<Record<string, Readonly<Record<string, ChannelTarget>>>>;
   readonly exclude_channels: readonly string[];
@@ -36,6 +39,7 @@ export interface DiagnoseInput {
   /** null selects policy.demand.horizon. */
   readonly horizonMs: number | null;
   readonly clock: Clock;
+  readonly incomingHistory?: IncomingHistory;
 }
 
 export interface ChannelDiagnosis {
@@ -61,7 +65,7 @@ export interface ChannelDiagnosis {
 export interface OkDiagnosis {
   readonly status: 'OK';
   readonly nodeName: string;
-  readonly demandSource: 'TARGETS';
+  readonly demandSource: 'TARGETS' | 'EWMA';
   readonly horizonMs: number;
   readonly evaluatedAt: number;
   readonly channels: readonly ChannelDiagnosis[];
@@ -93,7 +97,7 @@ export function diagnose(input: DiagnoseInput): Diagnosis {
     if (channels[i]?.channelKey === channels[i - 1]?.channelKey) throw new Error('diagnose: more than one snapshot for one channel');
   }
 
-  const targets = Object.hasOwn(policy.targets, nodeName) ? policy.targets[nodeName] ?? {} : {};
+  let targets = Object.hasOwn(policy.targets, nodeName) ? policy.targets[nodeName] ?? {} : {};
 
   // INV-06: both times come from the database clock. A snapshot dated after the clock reading cannot be
   // shown to be fresh, so it is refused like an old one; a targeted channel never observed is never a met target.
@@ -105,6 +109,48 @@ export function diagnose(input: DiagnoseInput): Diagnosis {
     ...Object.keys(targets).filter(key => !observed.has(key)).map(channelKey => ({ channelKey, ageMs: null })),
   ].sort((a, b) => compareKeys(a.channelKey, b.channelKey));
   if (stale.length > 0) return { status: 'STALE_SNAPSHOT', nodeName, stale };
+
+  if (policy.demand.mode === 'ewma') {
+    const history = input.incomingHistory;
+    const params = policy.demand.ewma;
+    if (history === undefined || !history.complete || params === undefined || policy.demand.burst_factor === undefined || history.receipts.length === 0) return { status: 'INSUFFICIENT_HISTORY', nodeName };
+    const width = params.bucket_seconds * 1000;
+    const horizonMs = input.horizonMs ?? policy.demand.horizon;
+    if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(horizonMs) || horizonMs <= 0) throw new RangeError('demand window is invalid');
+    const count = Math.max(params.min_samples, Math.ceil(horizonMs / width));
+    // A bounded history scan cannot justify a larger window than the observations it could contain.
+    if (!Number.isSafeInteger(count) || count > 100_000) return { status: 'INSUFFICIENT_HISTORY', nodeName };
+    const end = Math.floor(now / width) * width;
+    const start = end - count * width;
+    if (!Number.isSafeInteger(start)) return { status: 'INSUFFICIENT_HISTORY', nodeName };
+    const volumes = new Map<string, Map<number, bigint>>();
+    let earliest = now;
+    for (const receipt of history.receipts) {
+      if (!Number.isSafeInteger(receipt.settledAt) || receipt.settledAt < 0 || receipt.settledAt > now || receipt.amountMsat < 0n) return { status: 'INSUFFICIENT_HISTORY', nodeName };
+      earliest = Math.min(earliest, receipt.settledAt);
+      const bucket = Math.floor(receipt.settledAt / width) * width;
+      if (bucket < start || bucket >= end) continue;
+      const channel = volumes.get(receipt.channelKey) ?? new Map<number, bigint>();
+      channel.set(bucket, (channel.get(bucket) ?? 0n) + receipt.amountMsat);
+      volumes.set(receipt.channelKey, channel);
+    }
+    // Complete scans include empty buckets; never invent observations before the first known receipt.
+    if (Math.floor(earliest / width) * width > start) return { status: 'INSUFFICIENT_HISTORY', nodeName };
+    const estimated: Record<string, ChannelTarget> = {};
+    for (const channel of channels) {
+      const buckets: VolumeBucket[] = Array.from({ length: count }, (_, i) => {
+        const at = start + i * width;
+        return { start: at, volumeMsat: volumes.get(channel.channelKey)?.get(at) ?? 0n };
+      });
+      const demand = estimateDemand({ buckets, now, targetMsat: 0n, params: {
+        bucketSeconds: params.bucket_seconds, alpha: params.alpha, minSamples: params.min_samples,
+        horizonSeconds: horizonMs / 1000, burstFactor: policy.demand.burst_factor,
+      } });
+      if (demand.source !== 'EWMA') return { status: 'INSUFFICIENT_HISTORY', nodeName };
+      estimated[channel.channelKey] = { ...targets[channel.channelKey], min_inbound_msat: demand.requiredInboundMsat };
+    }
+    targets = estimated;
+  }
 
   const hasTarget = Object.values(targets).some(target => target.min_inbound_msat !== undefined || target.min_outbound_msat !== undefined);
   if (!hasTarget) return { status: 'INSUFFICIENT_HISTORY', nodeName };
@@ -138,7 +184,7 @@ export function diagnose(input: DiagnoseInput): Diagnosis {
   return {
     status: 'OK',
     nodeName,
-    demandSource: 'TARGETS',
+    demandSource: policy.demand.mode === 'ewma' ? 'EWMA' : 'TARGETS',
     horizonMs: input.horizonMs ?? policy.demand.horizon,
     evaluatedAt: now,
     channels: rows,
