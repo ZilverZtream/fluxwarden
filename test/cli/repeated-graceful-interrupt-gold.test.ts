@@ -207,9 +207,13 @@ it('CP-001/REG-SRC009 repeated graceful events during a pending observation reta
     if (behaviour === 'listsendpays') for (const payment of answer['payments'] as Record<string, unknown>[]) {
       if (payment['status'] === 'complete') payment['amount_sent_msat'] = Number(PRINCIPAL + actualFee);
     }
-    if (behaviour === 'listpeerchannels' && d.cln.state.settledAt !== null) {
-      // An ordinary current node observation remains pending after the native
-      // paid receipt; no result, exit code or persisted outcome is substituted.
+    if (behaviour === 'listpeerchannels' && d.cln.state.settledAt !== null
+      && rows(d.database, 'SELECT status, actual_fee_msat FROM executions')
+        .some(execution => execution['status'] === 'VERIFIED_SUCCESS' && execution['actual_fee_msat'] === 300001)) {
+      // D29 native oracle clarification: listpeerchannels may first map native
+      // bookkeeper channel_id credit to SCID before SUCCESS reaches dispatch.
+      // Hold only the actual post-durable current-balance measurement. The
+      // native fee breach, persisted journals and signal checks stay unchanged.
       d.cln.fake.hold(context, behaviour); reached?.(); return;
     }
     respond(context, behaviour, answer);

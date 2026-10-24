@@ -3,7 +3,7 @@
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, expect, it } from 'vitest';
-import { FEE, S, T, callsOf, methodsOf } from '../fakes/cln/rebalance-node.js';
+import { FEE, S, T, callsOf } from '../fakes/cln/rebalance-node.js';
 import type { FakeServer } from '../fakes/https.js';
 import { approve, demo, documentOf, plan, prepareDemoFixtures, resultOf, rows, type DemoFixtures } from '../helpers/cpw-cli.js';
 import { testRoot } from '../helpers/env.js';
@@ -78,7 +78,10 @@ for (const c of [
     ]);
     expect.soft(callsOf(d.cln.fake, 'sendpay')).toHaveLength(1);
     expect.soft(callsOf(d.cln.fake, 'invoice')).toHaveLength(1);
-    expect.soft(methodsOf(d.cln.fake)).toContain('listhtlcs');
+    // D29 native oracle clarification: bookkeeper credit mapped by full native
+    // channel_id proves receipt independently. listhtlcs terminal removal state
+    // also covers failure (CLN v26.06.9 peer_htlcs.c remove_htlc_in), so that
+    // unrelated read is not required by the exact money/delta contract above.
     expect.soft((await d.run(['--json', 'ledger', 'verify'])).status).toBe(0);
   });
 }

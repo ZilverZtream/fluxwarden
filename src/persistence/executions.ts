@@ -165,8 +165,8 @@ export interface ExecutionsRepository {
   holds(executionId: string, fenceEpoch: bigint): boolean;
   /** Whether the approval or the proposal behind the row has expired by the database clock. */
   authorityLapsed(executionId: string): boolean;
-  /** CLAIMED/PREFLIGHT rows whose lease and whose approval or proposal have expired by the database clock. */
-  lapsedClaims(): readonly string[];
+  /** CLAIMED/PREFLIGHT rows whose lease and approval or proposal expired; optionally limited by stable node id. */
+  lapsedClaims(nodeIds?: readonly string[]): readonly string[];
   /** Takes the row's lease for `workerId` if it is CLAIMED/PREFLIGHT with an expired lease. */
   takeOver(executionId: string, workerId: string, leaseMs: number): HeldClaim | null;
   /** Fenced write of the delta verification result on a VERIFIED_SUCCESS row. Returns the new epoch. */
@@ -676,14 +676,15 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       return row !== undefined;
     }),
 
-    lapsedClaims: () => run(() => {
+    lapsedClaims: nodeIds => run(() => {
       // MySQL: same, with NOW(6) for the clock
       const rows = db.prepare(`SELECT e.id FROM executions e
         JOIN approvals a ON a.id = e.approval_id
         JOIN liquidity_proposals p ON p.id = e.proposal_id
         WHERE e.status IN ('CLAIMED','PREFLIGHT') AND e.lease_expires_at < ${DB_NOW}
           AND (a.expires_at <= ${DB_NOW} OR p.expires_at <= ${DB_NOW})
-        ORDER BY e.id`).all();
+          ${nodeIds === undefined ? '' : `AND p.node_id IN (${nodeIds.map(() => '?').join(',') || 'NULL'})`}
+        ORDER BY e.id`).all(...(nodeIds ?? []));
       return rows.map(row => textColumn(row, 'id'));
     }),
 

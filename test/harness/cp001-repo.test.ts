@@ -478,13 +478,15 @@ process.exitCode = mode === 'fail' ? 7 : 0;
   const productFiles = (args: readonly string[] = []): string[] => projectFiles('product', args);
   const complete = productFiles(), coreFiles = productFiles(['--config', coreConfig]), native = productFiles(nativeFiles);
   const fullHarness = projectFiles('harness-docs');
-  // D29 approves these exact nine product regressions in addition to the
+  // D29 approves these exact eleven product regressions in addition to the
   // original inventories. Exclude only these named additions when checking
   // the original counts; a general post-audit filename filter could hide loss.
   const addedProductFiles = [
     'test/commands/post-audit-demand-gold.test.ts',
     'test/commands/post-audit-metadata-gold.test.ts',
     'test/commands/post-audit-window-gold.test.ts',
+    'test/commands/reaudit-history-gold.test.ts',
+    'test/commands/reaudit-protocol-gold.test.ts',
     'test/core/post-audit-errors-gold.test.ts',
     'test/daemon/post-audit-cli-gold.test.ts',
     'test/executor/post-audit-budget-admission-gold.test.ts',
@@ -493,15 +495,16 @@ process.exitCode = mode === 'fail' ? 7 : 0;
     'test/reconciler/post-audit-recovery-gold.test.ts',
   ];
   const assertProductInventory = (files: readonly string[], originalCount: number): void => {
-    expect(files, 'product inventory includes every original file and the nine explicit additions').toHaveLength(originalCount + 9);
+    expect(files, 'product inventory includes every original file and the eleven explicit additions').toHaveLength(originalCount + 11);
     for (const added of addedProductFiles) expect(files, `${added} remains in the eligible product inventory`).toContain(added);
-    expect(files.filter(file => !addedProductFiles.includes(file)), 'excluding only the nine additions retains the original inventory count').toHaveLength(originalCount);
+    expect(files.filter(file => !addedProductFiles.includes(file)), 'excluding only the eleven additions retains the original inventory count').toHaveLength(originalCount);
   };
   assertProductInventory(complete, 133);
   assertProductInventory(coreFiles, 121);
   // Exercise the same acceptance boundary with an omitted new file and an
   // omitted original file: neither inventory may silently lose either kind.
-  for (const omitted of ['test/commands/post-audit-demand-gold.test.ts', 'test/cli/cp016-commands.test.ts']) {
+  for (const omitted of ['test/commands/post-audit-demand-gold.test.ts', 'test/commands/reaudit-history-gold.test.ts',
+    'test/commands/reaudit-protocol-gold.test.ts', 'test/cli/cp016-commands.test.ts']) {
     expect(complete).toContain(omitted);
     expect(coreFiles).toContain(omitted);
     expect(() => { assertProductInventory(complete.filter(file => file !== omitted), 133); }).toThrow();

@@ -14,6 +14,8 @@ import { testRoot } from '../helpers/env.js';
 import { liveSentinelDetected, scanner } from '../helpers/leak-scan.js';
 import { parseYaml } from '../helpers/yaml.js';
 import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
+import { registerSentinels, sentinels } from '../helpers/output.js';
+import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
 
 const captureCli = join(repoRoot, 'scripts/ci-capture.mjs');
 const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex');
@@ -110,6 +112,117 @@ process.exitCode = ${String(exitCode)};
     receipt() { return asRecord(JSON.parse(readFileSync(join(capture, 'receipt.json'), 'utf8')) as unknown, 'safe receipt'); },
   };
 }
+
+it('CP-044/CI-SENTINELS concurrent fixture registration preserves every immutable source and strict capture provenance', () => {
+  const f = fixture();
+  const committed = sentinels();
+  const runtime = [randomBytes(32), randomBytes(32)];
+  const rotations = [randomBytes(32), randomBytes(32)];
+  // These original INPUT values are known before any fixture registration.
+  // Qualify their nested private custody copies prospectively for an outer
+  // capture, including the static and runtime sources as well as rotations.
+  declareFixtureCapture(f.capture, [...committed.map(row => row.bytes), ...runtime, ...rotations], []);
+  registerSentinels(f.sourceRoot);
+  const expected = committed.map(row => ({ path: join(f.sourceRoot, `product-${row.kind}.bin`), bytes: row.bytes }));
+  const identity = (path: string) => { const info = statSync(path, { bigint: true }); return {
+    path, dev: info.dev, ino: info.ino, size: info.size, mtimeNs: info.mtimeNs, ctimeNs: info.ctimeNs,
+  }; };
+  const before = expected.map(row => identity(row.path));
+  const config = join(f.root, 'vitest.config.mjs');
+  // Vitest may create its excluded .vite cache under this otherwise empty
+  // dependency directory. Its own namespace must exist at capture Opening.
+  mkdirSync(join(f.root, 'node_modules'));
+  writeFileSync(config, `export default { test: { allowOnly: false, passWithNoTests: false,
+    maxWorkers: 2, fileParallelism: true, include: ['test/register-*.test.mjs'] } };\n`);
+  const vitest = pathToFileURL(join(repoRoot, 'node_modules/vitest/dist/index.js')).href;
+  const helper = pathToFileURL(join(repoRoot, 'test/helpers/public-money-safety.ts')).href;
+  const report = join(f.evidence, 'sentinel-workers.json');
+  Object.assign(f.env, { FW_SENTINEL_FIRST: rotations[0]?.toString('base64'), FW_SENTINEL_SECOND: rotations[1]?.toString('base64') });
+  const rotationPaths = [0, 1].map(lane => join(f.scratch, `rotating-${String(lane)}.bin`));
+  declareFixturePaths(rotationPaths);
+  const credentials = runtime.map((bytes, index) => ({ path: join(f.sourceRoot, `rotation-${String(index)}.bin`), bytes }));
+  for (const row of credentials) {
+    declareFixturePaths([row.path]);
+    writeFileSync(row.path, row.bytes, { flag: 'wx', mode: 0o600 });
+  }
+  // Original credential INPUTs and their immutable registry contexts belong to
+  // this fixture. Establish them under the outer observer before inner Opening;
+  // declarations made only by nested workers cannot authorize outer custody.
+  writeFileSync(join(f.scratch, 'declared-out.txt'), rotationPaths.map(path => `${path}\n`).join(''), { flag: 'wx', mode: 0o600 });
+  const outerRegistry = testRoot('FLUXWARDEN_SENTINEL_DIR');
+  try {
+    process.env['FLUXWARDEN_SENTINEL_DIR'] = f.sourceRoot;
+    registerMoneySafetyCredentials(credentials.map(row => row.path));
+    for (const path of rotationPaths) for (const bytes of rotations) {
+      writeFileSync(path, bytes, { mode: 0o600 });
+      registerMoneySafetyCredentials([path]);
+    }
+  } finally { process.env['FLUXWARDEN_SENTINEL_DIR'] = outerRegistry; }
+  for (const lane of [0, 1]) writeFileSync(join(f.root, `test/register-${String(lane)}.test.mjs`), `
+import { it } from ${JSON.stringify(vitest)};
+import { appendFileSync, watch, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { registerMoneySafetyCredentials } from ${JSON.stringify(helper)};
+it('concurrent sentinel registrar ${String(lane)}', async () => {
+ const scratch = process.env.FLUXWARDEN_TEST_TMP;
+ const ready = join(scratch, 'registrar-${String(lane)}.ready');
+ const other = join(scratch, 'registrar-${String(1 - lane)}.ready');
+ await new Promise((resolve, reject) => {
+   const watcher = watch(scratch, () => { if (existsSync(other)) { watcher.close(); resolve(); } });
+   watcher.once('error', reject);
+   writeFileSync(ready, 'ready');
+   if (existsSync(other)) { watcher.close(); resolve(); }
+ });
+ registerMoneySafetyCredentials(${JSON.stringify(credentials.map(row => row.path))});
+ const rotating = ${JSON.stringify(rotationPaths[lane])};
+ appendFileSync(join(scratch, 'declared-out.txt'), rotating + '\\n');
+ for (const value of [process.env.FW_SENTINEL_FIRST, process.env.FW_SENTINEL_SECOND]) {
+   writeFileSync(rotating, Buffer.from(value, 'base64'), { mode: 0o600 });
+   registerMoneySafetyCredentials([rotating]);
+ }
+ writeFileSync(join(scratch, 'registrar-${String(lane)}.json'), JSON.stringify({ pid: process.pid, completed: true }));
+});\n`);
+  f.script(`const { spawn } = await import('node:child_process');
+const worker = spawn(process.execPath, ${JSON.stringify([join(repoRoot, 'scripts/ci-test-driver.mjs'), 'run', '--root', f.root, '--config', config,
+    '--reporter=json', `--outputFile=${report}`])}, { env: process.env, stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+const code = await new Promise((resolve, reject) => { worker.once('error', reject); worker.once('close', resolve); });
+if (code !== 0) throw new Error('concurrent fixture workers did not complete');`);
+  const result = f.invoke();
+  expect(result.error, 'the existing finite capture command budget is unchanged').toBeUndefined();
+  const workers = asRecord(JSON.parse(readFileSync(report, 'utf8')) as unknown, 'actual worker results');
+  expect({ passed: workers['numPassedTests'], failed: workers['numFailedTests'], pending: workers['numPendingTests'] })
+    .toEqual({ passed: 2, failed: 0, pending: 0 });
+  const lanes = [0, 1].map(lane => asRecord(JSON.parse(readFileSync(join(f.scratch, `registrar-${String(lane)}.json`), 'utf8')) as unknown, 'worker witness'));
+  expect(new Set(lanes.map(row => row['pid'])).size, 'two real processes complete concurrent registration').toBe(2);
+  const reasons = result.stderr.split(/\r?\n/).flatMap(line => {
+    try {
+      const value = asRecord(JSON.parse(line) as unknown, 'safe capture envelope');
+      const candidates: unknown[] = Array.isArray(value['reasons']) ? value['reasons'] : [];
+      return candidates.filter((reason): reason is string => typeof reason === 'string');
+    }
+    catch { return []; }
+  });
+  expect.soft(result.status, `successful children alone do not establish complete custody: ${JSON.stringify(reasons)}`).toBe(0);
+  expect.soft(f.receipt()['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: true, policySatisfied: true });
+  const sources = records(f.receipt()['sources'], 'all retained input contexts');
+  for (const row of [...expected, ...credentials]) {
+    expect(readFileSync(row.path).equals(row.bytes), 'every original literal remains intact').toBe(true);
+    expect(sources.some(source => source['path'] === row.path && source['purpose'] === 'INPUT' && source['sha256'] === digest(row.bytes)),
+      'each original input retains its exact source provenance').toBe(true);
+    expect(readFileSync(join(f.capture, 'private/sources', digest(row.bytes))).equals(row.bytes), 'all source bytes remain in private custody').toBe(true);
+  }
+  const registry = files(f.sourceRoot);
+  for (const bytes of rotations) {
+    const preserved = registry.filter(path => readFileSync(path).equals(bytes));
+    expect(preserved.length, 'both literal credential rotations remain registered across concurrent workers').toBeGreaterThanOrEqual(2);
+    for (const path of preserved) expect(sources.some(source => source['path'] === path && source['purpose'] === 'INPUT' && source['sha256'] === digest(bytes)),
+      'every immutable rotated registry context retains original input provenance').toBe(true);
+    expect(readFileSync(join(f.capture, 'private/sources', digest(bytes))).equals(bytes), 'both original and replacement literals remain in private custody').toBe(true);
+  }
+  expect.soft(expected.map(row => identity(row.path)),
+    'repeated registration never truncates or replaces an existing registered inode').toEqual(before);
+  expect.soft(f.invoke(true).status, 'the unmodified collector independently verifies complete retained evidence').toBe(0);
+});
 
 // Node 24.21 fs.link, fs.linkSync and fsPromises.link create a new hard-link
 // destination; they do not overwrite an existing destination. Source:

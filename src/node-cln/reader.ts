@@ -49,8 +49,11 @@ class ClnReader implements NodeReader {
   async incomingHistory(): Promise<IncomingHistory> {
     // CLN v26.06.9 doc/schemas/{listinvoices,listhtlcs}.json: created start is inclusive.
     // As in the collector, bound each scan to 200 pages of 500; an unfinished scan supplies no demand.
-    const scan = async (method: string, field: string) => {
-      const entries = [];
+    // Project each page before retaining it: invoice descriptions, bolt11 and preimages never belong
+    // to demand history. Cap retained compact evidence at the existing 16 MiB response bound as well.
+    let retainedBytes = 0;
+    const scan = async <T>(method: string, field: string, project: (entry: JsonObject) => T | null): Promise<T[] | null> => {
+      const entries: T[] = [];
       let cursor = 0n;
       for (let page = 0; page < 200; page++) {
         const start = Number(cursor);
@@ -62,15 +65,34 @@ class ClnReader implements NodeReader {
           const index = BigInt(identifier(entry, 'created_index'));
           if (index < cursor) throw new ProtocolError('incoming history page does not advance');
           cursor = index + 1n;
-          entries.push(entry);
+          const compact = project(entry);
+          if (compact !== null) {
+            retainedBytes += Buffer.byteLength(JSON.stringify(compact, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value));
+            if (retainedBytes > 16 * 1024 * 1024) return null;
+            entries.push(compact);
+          }
         }
         if (batch.length < 500) return entries;
       }
       return null;
     };
-    const invoices = await scan('listinvoices', 'invoices');
-    const htlcs = await scan('listhtlcs', 'htlcs');
-    if (invoices === null || htlcs === null) return { complete: false, receipts: [] };
+    const seen = new Set<string>();
+    const invoices = await scan('listinvoices', 'invoices', entry => {
+      const invoice = parseInvoice(entry);
+      if (seen.has(invoice.paymentHash)) throw new ProtocolError('incoming history names an invoice twice');
+      seen.add(invoice.paymentHash);
+      return invoice.status === 'paid' && invoice.paidAt !== null && invoice.amountReceivedMsat !== null
+        ? { paymentHash: invoice.paymentHash, paidAt: invoice.paidAt, amountReceivedMsat: invoice.amountReceivedMsat } : null;
+    });
+    if (invoices === null) return { complete: false, receipts: [] };
+    const paidHashes = new Set(invoices.map(invoice => invoice.paymentHash));
+    const htlcs = await scan('listhtlcs', 'htlcs', entry => {
+      if (text(entry, 'direction') !== 'in' || text(entry, 'state') !== 'SENT_REMOVE_ACK_REVOCATION') return null;
+      const paymentHash = text(entry, 'payment_hash');
+      return paidHashes.has(paymentHash)
+        ? { paymentHash, channelKey: text(entry, 'short_channel_id'), amountMsat: msat(entry, 'amount_msat') } : null;
+    });
+    if (htlcs === null) return { complete: false, receipts: [] };
     const events = await new ClnReadApi(this.#rest).listAccountEvents();
     if (events.length > 100_000) return { complete: false, receipts: [] };
     const channels = await new ClnReadApi(this.#rest).listPeerChannels();
@@ -82,10 +104,9 @@ class ClnReader implements NodeReader {
       channelKeys.set(channel.channelId, channel.shortChannelId ?? channel.channelId);
     }
     const receipts: IncomingHistory['receipts'][number][] = [];
-    const byHash = new Map<string, JsonObject[]>();
+    const byHash = new Map<string, (typeof htlcs)[number][]>();
     for (const htlc of htlcs) {
-      if (text(htlc, 'direction') !== 'in' || text(htlc, 'state') !== 'SENT_REMOVE_ACK_REVOCATION') continue;
-      const hash = text(htlc, 'payment_hash');
+      const hash = htlc.paymentHash;
       const list = byHash.get(hash) ?? [];
       list.push(htlc); byHash.set(hash, list);
     }
@@ -95,12 +116,7 @@ class ClnReader implements NodeReader {
       const list = creditsByHash.get(event.paymentId) ?? [];
       list.push(event); creditsByHash.set(event.paymentId, list);
     }
-    const seen = new Set<string>();
-    for (const raw of invoices) {
-      const invoice = parseInvoice(raw);
-      if (seen.has(invoice.paymentHash)) throw new ProtocolError('incoming history names an invoice twice');
-      seen.add(invoice.paymentHash);
-      if (invoice.status !== 'paid' || invoice.paidAt === null || invoice.amountReceivedMsat === null) continue;
+    for (const invoice of invoices) {
       const at = invoice.paidAt * 1000;
       if (!Number.isSafeInteger(at)) throw new ProtocolError('incoming settlement time is out of range');
       const matching = byHash.get(invoice.paymentHash) ?? [];
@@ -113,7 +129,7 @@ class ClnReader implements NodeReader {
         || credits.reduce((total, event) => total + event.creditMsat, 0n) !== invoice.amountReceivedMsat) return { complete: false, receipts: [] };
       const hints = new Map<string, number>();
       for (const htlc of matching) {
-        const key = `${text(htlc, 'short_channel_id')}:${msat(htlc, 'amount_msat').toString()}`;
+        const key = `${htlc.channelKey}:${htlc.amountMsat.toString()}`;
         hints.set(key, (hints.get(key) ?? 0) + 1);
       }
       for (const credit of credits) {

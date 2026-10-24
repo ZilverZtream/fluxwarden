@@ -234,7 +234,10 @@ export class LndExecutionAdapter {
         const answer = await this.#api.listPayments({ indexOffset: offset, maxPayments: SWEEP_PAGE, includeIncomplete: true });
         const found = answer.payments.find(payment => payment.paymentHash === hash);
         if (found !== undefined) return await this.#receiver(observationOf(found).observation, hash, found.valueMsat);
-        if (answer.payments.length === 0 || answer.lastIndexOffset <= offset) return { kind: 'NOT_FOUND' };
+        if (answer.payments.length === 0) return { kind: 'NOT_FOUND' };
+        // lnd v0.21.4-beta lnrpc/lightning.proto ListPaymentsResponse: the last offset is the next
+        // forward-seek cursor. A nonempty page that cannot advance leaves the history incomplete (INV-04).
+        if (answer.lastIndexOffset <= offset) return { kind: 'AMBIGUOUS', cause: 'the payment list did not advance' };
         offset = answer.lastIndexOffset;
       }
     } catch (error) {

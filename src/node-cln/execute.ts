@@ -7,14 +7,14 @@ import { minFinalCltvExpiry } from '../core/bolt11-cltv.js';
 import { assertHash } from '../core/encoding.js';
 import { ProtocolError } from '../core/errors.js';
 import type { CancelResult, CircularRoute, InvoiceResult, InvoiceState, PaymentObservation, RouteOwnership, RouteRequest, RoutingLayerClaim } from '../core/execution.js';
-import { identifier, type JsonObject } from '../core/json.js';
+import type { JsonObject } from '../core/json.js';
 import type { Msat } from '../core/money.js';
 import { isNoRoute, type CandidateRoute } from '../core/route.js';
 import { channelScid, scidToChanId } from '../core/scid.js';
 import { ClnReadApi } from './api.js';
 import { lightningdRefused, type ClnRest } from './rest.js';
 import { ClnRouteApi } from './routes.js';
-import { msat, objects, parseInfo, parsePeerChannel, parseSendPay, text, type ClnSendPay } from './types.js';
+import { objects, parseInfo, parsePeerChannel, parseSendPay, text, type ClnSendPay } from './types.js';
 
 export interface ClnExecutionOptions {
   /** Our node id; askrene disables it so that getroutes runs between the two peers. */
@@ -132,12 +132,16 @@ export class ClnExecutionAdapter {
         beforeCreate: () => {
           assertOwner();
           recordAcquired = ownership.db.routingLayers.prepareAcquisition(ownership.executionId, ownership.fenceEpoch, this.#ownId, layer);
+          recorded = recordAcquired();
         },
         acquired: () => {
           if (recordAcquired === undefined) throw new ProtocolError('route acquisition has no prepared ownership receipt');
           recorded = recordAcquired();
           // Recording a successful receipt grants no authority for the next native mutation.
           assertOwner();
+        },
+        refused: () => {
+          if (recorded !== undefined) ownership.db.routingLayers.notAcquired(recorded, ownership.executionId, ownership.fenceEpoch);
         },
         removed: () => { if (recorded !== undefined) ownership.db.routingLayers.removedImmediately(recorded, ownership.executionId, ownership.fenceEpoch); },
       } }),
@@ -327,41 +331,25 @@ export class ClnExecutionAdapter {
     };
   }
 
-  /** CLN v26.06.9 listhtlcs.json: completed incoming history correlated with our paid invoice, never the payer route. */
+  /** CLN v26.06.9 peer_htlcs.c remove_htlc_in: only fulfilled HTLCs credit the channel account. */
   async #receiverChannel(hash: string, principal: bigint): Promise<string | null> {
     try {
       const invoices = await this.#api.listInvoices({ paymentHash: hash });
       const invoice = invoices.length === 1 ? invoices[0] : undefined;
       if (invoice?.status !== 'paid' || invoice.amountReceivedMsat !== principal || principal <= 0n) return null;
-      const limit = 500;
-      let cursor = 0n;
-      let incoming: JsonObject | undefined;
-      // Core Lightning doc/schemas/listhtlcs.json uses an inclusive created-index start: continue after the last
-      // index, as for listsendpays in reader.ts. Keep the accounting reader's 200-page work bound, and retain no
-      // attribution unless a short final page proves the complete scan (including pages after an apparent match).
-      for (let page = 0; page < 200; page++) {
-        const start = Number(cursor);
-        if (!Number.isSafeInteger(start)) return null;
-        const history = objects(await this.#rest.call('listhtlcs', { index: 'created', start, limit }), 'htlcs');
-        if (history.length > limit) return null;
-        for (const htlc of history) {
-          if (htlc['created_index'] === undefined || htlc['created_index'] === null) return null;
-          const index = BigInt(identifier(htlc, 'created_index'));
-          if (index < cursor) return null;
-          cursor = index + 1n;
-          if (text(htlc, 'payment_hash') === hash && text(htlc, 'direction') === 'in' &&
-            text(htlc, 'state') === 'SENT_REMOVE_ACK_REVOCATION' && msat(htlc, 'amount_msat') === principal) {
-            if (incoming !== undefined) return null;
-            incoming = htlc;
-          }
-        }
-        if (history.length < limit) {
-          if (incoming === undefined) return null;
-          const channel = text(incoming, 'short_channel_id');
-          return scidToChanId(channel) === '0' ? null : channel;
-        }
-      }
-      return null;
+      // SENT_REMOVE_ACK_REVOCATION also describes failed HTLCs. A paid invoice and payer preimage
+      // cannot identify which retained HTLC credited a channel. Use independent native channel credit
+      // without requiring unrelated HTLC history to remain available or complete.
+      // CLN v26.06.9 doc/schemas/bkpr-listaccountevents.json identifies the credited account by full
+      // channel_id; this method already belongs to the execution rune allowlist (SECURITY §3.2).
+      const events = await this.#api.listAccountEvents({ paymentId: hash });
+      const credits = events.filter(event => event.type === 'channel' && event.creditMsat > 0n);
+      const credit = credits.length === 1 ? credits[0] : undefined;
+      if (credit === undefined || credit.tag !== 'invoice' || credit.debitMsat !== 0n || credit.creditMsat !== principal) return null;
+      const channels = await this.#api.listPeerChannels();
+      const credited = channels.filter(entry => entry.channelId === credit.account);
+      const channel = credited.length === 1 ? credited[0]?.shortChannelId : null;
+      return channel !== undefined && channel !== null && scidToChanId(channel) !== '0' ? channel : null;
     } catch {
       return null;
     }

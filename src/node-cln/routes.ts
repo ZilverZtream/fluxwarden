@@ -25,8 +25,8 @@ export interface ClnRouteRequest {
   readonly layer: string;
   /** Channels neither direction of which may be used. */
   readonly excludeScids: readonly string[];
-  /** An execution caller records an actual successful acquisition and conclusive immediate removal. */
-  readonly lifecycle?: { beforeCreate(): void; acquired(): void; removed(): void };
+  /** An execution caller durably records intent before create and conclusively retires refusal or removal. */
+  readonly lifecycle?: { beforeCreate(): void; acquired(): void; refused(): void; removed(): void };
 }
 
 interface PathItem {
@@ -141,7 +141,15 @@ export class ClnRouteApi {
     } catch (error) {
       // lightningd refused the name: it may be another assessment's layer, which is left alone. Any other failure
       // (a cut or an unreadable answer) may have created the layer, so it is removed before the error is reported.
-      if (!lightningdRefused(error)) await this.#rest.call('askrene-remove-layer', { layer }).catch(() => undefined);
+      if (lightningdRefused(error)) request.lifecycle?.refused();
+      else {
+        try {
+          await this.#rest.call('askrene-remove-layer', { layer });
+          request.lifecycle?.removed();
+        } catch {
+          // The durable exact-name intent remains pending for terminal-owner recovery.
+        }
+      }
       throw error;
     }
     let outcome: JsonObject | Error | undefined;

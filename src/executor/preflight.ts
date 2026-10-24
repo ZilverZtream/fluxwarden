@@ -242,11 +242,13 @@ export async function recoverPreflight(deps: Pick<PreflightDeps, 'db' | 'workerI
   readonly adapter?: Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'>;
   /** Admitted adapters keyed by nodes.id for a multi-node recovery pass. */
   readonly adapters?: ReadonlyMap<string, Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'>>;
+  /** Scope all takeovers, including hashless housekeeping; omitted for the ordinary global daemon sweep. */
+  readonly nodeIds?: ReadonlySet<string>;
 }): Promise<{ cancelled: readonly string[] }> {
   const { db, workerId, leaseMs } = deps;
   const cancelled: string[] = [];
   try {
-    for (const executionId of db.executions.lapsedClaims()) {
+    for (const executionId of db.executions.lapsedClaims(deps.nodeIds === undefined ? undefined : [...deps.nodeIds])) {
       const hash = db.executions.view(executionId)?.paymentHash ?? null;
       let adapter: Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'> | undefined;
       if (hash !== null) {

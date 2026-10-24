@@ -6,6 +6,8 @@ The implementation targets LND 0.21.4-beta and Core Lightning 26.06.9. Use the p
 - LND router RPC definitions, including SendToRouteV2 and tracking: https://github.com/lightningnetwork/lnd/blob/v0.21.4-beta/lnrpc/routerrpc/router.proto
 - Core Lightning 26.06.9 source and RPC schemas: https://github.com/ElementsProject/lightning/tree/v26.06.9/doc/schemas
 - Core Lightning HTLC send height and outgoing CLTV handling: https://github.com/ElementsProject/lightning/blob/v26.06.9/lightningd/pay.c
+- Core Lightning incoming HTLC fulfillment and channel credit, including failed terminal removals: https://github.com/ElementsProject/lightning/blob/v26.06.9/lightningd/peer_htlcs.c
+- Core Lightning bookkeeper channel accounts and payment hash filtering: https://github.com/ElementsProject/lightning/blob/v26.06.9/doc/schemas/bkpr-listaccountevents.json
 - Core Lightning route finding and explicit single-part constraints: https://docs.corelightning.org/reference/getroutes
 - Core Lightning rune restrictions and alternative restriction semantics: https://docs.corelightning.org/reference/createrune
 - Node.js SQLite statement integer handling and transactions: https://nodejs.org/docs/latest-v24.x/api/sqlite.html

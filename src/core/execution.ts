@@ -125,9 +125,10 @@ export interface RoutingLayerClaim {
   readonly fenceEpoch: bigint;
 }
 
-/** Persistence binds a receipt recorder while authority is live; adapters invoke it only on successful acquisition. */
+/** Persistence records the exact acquisition intent while authority is live, before a native create can be ambiguous. */
 export interface RoutingLayerOwnership {
   prepareAcquisition(executionId: string, fenceEpoch: bigint, nodePubkey: string, layer: string): () => RoutingLayerClaim;
+  notAcquired(claim: RoutingLayerClaim, executionId: string, fenceEpoch: bigint): void;
   removedImmediately(claim: RoutingLayerClaim, executionId: string, fenceEpoch: bigint): void;
 }
 

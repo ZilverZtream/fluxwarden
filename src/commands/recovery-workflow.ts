@@ -63,9 +63,13 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
       topologyBefore.push(...db.commandData.snapshots(session.rowId));
       db.snapshots.storeAll(channels);
     }
-    const ids = db.commandData.executionIds();
+    const scope = { nodeIds: [...adapters.keys()], ...window.window };
+    // Accounting still considers every stored hash on these nodes. Evidence keeps only the window and
+    // unresolved inputs, plus any older execution actually changed or referenced by this pass.
+    const ids = db.commandData.executionIds({ nodeIds: scope.nodeIds });
+    const evidenceIds = new Set(db.commandData.executionIds(scope));
     const before = new Map(ids.map(id => [id, database.executions.view(id)?.status]));
-    await recoverPreflight({ db, adapters, workerId: randomUUID(), leaseMs: 60_000 });
+    await recoverPreflight({ db, adapters, nodeIds: new Set(scope.nodeIds), workerId: randomUUID(), leaseMs: 60_000 });
     const pass = await reconcile({ db, adapters, workerId: randomUUID(), leaseMs: 60_000, notFoundWindowMs: 120_000,
       escalateAfterMs: config.escalateAfterMs, deltaToleranceMsat: config.deltaToleranceMsat, confirmIntervalMs: 1000, nodeIds: new Set(adapters.keys()),
       alert: alert => { writer.raise({ kind: alert.kind === 'INVARIANT_BREACH' ? 'invariant-breach' : alert.kind,
@@ -85,15 +89,26 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
     for (const difference of accounting.differences) writer.raise({ kind: 'recon-difference', subject: difference.executionId ?? difference.node,
       state: `${difference.source}:${difference.kind}:${String(difference.ledgerMsat)}:${String(difference.nodeMsat)}:${difference.reason ?? ''}` });
     const runId = `run_${ulid(db.now())}`;
-    const changes = executions.filter(execution => before.get(execution.id) !== execution.status).map(execution => ({ execution_id: execution.id, from: before.get(execution.id), to: execution.status }));
-    const journals = db.ledger.journals();
+    // Hashless expired claims are housekeeping rather than accounting records, but their actual
+    // transitions still belong to this selected-node report and its complete evidence inputs.
+    const changes = ids.flatMap(id => {
+      const status = database.executions.view(id)?.status;
+      return status !== undefined && before.get(id) !== status ? [{ execution_id: id, from: before.get(id), to: status }] : [];
+    });
+    for (const change of changes) evidenceIds.add(change.execution_id);
+    for (const difference of accounting.differences) if (difference.executionId !== null) evidenceIds.add(difference.executionId);
+    const journals = db.ledger.journals().filter(journal => journal.executionId !== null ? evidenceIds.has(journal.executionId)
+      : journal.occurredAt >= scope.sinceMs && journal.occurredAt < scope.untilMs
+        && journal.lines.some(line => nodes.some(node => line.account.startsWith(`channel:${node.name}:`))));
     const differences = accounting.differences.map(difference => ({ node: difference.node, execution_id: difference.executionId, item: `${difference.source}:${difference.kind}`,
       ledger_msat: (difference.ledgerMsat ?? 0n).toString(), node_msat: (difference.nodeMsat ?? 0n).toString(),
       journal_id: journals.find(journal => journal.eventType === 'RECON_DIFFERENCE' && journal.executionId === difference.executionId)?.id ?? runId }));
     const report = { run_id: runId, since: window.window.sinceMs, nodes: accounting.nodes.map(node => ({ name: node.node, result: node.status })), executions: changes, differences,
       steps: [1, 2, 3, 4].map(step => ({ step, result: step === 4 && accounting.nodes.some(node => node.status !== 'compared') ? 'incomplete' : 'compared' })) };
-    const proposals = db.commandData.proposalIds({ nodeIds: [...adapters.keys()], ...window.window })
-      .map(id => database.proposals.find(id)).filter(proposal => proposal !== null).map(proposal => proposalDocument(proposal, database.now()));
+    const proposals = db.commandData.proposalIds({ ...scope, executionIds: [...evidenceIds] })
+      .map(id => database.proposals.find(id)).filter(proposal => proposal !== null).map(proposal => ({
+        ...proposalDocument(proposal, database.now()), approvals: database.commandData.approvals.listByProposal(proposal.id),
+      }));
     const policy = activePolicy(config);
     const build = buildIdentity();
     const input: EvidenceInput = {
@@ -105,9 +120,10 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
         seeds: [], policySha256: policySha256(policy), approvalKeyIds: config.approvalKeys.map(key => key.keyId), chaosScenarioIds: [],
         unavailableEvidence: { image_digests: 'node RPC does not expose container image digests', seeds: 'reconciliation uses no simulation seed',
           chaos_scenario_ids: 'no chaos scenario was supplied for this run',
-          proposal_history: 'proposals cover the selected nodes and reconciliation window, plus all execution inputs; unrelated planner history is omitted' } },
+          proposal_history: 'proposals and public approval proofs cover the selected nodes and window, plus unresolved, changed and accounting-referenced executions; unrelated completed history is omitted',
+          ledger_history: 'verification covers the full stored book; exported journals close the retained executions and selected-node window; balances are current whole-book totals, not a recomputation of this journal subset' } },
       topologyBefore, topologyAfter: nodes.flatMap(node => { const stored = database.nodes.list().find(row => row.name === node.name); return stored === undefined ? [] : database.commandData.snapshots(stored.id); }),
-      proposals, executionTrace: ids.flatMap(id => database.executions.events(id).map(event => ({ execution_id: id, ...event }))),
+      proposals, executionTrace: [...evidenceIds].flatMap(id => database.executions.events(id).map(event => ({ execution_id: id, ...event }))),
       ledgerAudit: { journals, balances: Object.fromEntries(db.ledger.balances()), steps: report.steps }, reconciliation: report, chaosResults: [],
     };
     writeRunRecord(config.database, await labEvidence(input, command.config, env, db));

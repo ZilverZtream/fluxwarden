@@ -64,13 +64,30 @@ it('CP-026/REG-CLI016 paid pending execution exposes known economics null deltas
   await approve(d, proposal);
   const respond = d.cln.fake.result;
   let missingCurrentListing = false;
+  let historicalTargetMappingSeen = false, matchingNativeCreditSeen = false;
+  const nativeTargetAccount = '25'.repeat(32);
   d.cln.fake.result = (context, behaviour, value) => {
     if (behaviour === 'invoice') {
       register('preimage', Buffer.from(String(context.params['preimage']), 'hex'));
       register('payment-secret', Buffer.from(String(rec(value)['payment_secret']), 'hex'));
     }
     // listpeerchannels.json permits an empty current listing. Native paid
-    // payer/invoice/incoming-HTLC receipts remain unchanged and prove settlement.
+    if (behaviour === 'listpeerchannels' && d.cln.state.settledAt === null) {
+      historicalTargetMappingSeen ||= (rec(value)['channels'] as Record<string, unknown>[])
+        .some(channel => channel['channel_id'] === nativeTargetAccount && channel['short_channel_id'] === T);
+    }
+    if (behaviour === 'bkpr-listaccountevents') {
+      matchingNativeCreditSeen ||= (rec(value)['events'] as Record<string, unknown>[]).some(event =>
+        event['account'] === nativeTargetAccount && event['payment_id'] === d.cln.state.sent[0]
+        && event['type'] === 'channel' && event['tag'] === 'invoice' && event['is_rebalance'] === true
+        && event['part_id'] === 0 && event['credit_msat'] === 100000000 && event['debit_msat'] === 0);
+    }
+    // payer and paid-invoice receipts still prove payment. D29 native oracle
+    // clarification: empty current listpeerchannels removes a fresh channel_id
+    // -> SCID binding. A witnessed earlier native binding plus actual matching
+    // bookkeeper credit can still prove T. Otherwise principal stays unassigned;
+    // failed-capable listhtlcs removal states cannot supply the missing proof
+    // (CLN v26.06.9 peer_htlcs.c remove_htlc_in).
     if (behaviour === 'listpeerchannels' && d.cln.state.settledAt !== null) {
       missingCurrentListing = true;
       respond(context, behaviour, { channels: [] });
@@ -92,11 +109,22 @@ it('CP-026/REG-CLI016 paid pending execution exposes known economics null deltas
     { account_code: `channel:cln-m:${S}:local`, debit_msat: 0, credit_msat: 100202101 },
     { account_code: 'clearing:inflight', debit_msat: 100202101, credit_msat: 0 },
   ]);
-  expect(journalLines(journals[1]?.['id'])).toEqual([
-    { account_code: `channel:cln-m:${T}:local`, debit_msat: 100000000, credit_msat: 0 },
-    { account_code: 'clearing:inflight', debit_msat: 0, credit_msat: 100202101 },
-    { account_code: 'expense:routing_fees', debit_msat: 202101, credit_msat: 0 },
-  ]);
+  const settledLines = journalLines(journals[1]?.['id']);
+  if (settledLines.some(line => line['account_code'] === `channel:cln-m:${T}:local`)) {
+    expect(historicalTargetMappingSeen, 'assigned principal needs an independently observed native channel binding').toBe(true);
+    expect(matchingNativeCreditSeen, 'assigned principal needs actual matching native bookkeeper credit').toBe(true);
+    expect(settledLines).toEqual([
+      { account_code: `channel:cln-m:${T}:local`, debit_msat: 100000000, credit_msat: 0 },
+      { account_code: 'clearing:inflight', debit_msat: 0, credit_msat: 100202101 },
+      { account_code: 'expense:routing_fees', debit_msat: 202101, credit_msat: 0 },
+    ]);
+  } else {
+    expect(settledLines).toEqual([
+      { account_code: 'clearing:inflight', debit_msat: 0, credit_msat: 100202101 },
+      { account_code: 'clearing:unassigned', debit_msat: 100000000, credit_msat: 0 },
+      { account_code: 'expense:routing_fees', debit_msat: 202101, credit_msat: 0 },
+    ]);
+  }
   for (const journal of journals) expect(journalLines(journal['id']).reduce((sum, line) =>
     sum + Number(line['debit_msat']) - Number(line['credit_msat']), 0)).toBe(0);
   expect(d.cln.fake.calls.filter(call => call.method === 'invoice')).toHaveLength(1);

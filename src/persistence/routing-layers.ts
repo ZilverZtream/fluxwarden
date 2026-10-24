@@ -30,33 +30,34 @@ export function routingLayersRepository(db: DatabaseSync, writable: (what: strin
     prepareAcquisition(executionId, fenceEpoch, nodePubkey, layer) {
       writable('routing layer ownership');
       if (layer.length === 0 || layer.length > 128) throw new PersistenceError('OUT_OF_RANGE', 'invalid routing layer identity');
-      const nodeId = run(() => {
-        // MySQL: same SELECT and NOW(6). No resource is owned until the native create succeeds.
-        const owner = db.prepare(`SELECT n.id FROM executions e
+      const recorded = run(() => {
+        const id = newUlid();
+        // MySQL: same INSERT ... SELECT with NOW(6). The exact uncertain acquisition must survive
+        // process loss before the native create reply. This grants no authority over any other layer.
+        const result = db.prepare(`INSERT INTO routing_layers
+            (id, node_id, layer, execution_id, acquired_fence_epoch, fence_epoch, state, acquired_at)
+          SELECT ?, n.id, ?, e.id, e.fence_epoch, 1, 'PENDING', ${DB_NOW} FROM executions e
           JOIN liquidity_proposals p ON p.id = e.proposal_id JOIN nodes n ON n.id = p.node_id
           WHERE e.id = ? AND e.fence_epoch = ? AND e.status = 'PREFLIGHT' AND e.lease_expires_at > ${DB_NOW}
             AND n.implementation = 'cln' AND n.expected_pubkey = ?`)
-          .get(executionId, fenceEpoch, nodePubkey);
-        if (owner === undefined) throw new PersistenceError('LEASE_LOST', 'routing layer acquisition has no current execution ownership');
-        return textColumn(owner, 'id');
+          .run(id, layer, executionId, fenceEpoch, nodePubkey);
+        changed(result.changes);
+        return { id, fenceEpoch: 1n };
       });
-      let recorded: RoutingLayerClaim | undefined;
-      return () => {
-        writable('routing layer ownership');
-        if (recorded !== undefined) return recorded;
-        recorded = run(() => {
-          const id = newUlid();
-          // MySQL: same INSERT and NOW(6). This exact receipt cannot renew or mutate execution authority.
-          // A delayed successful reply remains a fact after its initiating lease expires or is reclaimed.
-          const result = db.prepare(`INSERT INTO routing_layers
-            (id, node_id, layer, execution_id, acquired_fence_epoch, fence_epoch, state, acquired_at)
-            VALUES (?, ?, ?, ?, ?, 1, 'PENDING', ${DB_NOW})`)
-            .run(id, nodeId, layer, executionId, fenceEpoch);
-          changed(result.changes);
-          return { id, fenceEpoch: 1n };
-        });
-        return recorded;
-      };
+      return () => recorded;
+    },
+
+    notAcquired(claim, executionId, fenceEpoch) {
+      writable('routing layer acquisition refusal');
+      run(() => {
+        // MySQL: same CAS. A native create refusal conclusively disclaims acquisition even if its
+        // reply arrives after execution authority expires. Never remove that possibly foreign layer.
+        const result = db.prepare(`UPDATE routing_layers SET state = 'CLEANED', fence_epoch = fence_epoch + 1, completed_at = ${DB_NOW}
+          WHERE id = ? AND fence_epoch = ? AND execution_id = ? AND acquired_fence_epoch = ? AND state = 'PENDING'
+            AND worker_id IS NULL AND lease_expires_at IS NULL`)
+          .run(claim.id, claim.fenceEpoch, executionId, fenceEpoch);
+        changed(result.changes);
+      });
     },
 
     removedImmediately(claim, executionId, fenceEpoch) {

@@ -95,21 +95,45 @@ export function commandData(db: DatabaseSync, writable: (what: string) => void, 
         observedAt: numberColumn(row, 'observed_at'), blockHeight: numberColumn(row, 'block_height'), provenance: JSON.parse(textColumn(row, 'provenance_json')) as Record<string, string>,
       })));
     },
-    /** Window proposals for selected nodes, plus every execution's inputs to close trace and ledger references. */
-    proposalIds(scope?: { readonly nodeIds: readonly string[]; readonly sinceMs: number; readonly untilMs: number }): string[] {
+    /** Window proposals for selected nodes, plus the explicitly retained executions' inputs. */
+    proposalIds(scope?: { readonly nodeIds: readonly string[]; readonly sinceMs: number; readonly untilMs: number; readonly executionIds?: readonly string[] }): string[] {
       return run(() => {
         // MySQL: same. Scope unrelated planner history before loading route and explanation documents.
         const rows = scope === undefined
           ? db.prepare('SELECT id FROM liquidity_proposals ORDER BY created_at, id').all()
           : db.prepare(`SELECT p.id FROM liquidity_proposals p WHERE
               (p.node_id IN (${scope.nodeIds.map(() => '?').join(',') || 'NULL'}) AND p.created_at >= ? AND p.created_at < ?)
-              OR EXISTS (SELECT 1 FROM executions e WHERE e.proposal_id = p.id)
-            ORDER BY p.created_at, p.id`).all(...scope.nodeIds, scope.sinceMs, scope.untilMs);
+              OR EXISTS (SELECT 1 FROM executions e WHERE e.proposal_id = p.id
+                AND e.id IN (${scope.executionIds?.map(() => '?').join(',') || 'NULL'}))
+            ORDER BY p.created_at, p.id`).all(...scope.nodeIds, scope.sinceMs, scope.untilMs, ...(scope.executionIds ?? []));
         return rows.map(row => textColumn(row, 'id'));
       });
     },
-    // MySQL: same
-    executionIds(): string[] { return run(() => db.prepare('SELECT id FROM executions ORDER BY created_at, id').all().map(row => textColumn(row, 'id'))); },
+    /** Scope evidence before loading trace/proposal documents; unresolved work remains relevant at any age. */
+    executionIds(scope?: { readonly nodeIds: readonly string[]; readonly sinceMs?: number; readonly untilMs?: number }): string[] {
+      return run(() => {
+        // MySQL: same unscoped execution-id listing.
+        if (scope === undefined) return db.prepare('SELECT id FROM executions ORDER BY created_at, id').all().map(row => textColumn(row, 'id'));
+        const { sinceMs, untilMs } = scope;
+        const bounds = sinceMs === undefined || untilMs === undefined ? []
+          : Array.from({ length: 4 }, () => [sinceMs, untilMs]).flat();
+        const windowed = bounds.length > 0;
+        // MySQL: same. Journal references close accounting windows whose execution started earlier.
+        const rows = db.prepare(`SELECT e.id FROM executions e JOIN liquidity_proposals p ON p.id = e.proposal_id
+          WHERE p.node_id IN (${scope.nodeIds.map(() => '?').join(',') || 'NULL'}) ${windowed ? `AND (
+            e.status IN ('CLAIMED','PREFLIGHT','SUBMITTING','IN_FLIGHT','UNKNOWN')
+            OR (e.status = 'VERIFIED_SUCCESS' AND (e.delta_status = 'PENDING' OR e.actual_fee_msat IS NULL
+              OR (EXISTS (SELECT 1 FROM ledger_journals j JOIN ledger_lines l ON l.journal_id = j.id
+                WHERE j.execution_id = e.id AND j.event_type = 'REBALANCE_SETTLED' AND l.account_code = 'clearing:unassigned')
+                AND NOT EXISTS (SELECT 1 FROM ledger_journals j WHERE j.execution_id = e.id AND j.event_type = 'RECON_DIFFERENCE'
+                  AND j.reference = 'incoming:' || e.id || ':release'))))
+            OR (e.created_at >= ? AND e.created_at < ?) OR (e.updated_at >= ? AND e.updated_at < ?)
+            OR EXISTS (SELECT 1 FROM execution_events ev WHERE ev.execution_id = e.id AND ev.at >= ? AND ev.at < ?)
+            OR EXISTS (SELECT 1 FROM ledger_journals j WHERE j.execution_id = e.id AND j.occurred_at >= ? AND j.occurred_at < ?))` : ''}
+          ORDER BY e.created_at, e.id`).all(...scope.nodeIds, ...bounds);
+        return rows.map(row => textColumn(row, 'id'));
+      });
+    },
   };
 }
 export type CommandData = ReturnType<typeof commandData>;

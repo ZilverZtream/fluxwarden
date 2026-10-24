@@ -3,11 +3,15 @@
 // (state SETTLED=1, chan_id, amt_msat); CLN v26.06.9 listhtlcs.json (readonly,
 // created_index/short_channel_id/direction/amount_msat/payment_hash/state), plus
 // a PAID listinvoices receipt. No incoming-channel field is invented on CLN invoices.
+// D29 2026-10-24 oracle correction: peer_htlcs.c remove_htlc_in L1880-1926
+// accepts failure or preimage at the same terminal removal state. Positive CLN
+// attribution therefore also has independently recorded bookkeeper credit,
+// mapped from its full channel account via native listpeerchannels channel_id.
 import { randomBytes } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
-import { clnInvoice, sendpay } from '../fakes/cln/responses.js';
+import { accountEvent, clnInvoice, peerChannel, sendpay } from '../fakes/cln/responses.js';
 import { attempt, b64, invoice, payment } from '../fakes/lnd/responses.js';
 import type { ClnRest, LndRest } from '../helpers/adapter-interfaces.js';
 import { loadClnExecute, loadLndExecute, sha256 } from '../helpers/cp030-execution.js';
@@ -58,7 +62,7 @@ function incomingCln(over: Record<string, unknown> = {}): Record<string, unknown
     state: 'SENT_REMOVE_ACK_REVOCATION', ...over };
 }
 
-async function clnReceipt(htlcs: readonly Record<string, unknown>[], truncated = false) {
+async function clnReceipt(htlcs: readonly Record<string, unknown>[], truncated = false, corroborated = false) {
   const calls: { method: string; params: Record<string, unknown> | undefined }[] = [];
   let pages = 0;
   const rest: ClnRest = { call: (method, params) => {
@@ -67,6 +71,10 @@ async function clnReceipt(htlcs: readonly Record<string, unknown>[], truncated =
       status: 'complete', amount_msat: principal, amount_sent_msat: 100202101, payment_preimage: preimage.toString('hex') })] });
     if (method === 'listinvoices') return Promise.resolve({ invoices: [clnInvoice({ payment_hash: hash,
       status: 'paid', amount_msat: principal, amount_received_msat: principal })] });
+    if (method === 'bkpr-listaccountevents') return Promise.resolve({ events: corroborated ? [accountEvent({
+      account: '78'.repeat(32), payment_id: hash, credit_msat: principal, debit_msat: 0, fees_msat: 0,
+    })] : [] });
+    if (method === 'listpeerchannels') return Promise.resolve({ channels: [peerChannel({ short_channel_id: actualCln })] });
     if (method === 'listhtlcs') {
       pages += 1;
       if (truncated && pages > 1) return Promise.reject(new Error('ordinary transport closed before the next history page'));
@@ -95,12 +103,12 @@ for (const [name, htlcs] of [
   });
 }
 
-it('CP-031/B3 CLN paid receiver and unique completed incoming history preserve actual SCID with bounded read-only calls', async () => {
-  const r = await clnReceipt([incomingCln(), incomingCln({ direction: 'out', state: 'RCVD_REMOVE_ACK_REVOCATION', short_channel_id: '103x1x0', created_index: 8 })]);
+it('CP-031/B3 CLN paid receiver with independent native channel credit preserves actual SCID with bounded read-only calls', async () => {
+  const r = await clnReceipt([incomingCln(), incomingCln({ direction: 'out', state: 'RCVD_REMOVE_ACK_REVOCATION', short_channel_id: '103x1x0', created_index: 8 })], false, true);
   expect(r.observed).toMatchObject({ kind: 'SUCCEEDED', settledChannelKey: actualCln, feeMsat: 202_101n });
-  expect(r.calls.every(call => ['listsendpays', 'listinvoices', 'listhtlcs'].includes(call.method))).toBe(true);
+  expect(r.calls.every(call => ['listsendpays', 'listinvoices', 'listhtlcs', 'bkpr-listaccountevents', 'listpeerchannels'].includes(call.method))).toBe(true);
   const reads = r.calls.filter(call => call.method === 'listhtlcs');
-  expect(reads.length).toBeGreaterThanOrEqual(1);
+  // Conclusive independent credit does not require an unrelated HTLC scan.
   for (const read of reads) {
     expect(read.params?.['index']).toBe('created');
     expect(Number(read.params?.['limit'])).toBeGreaterThan(0);
@@ -110,6 +118,7 @@ it('CP-031/B3 CLN paid receiver and unique completed incoming history preserve a
 
 for (const [name, htlcs] of [
   ['missing', []],
+  ['terminal state without independent settlement credit', [incomingCln()]],
   ['ambiguous', [incomingCln(), incomingCln({ short_channel_id: '109x3x0', created_index: 8, id: 4 })]],
   ['unresolved incoming state', [incomingCln({ state: 'RCVD_ADD_ACK_REVOCATION' })]],
 ] as const) {

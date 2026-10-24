@@ -1,9 +1,10 @@
-import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, linkSync, lstatSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { repoRoot } from './cli.js';
 import { testRoot } from './env.js';
+import { declareFixturePaths } from './capture-fixture.js';
 
 export interface SecretValue { toString(): string; toJSON(): string }
 export interface Output {
@@ -44,7 +45,35 @@ export function sentinelRoot(): string {
 }
 
 export function registerSentinels(directory = sentinelRoot()): void {
-  for (const row of sentinels()) writeFileSync(join(directory, `product-${row.kind}.bin`), row.bytes, { mode: 0o600 });
+  for (const row of sentinels()) publishSentinel(directory, `product-${row.kind}.bin`, row.bytes);
+}
+
+/** Publish complete immutable input bytes without exposing an empty destination
+ * or truncating another worker's source. Node fs.linkSync is exclusive at the
+ * destination (Node 24.21 fs documentation); EEXIST requires exact validation.
+ * Stages stay in owned scratch until command cleanup: unlinking a winning
+ * hard-link stage earlier would change the registered inode's native ctime. */
+export function publishSentinel(directory: string, name: string, bytes: Buffer): void {
+  if (!/^[a-z0-9-]+\.bin$/.test(name) || bytes.length === 0) throw new Error('invalid immutable sentinel input');
+  const destination = join(directory, name);
+  const hasCode = (error: unknown, code: string): boolean => typeof error === 'object' && error !== null && 'code' in error && error.code === code;
+  const existingMatches = (): boolean => {
+    let before;
+    try { before = lstatSync(destination, { bigint: true }); }
+    catch (error) { if (hasCode(error, 'ENOENT')) return false; throw error; }
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error('immutable sentinel is not a regular file');
+    const actual = readFileSync(destination), after = lstatSync(destination, { bigint: true });
+    if (!actual.equals(bytes) || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw new Error('immutable sentinel input changed');
+    return true;
+  };
+  if (existingMatches()) return;
+  const stage = join(mkdtempSync(join(scratchRoot(), 'sentinel-input-')), 'source.bin');
+  declareFixturePaths([stage, destination]);
+  writeFileSync(stage, bytes, { flag: 'wx', mode: 0o600 });
+  try { linkSync(stage, destination); }
+  catch (error) { if (!hasCode(error, 'EEXIST')) throw error; }
+  if (!existingMatches()) throw new Error('immutable sentinel publication is absent');
 }
 
 export function scratchRoot(): string {

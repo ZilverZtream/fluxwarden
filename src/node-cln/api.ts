@@ -58,8 +58,11 @@ export class ClnReadApi {
     return unique(invoices, invoice => invoice.label, 'invoice label');
   }
 
-  async listAccountEvents(): Promise<ClnAccountEvent[]> {
-    return objects(await this.#rest.call('bkpr-listaccountevents'), 'events').map(parseAccountEvent);
+  async listAccountEvents(filter?: { paymentId: string }): Promise<ClnAccountEvent[]> {
+    // CLN v26.06.9 doc/schemas/bkpr-listaccountevents.json: payment_id is a native hash filter.
+    const events = objects(await this.#rest.call('bkpr-listaccountevents', filter === undefined ? {} : { payment_id: assertHash(filter.paymentId) }), 'events').map(parseAccountEvent);
+    if (filter !== undefined && events.some(event => event.paymentId !== filter.paymentId)) throw new ProtocolError('account events name another payment hash');
+    return events;
   }
 
   async listLayers(): Promise<ClnLayer[]> {

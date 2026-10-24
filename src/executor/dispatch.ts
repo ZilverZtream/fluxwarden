@@ -214,11 +214,18 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       return outcome(ExitCode.SAFETY_REFUSAL, 'STALE_SNAPSHOT');
     }
 
-    // The branded route may have been approved against an older, richer snapshot.
+    // The branded route may have been approved against an older, richer snapshot. Recheck V8/V9/V12
+    // and the endpoint identities before creating the invoice on the newest observation.
     const source = baseline?.find(channel => channel.channelKey === route.sourceChannelKey);
-    if (source === undefined || source.spendableMsat - (route.principalMsat + route.totalFeeMsat) < sourceReserveFloor(input.policy)) {
-      fenced('PREFLIGHT', 'CANCELLED', { errorCode: 'RESERVE_FLOOR' });
-      return outcome(ExitCode.SAFETY_REFUSAL, 'RESERVE_FLOOR');
+    const target = baseline?.find(channel => channel.channelKey === route.targetChannelKey);
+    const refusal = source === undefined || target === undefined || source.state !== 'ACTIVE' || target.state !== 'ACTIVE'
+      || source.peerPubkey !== route.outPeer || target.peerPubkey !== route.inPeer ? 'NO_FEASIBLE_ROUTE'
+      : source.spendableMsat < route.principalMsat + route.totalFeeMsat ? 'FIRST_HOP_SPENDABLE'
+        : source.spendableMsat - (route.principalMsat + route.totalFeeMsat) < sourceReserveFloor(input.policy) ? 'RESERVE_FLOOR'
+          : target.receivableMsat < route.principalMsat ? 'LAST_HOP_RECEIVABLE' : null;
+    if (refusal !== null) {
+      fenced('PREFLIGHT', 'CANCELLED', { errorCode: refusal });
+      return outcome(ExitCode.SAFETY_REFUSAL, refusal);
     }
 
     const preimage = deps.randomBytes(PREIMAGE_BYTES);
