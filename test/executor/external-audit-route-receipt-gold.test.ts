@@ -5,7 +5,7 @@ import { expect, it } from 'vitest';
 import { succeeded } from '../fakes/execution-node.js';
 import { circularRoute, FakePreflightNode, fakeChannel } from '../fakes/preflight-node.js';
 import {
-  APPROVAL_KEYS, execByProposal, IN_PEER, loadPersistence, loadPreflight, policyFor, PRINCIPAL, raw,
+  APPROVAL_KEYS, dbNow, execByProposal, IN_PEER, loadPersistence, loadPreflight, OUT_PEER, policyFor, PRINCIPAL, raw,
   scratchDb, seedBase, seedProposal,
 } from '../helpers/cp028-executor.js';
 import { balances, prepare, ROUTE_FEE, S_BEFORE, T_BEFORE } from '../helpers/cp030-dispatch.js';
@@ -28,7 +28,15 @@ for (const condition of ['valid', 'wrong-fee', 'below-minimum', 'above-maximum']
       minHtlcMsat: condition === 'below-minimum' && index === 2 ? PRINCIPAL + 1n : 1n,
       maxHtlcMsat: condition === 'above-maximum' && index === 2 ? PRINCIPAL - 1n : 1_000_000_000n,
     } })) };
-    const node = new FakePreflightNode(base.sourceKey, base.targetKey, { route: () => known });
+    const node = new FakePreflightNode(base.sourceKey, base.targetKey, {
+      route: () => known,
+      // Match workflow.ts's database-clock observation authority; these cases
+      // vary forwarding policy, not snapshot clock skew (CP044/F02 covers skew).
+      channels: () => {
+        const observedAt = dbNow(path);
+        return [fakeChannel(base.sourceKey, OUT_PEER, { observedAt }), fakeChannel(base.targetKey, IN_PEER, { observedAt })];
+      },
+    });
     const db = p.openDatabase(path, { readOnly: false });
     try {
       const outcome = await prepareExecution({ db, adapter: node, workerId: 'worker-a', leaseMs: 60_000 },

@@ -30,11 +30,11 @@ interface FailedObservationStore {
   noteObservation(executionId: string, fenceEpoch: bigint, observation: 'FAILED' | 'CLEARED'): bigint;
 }
 
-async function world(prefix: string, options: { confirmIntervalMs?: number; failedObservationAgeMs?: () => number } = {}) {
+async function world(prefix: string, options: { implementation?: 'lnd' | 'cln'; confirmIntervalMs?: number; failedObservationAgeMs?: () => number } = {}) {
   const p = await loadPersistence();
   const { reconcile } = await loadReconciler();
   const path = scratchDb(prefix);
-  const base = seedBase(p, path);
+  const base = seedBase(p, path, undefined, { implementation: options.implementation ?? 'lnd' });
   const evidence = new Map<string, Evidence>();
   const reads = new Map<string, number>();
   const script: Partial<ExecutionScript> = {
@@ -357,9 +357,8 @@ it('CP-032/B4 NOT_FOUND past the window whose invoice cancel fails stays UNKNOWN
 
 it('CP-032/B2 on a CLN node one listsendpays failed is not terminal; a second failed one interval later is', async () => {
   let observationAgeMs = 0;
-  const w = await world('cln-failed-twice', { confirmIntervalMs: 2000, failedObservationAgeMs: () => observationAgeMs });
+  const w = await world('cln-failed-twice', { implementation: 'cln', confirmIntervalMs: 2000, failedObservationAgeMs: () => observationAgeMs });
   // Control the existing age-read port; native database work cannot establish an observation inside the interval.
-  exec(w.path, "UPDATE nodes SET implementation = 'cln'");
   const e = w.seed('UNKNOWN', { payer: [failed('SENDPAY_FAILED')], invoice: 'OPEN' });
   await w.run();
   // SPEC §5.4: listsendpays can swing between failed and pending or lag; a single read decides nothing.
@@ -419,8 +418,7 @@ it('CP-032/B2 a reconciled fee exactly at the approved cap is within it: a fee-m
 });
 
 it('CP-032/B2 on a CLN node an observation between two failed ones resets the rule: failed, in flight, failed decides nothing', async () => {
-  const w = await world('cln-reset', { confirmIntervalMs: 200 });
-  exec(w.path, "UPDATE nodes SET implementation = 'cln'");
+  const w = await world('cln-reset', { implementation: 'cln', confirmIntervalMs: 200 });
   const e = w.seed('UNKNOWN', { payer: [failed('PAY_TRY_OTHER_ROUTE'), { kind: 'IN_FLIGHT' }, failed('PAY_TRY_OTHER_ROUTE')], invoice: 'OPEN' });
   await w.run();
   await sleep(250);

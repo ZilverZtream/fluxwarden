@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { qualifyReference, qualifyNativeReference } from './owned-reference.mjs';
+import { assertCurrentBinding, assertChaosPlan } from '../live-profile.mjs';
 
 export const requiredLiveRows = ['T-01','T-03','T-05','T-06','T-07','T-16','T-18','T-25'];
 export const allFakeRows = Array.from({ length: 25 }, (_, i) => `T-${String(i + 1).padStart(2, '0')}`);
@@ -13,9 +15,10 @@ export function input() {
   if (!process.env.FLUXWARDEN_CHAOS_REFERENCE_PLAN) throw new Error('LabInvalidError: explicit owned reference plan required');
   const p = JSON.parse(readFileSync(process.env.FLUXWARDEN_CHAOS_REFERENCE_PLAN, 'utf8'));
   const owner = JSON.parse(readFileSync(p.owner, 'utf8'));
-  if (owner.project !== 'fluxwarden-lab-demo-fixed-20261013' || owner.ports.lndRest !== 29210 || owner.ports.clnRest !== 29211 || owner.ports.toxiproxy !== 29212)
-    throw new Error('LabInvalidError: authorized owner mismatch');
-  return { ...p, ownerPath:p.owner, owner, manifest: JSON.parse(readFileSync(join(owner.runtimeRoot, 'lab.json'), 'utf8')) };
+  const manifest = JSON.parse(readFileSync(join(owner.runtimeRoot, 'lab.json'), 'utf8'));
+  qualifyReference(owner, manifest);
+  assertCurrentBinding(p.binding, p.owner, p.binding?.sourceCommit);
+  return { ...p, ownerPath:p.owner, owner, manifest };
 }
 function hash(bytes) { return createHash('sha256').update(bytes).digest('hex'); }
 export function register(path, name) {
@@ -53,7 +56,15 @@ export function oracle(node, method, parameters = []) {
   const p = input();
   return safe(command('docker', ['exec', `${p.owner.project}-${node}-1`, ...(node.startsWith('lnd-') ? ['lncli', '--network=regtest'] : ['lightning-cli','--network=regtest','-k']), method, ...parameters]));
 }
-export async function proxies() { const p = input(); return await (await fetch(`http://127.0.0.1:${p.owner.ports.toxiproxy}/proxies`)).json(); }
+export async function proxies() {
+  const p = input(), response = await fetch(`http://127.0.0.1:${p.owner.ports.toxiproxy}/proxies`);
+  if (!response.ok) throw new Error('LabInvalidError: owned proxy discovery failed');
+  const observed = await response.json();
+  if (JSON.stringify(Object.keys(observed).sort()) !== JSON.stringify(['cln-m-rest','lnd-r-rest']) ||
+      observed['lnd-r-rest'].upstream !== 'lnd-r:8080' || observed['cln-m-rest'].upstream !== 'cln-m:3010')
+    throw new Error('LabInvalidError: foreign proxy binding');
+  return observed;
+}
 export async function clean() {
   const p = input(), base = `http://127.0.0.1:${p.owner.ports.toxiproxy}/proxies`;
   const failures=[];let observed={};
@@ -94,7 +105,11 @@ export function clnConfig(caseId,reverse=false) {
   retain(`${caseId}-fixture`,{database,policy,originalChannels:channels,policyFileSha256:hash(readFileSync(policy))});return{config,policy,database};
 }
 export async function preflight(name) {
-  const p = input(), ids = command('docker', ['inspect', ...['bitcoind','lnd-p','lnd-r','cln-p','cln-r','cln-m','toxiproxy'].map(n => `${p.owner.project}-${n}-1`)]);
+  const p = input(); assertChaosPlan(p);
+  const ids = command('docker', ['inspect', ...['bitcoind','lnd-p','lnd-r','cln-p','cln-r','cln-m','toxiproxy'].map(n => `${p.owner.project}-${n}-1`)]);
+  qualifyNativeReference(p.owner, p.manifest, ids);
+  const chain = command('docker', ['exec', `${p.owner.project}-bitcoind-1`, 'bitcoin-cli', '-regtest', 'getblockchaininfo']);
+  if (chain.chain !== 'regtest') throw new Error('LabInvalidError: pinned chain network mismatch');
   const nodes = ['lnd-p','lnd-r','cln-p','cln-r','cln-m'].map(node => {
     const info = oracle(node,'getinfo'), expected = p.manifest.nodes[node], lnd = node.startsWith('lnd-');
     const network = lnd ? info.chains[0].network : info.network;
@@ -154,8 +169,8 @@ export function lndConfig(reverse=false) {
   // REST ListChannels channel keys are decimal scids; lncli adds scid_str as a display field.
   writeFileSync(policy,readFileSync(p.policy,'utf8').split('"targets":')[0]+`"targets":\n  "lnd-r":\n    "${source.scid}":\n      "min_inbound_msat": "${inbound}"\n    "${target.scid}":\n      "min_inbound_msat": "0"\n`);
   const head = readFileSync(p.config,'utf8').split('nodes:')[0].replace('database: ./state/fluxwarden.db',`database: "${database.replaceAll('\\','/')}"`).replace('policy: ./policy.yaml',`policy: "${policy.replaceAll('\\','/')}"`);
-  writeFileSync(config,head+`nodes:\n  - name: lnd-r\n    implementation: lnd\n    url: https://localhost:29210\n    tls_cert_path: "${p.manifest.nodes['lnd-r'].certificate.path.replaceAll('\\','/')}"\n    macaroon_path: "${p.manifest.credentials['lnd-r'].execute.path.replaceAll('\\','/')}"\n    expected_pubkey: "${p.manifest.nodes['lnd-r'].pubkey}"\n    expected_network: regtest\n`);
-  retain('lnd-owned-policy-source',{ originalPolicySha256:'baaae43179d69c79ee0fe9a16410463ec403eed1aa78f4d740481c6b25184287', fileSha256:hash(readFileSync(policy)), sourceChannel:source.scid_str,targetChannel:target.scid_str,principalMsat:principal.toString(), originalChannels:info.channels });
+  writeFileSync(config,head+`nodes:\n  - name: lnd-r\n    implementation: lnd\n    url: https://localhost:${p.owner.ports.lndRest}\n    tls_cert_path: "${p.manifest.nodes['lnd-r'].certificate.path.replaceAll('\\','/')}"\n    macaroon_path: "${p.manifest.credentials['lnd-r'].execute.path.replaceAll('\\','/')}"\n    expected_pubkey: "${p.manifest.nodes['lnd-r'].pubkey}"\n    expected_network: regtest\n`);
+  retain('lnd-owned-policy-source',{ originalPolicySha256:p.policySha256, fileSha256:hash(readFileSync(policy)), sourceChannel:source.scid_str,targetChannel:target.scid_str,principalMsat:principal.toString(), originalChannels:info.channels });
   return {config,policy,database};
 }
 export function feeConfig() {

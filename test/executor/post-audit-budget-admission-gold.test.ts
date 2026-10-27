@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { PAYMENT_SECRET, ScriptedExecutionNode } from '../fakes/execution-node.js';
 import { circularRoute, fakeChannel, FakePreflightNode } from '../fakes/preflight-node.js';
-import { APPROVAL_KEYS, loadPreflight, PRINCIPAL, reservationsOf, seedOtherNode, seedProposal } from '../helpers/cp028-executor.js';
+import { APPROVAL_KEYS, dbNow, loadPreflight, PRINCIPAL, reservationsOf, seedOtherNode, seedProposal } from '../helpers/cp028-executor.js';
 import { prepare, PREIMAGE, ROUTE_FEE, S_BEFORE, T_BEFORE, TOLERANCE } from '../helpers/cp030-dispatch.js';
 import { labelOf, loadDispatch, reservationState, rowOf, sha256, transitionsOf } from '../helpers/cp030-execution.js';
 import { loadLedger, type LedgerDatabase } from '../helpers/cp037-ledger.js';
@@ -50,10 +50,15 @@ it('POST-AUDIT/AUDIT-04+GLOBAL-BUDGET a held operation rechecks corrected fees a
   const route = { ...circularRoute(b.sourceKey, b.targetKey, ROUTE_FEE, 80), outPeer, inPeer };
   const nodeOut = [outPeer, inPeer, ownPubkey];
   const routeB = { ...route, hops: route.hops.map((hop, index) => ({ ...hop, nodeOut: nodeOut[index] ?? ownPubkey })) };
-  const channels = (sourceMsat: bigint, targetMsat: bigint) => [
-    fakeChannel(b.sourceKey, outPeer, { nodeId: String(config['name']), localBalanceMsat: sourceMsat }),
-    fakeChannel(b.targetKey, inPeer, { nodeId: String(config['name']), localBalanceMsat: targetMsat }),
-  ];
+  const channels = (sourceMsat: bigint, targetMsat: bigint) => {
+    // Same clock as the production controller's listChannels stamping and the
+    // executor's freshness boundary. This fixture varies fees, not clock skew.
+    const observedAt = dbNow(a.path);
+    return [
+      fakeChannel(b.sourceKey, outPeer, { nodeId: String(config['name']), localBalanceMsat: sourceMsat, observedAt }),
+      fakeChannel(b.targetKey, inPeer, { nodeId: String(config['name']), localBalanceMsat: targetMsat, observedAt }),
+    ];
+  };
   const approval = seedProposal(b);
   const preflight = new FakePreflightNode(b.sourceKey, b.targetKey, {
     pubkey: ownPubkey, version: '26.06.9', channels: () => channels(S_BEFORE, T_BEFORE), route: () => routeB,

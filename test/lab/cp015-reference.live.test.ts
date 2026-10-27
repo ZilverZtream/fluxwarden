@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { loadCore } from '../helpers/cp004-reference.js';
 import { loadPersistence, scratch, type SnapshotInput } from '../helpers/cp015-persistence.js';
+import { currentPlannerCapture } from '../helpers/live-profile.js';
 
 interface Ctx { nodeId: string; observedAt: number; blockHeight: number }
 interface Normalize {
@@ -16,8 +17,7 @@ interface Normalize {
 }
 
 function capture(name: string): Record<string, unknown> {
-  const dir = process.env['FLUXWARDEN_LAB_CAPTURE_DIR'];
-  if (!dir) throw new Error('lab capture directory is required');
+  const dir = currentPlannerCapture();
   return JSON.parse(readFileSync(join(dir, name), 'utf8')) as Record<string, unknown>;
 }
 

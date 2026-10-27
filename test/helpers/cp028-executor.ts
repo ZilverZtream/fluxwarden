@@ -128,7 +128,7 @@ src/executor/preflight.ts:
 */
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { constants, copyFileSync, mkdtempSync } from 'node:fs';
+import { chmodSync, constants, copyFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -365,11 +365,17 @@ export function cloneEmptyDatabaseFixture(emptyDatabase: string, path: string): 
       [path, '/inheritance:d'], { encoding: 'utf8', windowsHide: true, shell: false });
     if (run.error !== undefined) throw run.error;
     if (run.status !== 0) throw new Error(`protecting empty database fixture failed: ${run.stderr}`);
-  }
+  } else chmodSync(path, 0o600);
+}
+
+/** An identity is selected before the fixture has any node or execution history. */
+export interface SeedNodeIdentity {
+  readonly name?: string;
+  readonly implementation?: 'lnd' | 'cln';
 }
 
 /** A migrated database with one node, two channels (S, T) and one policy version. */
-export function seedBase(p: ExecPersistence, path: string, emptyDatabase?: string): Base {
+export function seedBase(p: ExecPersistence, path: string, emptyDatabase?: string, node: SeedNodeIdentity = {}): Base {
   if (emptyDatabase === undefined) p.openDatabase(path, { readOnly: false }).close();
   else cloneEmptyDatabaseFixture(emptyDatabase, path);
   const base: Base = {
@@ -377,8 +383,8 @@ export function seedBase(p: ExecPersistence, path: string, emptyDatabase?: strin
     sourceChannelId: ulid(), targetChannelId: ulid(), sourceKey: '123145302376448', targetKey: '246290604752896',
   };
   withRaw(path, db => {
-    db.prepare(`INSERT INTO nodes (id, name, implementation, expected_network, expected_pubkey, state) VALUES (?, 'lnd-r', 'lnd', 'regtest', ?, 'ONLINE')`)
-      .run(base.nodeId, NODE_PUBKEY);
+    db.prepare(`INSERT INTO nodes (id, name, implementation, expected_network, expected_pubkey, state) VALUES (?, ?, ?, 'regtest', ?, 'ONLINE')`)
+      .run(base.nodeId, node.name ?? 'lnd-r', node.implementation ?? 'lnd', NODE_PUBKEY);
     const channel = db.prepare(`INSERT INTO channels (id, node_id, channel_key, scid, peer_pubkey, funding_outpoint, capacity_msat, lifecycle_state, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 1000000000, 'ACTIVE', 0)`);
     channel.run(base.sourceChannelId, base.nodeId, base.sourceKey, '112x1x0', OUT_PEER, `${'c3'.repeat(32)}:0`);

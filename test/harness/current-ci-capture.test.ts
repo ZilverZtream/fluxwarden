@@ -16,6 +16,7 @@ import { parseYaml } from '../helpers/yaml.js';
 import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { registerSentinels, sentinels } from '../helpers/output.js';
 import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { proveDispatcherExit, provePlatformPlans } from '../helpers/oct26-ci-oracles.js';
 
 const captureCli = join(repoRoot, 'scripts/ci-capture.mjs');
 const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex');
@@ -497,28 +498,76 @@ it('CP-044/CI-CAPTURE live positive control retains its originally registered so
   expect(retained.every(path => readFileSync(path).length > 0), 'retained positive-control sources are readable and nonempty').toBe(true);
 });
 
-it('CP-044/CI-CAPTURE every current hosted job captures commands before a final always-run verification and safe upload', () => {
+// Owner-routed D29 interface correction, frozen 593a6be: platform suites now
+// enter through ci-platform.mjs. The dispatcher must prove the same public
+// captured command plan and failure propagation; its filename alone is no proof.
+function hostedCapture(name: string, steps: Record<string, unknown>[]): boolean {
+  const npmCommand = /\bnpm (?:test\b|run test:(?:harness|lab|chaos)\b)/;
+  const dispatcher = /\bnode scripts\/ci-platform\.mjs\b/;
+  const commandSteps = steps.filter(step => typeof step['run'] === 'string' && (npmCommand.test(step['run']) || dispatcher.test(step['run'])));
+  expect(commandSteps.length, `${name}: current real test commands remain selected`).toBeGreaterThan(0);
+  let dispatches = false;
+  for (const step of commandSteps) {
+    const command = String(step['run']);
+    if (dispatcher.test(command)) {
+      expect(name, 'only the approved platform job delegates its capture boundary').toBe('test');
+      const flags = [...command.matchAll(/--(os|node|shard)\s+["']?\$\{\{\s*matrix\.\1\s*\}\}["']?/g)];
+      expect(flags.map(match => match[1]).sort()).toEqual(['node', 'os', 'shard']);
+      expect(command.replace(/--(os|node|shard)\s+["']?\$\{\{\s*matrix\.\1\s*\}\}["']?/g, '').trim(), 'dispatcher invocation contains no uncaptured trailing command').toBe('node scripts/ci-platform.mjs');
+      expect(npmCommand.test(command), 'real suite execution belongs inside the dispatcher capture').toBe(false);
+      dispatches = true;
+    } else {
+      const capture = command.search(/scripts\/ci-capture\.mjs\b/);
+      expect(capture, `${name}: each real command enters the finite capture boundary`).toBeGreaterThanOrEqual(0);
+      expect(capture, `${name}: capture opens before test execution`).toBeLessThan(command.search(npmCommand));
+    }
+  }
+  const lastCommand = Math.max(...commandSteps.map(step => steps.indexOf(step)));
+  const verification = steps.findIndex((step, index) => index > lastCommand && typeof step['run'] === 'string' && /ci-capture\.mjs\s+verify\b/.test(step['run']));
+  expect(verification, `${name}: final invocation census verification follows generated outputs`).toBeGreaterThan(lastCommand);
+  expect(String(steps[verification]?.['if']), `${name}: failures still receive final verification`).toMatch(/always\(\)/);
+  const uploads = steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
+  expect(uploads.length, `${name}: safe receipt is retained`).toBeGreaterThan(0);
+  for (const step of uploads) {
+    expect(steps.indexOf(step), 'safe upload follows final verification').toBeGreaterThan(verification);
+    const options = asRecord(step['with'], 'upload options');
+    expect(options['if-no-files-found']).toBe('error');
+    expect(String(options['path']), 'raw source roots are never upload paths').not.toMatch(/SENTINEL|sentinel|sources|inputs/i);
+    expect(String(step['if']), 'upload is conditional on successful final verification').toMatch(/success/);
+  }
+  return dispatches;
+}
+
+it('CP-044/CI-CAPTURE every current hosted job captures commands before a final always-run verification and safe upload', async () => {
   const jobs = asRecord(asRecord(parseYaml(readText('.github/workflows/ci.yml')), 'workflow')['jobs'], 'jobs');
+  let dispatches = false;
   for (const name of ['test', 'lab', 'chaos']) {
     const stepsValue = asRecord(jobs[name], name)['steps'];
     const steps = records(stepsValue, `${name} steps`);
-    const commandSteps = steps.filter(step => typeof step['run'] === 'string' && /\bnpm (?:test\b|run test:(?:harness|lab|chaos)\b)/.test(step['run']));
-    expect(commandSteps.length, 'current real test commands remain selected').toBeGreaterThan(0);
-    for (const step of commandSteps) expect(String(step['run']), `${name}: each real command enters the finite capture boundary`).toMatch(/scripts\/ci-capture\.mjs\b/);
-    const lastCommand = Math.max(...commandSteps.map(step => steps.indexOf(step)));
-    const verification = steps.findIndex((step, index) => index > lastCommand && typeof step['run'] === 'string' && /ci-capture\.mjs\s+verify\b/.test(step['run']));
-    expect(verification, `${name}: final invocation census verification follows generated outputs`).toBeGreaterThan(lastCommand);
-    expect(String(steps[verification]?.['if']), `${name}: failures still receive final verification`).toMatch(/always\(\)/);
-    const uploads = steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
-    expect(uploads.length, `${name}: safe receipt is retained`).toBeGreaterThan(0);
-    for (const step of uploads) {
-      expect(steps.indexOf(step), 'safe upload follows final verification').toBeGreaterThan(verification);
-      const options = asRecord(step['with'], 'upload options');
-      expect(options['if-no-files-found']).toBe('error');
-      expect(String(options['path']), 'raw source roots are never upload paths').not.toMatch(/SENTINEL|sentinel|sources|inputs/i);
-      expect(String(step['if']), 'upload is conditional on successful final verification').toMatch(/success/);
-    }
+    if (hostedCapture(name, steps)) dispatches = true;
   }
+  if (dispatches) {
+    await provePlatformPlans();
+    await proveDispatcherExit();
+  }
+});
+
+it('CP-044/CI-CAPTURE dispatcher selection still refuses unwrapped suites late capture missing final verification and unsafe uploads', () => {
+  const run = { run: 'node scripts/ci-platform.mjs --os "${{ matrix.os }}" --node "${{ matrix.node }}" --shard "${{ matrix.shard }}"' };
+  const verify = { run: 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"', if: 'always()' };
+  const upload = { uses: `actions/upload-artifact@${'a'.repeat(40)}`, if: "always() && steps.capture-verify.outcome == 'success'",
+    with: { path: '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json', 'if-no-files-found': 'error' } };
+  expect(hostedCapture('test', [run, verify, upload])).toBe(true);
+  for (const steps of [
+    [{ run: 'npm test' }, verify, upload],
+    [{ run: 'npm test\nnode scripts/ci-capture.mjs --root "$PWD"' }, verify, upload],
+    [{ run: `${run.run}\nnpm test` }, verify, upload],
+    [{ run: `${run.run}; node unrelated.mjs` }, verify, upload],
+    [run, upload], [run, { ...verify, if: 'success()' }, upload],
+    [run, upload, verify], [run, verify, { ...upload, if: 'always()' }],
+    [run, verify, { ...upload, with: { ...upload.with, path: '${{ env.FLUXWARDEN_SENTINEL_DIR }}' } }],
+  ]) expect(() => hostedCapture('test', steps)).toThrow();
+  expect(() => hostedCapture('lab', [run, verify, upload]), 'live jobs cannot use the platform delegation exception').toThrow();
 });
 
 it('CP-044/CI-CAPTURE clean unlisted capture-root files have complete content identity and reject tampering', () => {

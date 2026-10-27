@@ -3,12 +3,13 @@
 // is never opened or changed, and a symbolic link or junction among the parent directories is refused.
 //
 // POSIX: the file is created exclusively with mode 0600, then its mode and owner are set and read
-// back on the open descriptor. Windows: the file is created inside a new directory that is first
-// restricted to the current user, so it is never accessible to anyone else; its own DACL is then
-// made protected and owner-only, and it is linked to the target path, which fails if that exists.
-import { closeSync, constants, fsyncSync, linkSync, lstatSync, mkdtempSync, openSync, rmdirSync, unlinkSync, writeSync } from 'node:fs';
+// back on the open descriptor. Windows: the staging directory and file are created with protected
+// owner-only native DACLs and verified before writing. The completed file is linked to the target
+// path, which fails if that exists.
+import { randomBytes } from 'node:crypto';
+import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, rmdirSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join, parse, resolve } from 'node:path';
-import { restrictToOwner, type OwnerOnlyTarget } from '../platform/owner-only.js';
+import { createOwnerOnlyDirectory, createOwnerOnlyEmptyFile, restrictToOwner, type OwnerOnlyTarget } from '../platform/owner-only.js';
 
 export type OwnerOnlyWrite = 'written' | 'exists' | 'failed' | 'invalid-path';
 
@@ -98,17 +99,27 @@ function createPrivate(path: string, bytes: Uint8Array, flags: number, scratch?:
 
 function writeWindows(path: string, bytes: Uint8Array): OwnerOnlyWrite {
   if (lstatSync(path, { throwIfNoEntry: false }) !== undefined) return 'exists';
-  let dir: string;
+  const dir = join(dirname(path), `.fluxwarden-${randomBytes(16).toString('hex')}`);
   try {
-    dir = mkdtempSync(join(dirname(path), '.fluxwarden-'));
+    // Reuse the persistence native CreateNew/DACL readback (microsoft/referencesource
+    // mscorlib/system/io/{directory,filestream}.cs), rather than restrict an inherited object.
+    if (!createOwnerOnlyDirectory(dir)) return 'failed';
   } catch {
     return 'failed';
   }
   const staged = join(dir, 'file');
-  const scratch = [join(dir, 'directory.acl'), join(dir, 'file.acl')] as const;
+  let created = false;
   try {
-    restrictToOwner(dir, 'directory', { scratch: scratch[0] });
-    if (!createPrivate(staged, bytes, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, scratch[1])) return 'failed';
+    if (!createOwnerOnlyEmptyFile(staged)) return 'failed';
+    created = true;
+    const before = lstatSync(staged);
+    const fd = openSync(staged, constants.O_WRONLY | constants.O_NOFOLLOW);
+    try {
+      const held = fstatSync(fd);
+      if (!held.isFile() || held.nlink !== 1 || held.size !== 0 || before.isSymbolicLink()
+        || before.dev !== held.dev || before.ino !== held.ino) return 'failed';
+      writeAll(fd, bytes);
+    } finally { closeSync(fd); }
     try {
       linkSync(staged, path);
     } catch (error) {
@@ -118,7 +129,7 @@ function writeWindows(path: string, bytes: Uint8Array): OwnerOnlyWrite {
   } catch {
     return 'failed';
   } finally {
-    for (const file of [staged, ...scratch]) quietly(() => { unlinkSync(file); });
+    if (created) quietly(() => { unlinkSync(staged); });
     quietly(() => { rmdirSync(dir); });
   }
 }

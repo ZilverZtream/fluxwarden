@@ -1,0 +1,4 @@
+{
+  "status": "GAP",
+  "reason": "SPEC P3 reserve protection precedes V8 on the same native spendable snapshot; this live refusal does not prove FIRST_HOP_SPENDABLE."
+}

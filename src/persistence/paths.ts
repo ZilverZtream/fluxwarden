@@ -2,10 +2,56 @@ import { randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, realpathSync, rmdirSync, statSync, unlinkSync, type Stats } from 'node:fs';
 import { dirname, parse, resolve } from 'node:path';
 import { PersistenceError } from './errors.js';
-import { createOwnerOnlyFile, onlyOwnerAccessMany, pathAccessMany, present, restrictCreated } from './owner-files.js';
-import { createOwnerOnlyDirectory } from '../platform/owner-only.js';
+import { createOwnerOnlyFile, onlyOwnerAccessMany, pathAccessMany, pathGroupsAccessMany, present, restrictCreated } from './owner-files.js';
+import { createOwnerOnlyDirectory, createOwnerOnlyDirectories } from '../platform/owner-only.js';
 
 const posix = process.platform !== 'win32';
+
+/** Validates a private directory and its trusted ancestry without changing it. */
+export function checkPrivateDirectory(path: string): string {
+  const absolute = resolve(path);
+  if (checkAncestry(absolute).length !== 0) throw unsafe('state: a private directory is missing');
+  return absolute;
+}
+
+/** Exclusive private directory creation; existing directories and links are never adopted. */
+export function createPrivateDirectoryExclusive(path: string): string {
+  const absolute = resolve(path);
+  checkPrivateDirectory(dirname(absolute));
+  if (posix) mkdirSync(absolute, { mode: 0o700 });
+  else if (!createOwnerOnlyDirectory(absolute)) throw unsafe('state: the destination already exists');
+  return absolute;
+}
+
+/** New sibling directories only; no existing destination or its permissions are adopted. */
+export function createPrivateDirectoriesExclusive(paths: readonly string[]): void {
+  const absolute = paths.map(path => resolve(path));
+  checkPrivateFiles([], [...new Set(absolute.map(path => dirname(path)))]);
+  for (const path of absolute) if (lstatOrUndefined(path) !== undefined) throw unsafe('state: the destination already exists');
+  if (posix) for (const path of absolute) mkdirSync(path, { mode: 0o700 });
+  else if (createOwnerOnlyDirectories(absolute).some(created => !created)) throw unsafe('state: the destination already exists');
+}
+
+/** One permission read for a batch; each file and every distinct private ancestry is still admitted. */
+export function checkPrivateFiles(paths: readonly string[], directories: readonly string[] = []): void {
+  const parents = [...new Set([...paths.map(path => dirname(resolve(path))), ...directories.map(path => resolve(path))])];
+  if (posix) {
+    for (const parent of parents) checkPrivateDirectory(parent);
+    for (const path of paths) checkSingleFile(lstatSync(path), path);
+    return;
+  }
+  settled(() => {
+    const groups = parents.map(stateDir => {
+      const { chain, missingFrom } = inspectAncestry(stateDir);
+      if (missingFrom !== chain.length) throw unsafe('state: a private directory is missing');
+      return { ancestors: chain.map(entry => entry.path), creationParent: undefined, stateDir };
+    });
+    for (const path of paths) checkSingleFile(lstatSync(path), path);
+    for (const access of pathGroupsAccessMany(groups, paths)) {
+      if (access.ancestors.some(allowed => !allowed) || access.objects.some(allowed => !allowed)) throw unsafe('state: a retained path has unsafe access');
+    }
+  });
+}
 
 function lstatOrUndefined(path: string): Stats | undefined {
   try {
@@ -38,6 +84,25 @@ function ancestry(dir: string): { path: string; stat: Stats | undefined }[] {
  * Returns the directories that do not exist yet, outermost first (empty when `dir` exists).
  */
 function checkAncestry(dir: string, objects: readonly string[] = []): string[] {
+  const { chain, missingFrom } = inspectAncestry(dir);
+  if (!posix) {
+    const existing = chain.slice(0, missingFrom).map(entry => entry.path);
+    const creationParent = missingFrom < chain.length ? existing.at(-1) : undefined;
+    settled(() => {
+      const access = pathAccessMany(existing, creationParent, dir, objects);
+      for (const [index, path] of existing.entries()) {
+        if (access.ancestors[index] !== true) throw unsafe(`${path} has an untrusted owner or allows other users to change the path`);
+      }
+      for (const [index, path] of objects.entries()) {
+        if (access.objects[index] !== true && (index === 0 || present(path))) throw unsafe(`${path} has an unsafe owner or access list`);
+      }
+    });
+  }
+  return chain.slice(missingFrom).map(entry => entry.path);
+}
+
+/** Inspect every component afresh before combining Windows ACL reads for one operation. */
+function inspectAncestry(dir: string): { chain: { path: string; stat: Stats | undefined }[]; missingFrom: number } {
   const chain = ancestry(dir);
   let missingFrom = chain.length;
   chain.forEach(({ path, stat }, index) => {
@@ -61,20 +126,7 @@ function checkAncestry(dir: string, objects: readonly string[] = []): string[] {
       if (stateDir) ownerOnly(directory, path, 0o077);
     }
   });
-  if (!posix) {
-    const existing = chain.slice(0, missingFrom).map(entry => entry.path);
-    const creationParent = missingFrom < chain.length ? existing.at(-1) : undefined;
-    settled(() => {
-      const access = pathAccessMany(existing, creationParent, dir, objects);
-      for (const [index, path] of existing.entries()) {
-        if (access.ancestors[index] !== true) throw unsafe(`${path} has an untrusted owner or allows other users to change the path`);
-      }
-      for (const [index, path] of objects.entries()) {
-        if (access.objects[index] !== true && (index === 0 || present(path))) throw unsafe(`${path} has an unsafe owner or access list`);
-      }
-    });
-  }
-  return chain.slice(missingFrom).map(entry => entry.path);
+  return { chain, missingFrom };
 }
 
 function trustedPosixAncestor(stat: Stats, path: string): void {

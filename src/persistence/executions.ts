@@ -2,6 +2,8 @@ import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
 import { reportedFeeBreach, transitionAllowed, type ExecutionPolicy, type ExecutionStatus } from '../core/execution.js';
 import { committedMsat, inFlightCount, lastTerminal, type TerminalTimes } from './budget.js';
 import { PersistenceError } from './errors.js';
+import { assertExecutionIdentity, assertNodeIdentity } from './node-identity.js';
+import { assertStateAdmitted } from './restore-barrier.js';
 import { bigintColumn, checkedMsat, DB_NOW, dbNow, immediate, newUlid, numberColumn, textColumn } from './sql.js';
 import { ledgerTransaction } from './ledger.js';
 import { post, postAccountTransfer, postTransition } from '../ledger/post.js';
@@ -158,6 +160,8 @@ export interface ExecutionsRepository {
   recordPaidIntent(executionId: string, fenceEpoch: bigint, paymentHash: string, fields?: TransitionFields): bigint;
   /** Fenced lease renewal; an expired CLAIMED/PREFLIGHT lease cannot be revived. Returns the new epoch. */
   renewLease(executionId: string, fenceEpoch: bigint, leaseMs: number): bigint;
+  /** Ends a completed recovery operation's ownership without changing payment status or its reservation. */
+  releaseRecovery(executionId: string, fenceEpoch: bigint, workerId: string): bigint;
   /** Runs `work` inside one BEGIN IMMEDIATE transaction. */
   claim<T>(work: (scope: ClaimScope) => T): T;
   plan(executionId: string): ExecutionPlan | null;
@@ -302,6 +306,8 @@ function holdsAt(db: DatabaseSync, executionId: string, fenceEpoch: bigint, stat
 
 /** The single fenced status write with its event and reservation change; the caller holds the transaction. */
 function fencedTransition(db: DatabaseSync, executionId: string, fenceEpoch: bigint, from: ExecutionStatus, to: ExecutionStatus, fields: TransitionFields, admission: 'dispatch' | 'paid-observation' = 'dispatch'): bigint {
+  if (to === 'SUBMITTING') assertStateAdmitted(db);
+  assertExecutionIdentity(db, executionId);
   const planned = fields.plannedFeeMsat === undefined ? null : checkedMsat(fields.plannedFeeMsat, 'plannedFeeMsat');
   const actual = fields.actualFeeMsat === undefined ? null : checkedMsat(fields.actualFeeMsat, 'actualFeeMsat');
   const lease = fields.leaseMs === undefined ? null : checkedLease(fields.leaseMs);
@@ -406,6 +412,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
 
       authority(approvalId, proposalId) {
         guard();
+        assertStateAdmitted(db);
         // MySQL: same
         const row = db.prepare(`SELECT a.id AS approval_id, a.key_id, a.nonce, a.expires_at AS approval_expires_at, a.max_fee_msat AS approved_max_fee_msat,
             a.max_cltv_delta AS approved_max_cltv_delta, p.status AS proposal_status, p.proposal_digest, p.expires_at AS proposal_expires_at,
@@ -416,6 +423,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
           JOIN policy_versions v ON v.id = p.policy_version_id
           WHERE a.id = ? AND a.proposal_id = ?`).get(approvalId, proposalId);
         if (row === undefined) return null;
+        assertNodeIdentity(db, textColumn(row, 'node_id'));
         return {
           approvalId: textColumn(row, 'approval_id'),
           keyId: textColumn(row, 'key_id'),
@@ -508,6 +516,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 0) throw new PersistenceError('OUT_OF_RANGE', 'maxInFlight is not a non-negative integer');
       checkedLease(leaseMs);
       return immediate(db, () => {
+        assertExecutionIdentity(db, executionId);
         if (!holdsAt(db, executionId, fenceEpoch, 'PREFLIGHT')) throw leaseLost(executionId);
         // MySQL: same joins and predicate, with NOW(6) for the stored expiry comparison.
         const expired = db.prepare(`SELECT 1 FROM executions e JOIN approvals a ON a.id = e.approval_id
@@ -626,6 +635,17 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       return fenceEpoch + 1n;
     },
 
+    releaseRecovery(executionId, fenceEpoch, workerId) {
+      writable('executions.releaseRecovery');
+      // Reuse FluxWarden src/persistence/executions.ts renewLease's conditional epoch update.
+      // MySQL: same, with NOW(6) - INTERVAL 1 MICROSECOND for the expired lease.
+      const result = run(() => db.prepare(`UPDATE executions SET lease_expires_at = ${DB_NOW} - 1,
+        fence_epoch = fence_epoch + 1, updated_at = ${DB_NOW}
+        WHERE id = ? AND fence_epoch = ? AND worker_id = ?`).run(executionId, fenceEpoch, workerId));
+      if (Number(result.changes) === 0) throw leaseLost(executionId);
+      return fenceEpoch + 1n;
+    },
+
     claim<T>(work: (claimScope: ClaimScope) => T): T {
       writable('executions.claim');
       const { scope: claimScope, close } = scope();
@@ -638,11 +658,12 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
 
     plan: executionId => run(() => {
       // MySQL: same
-      const row = db.prepare(`SELECT e.id, e.status, e.fence_epoch, n.expected_pubkey, n.implementation, p.source_channel_id, p.target_channel_id,
+      const row = db.prepare(`SELECT e.id, e.status, e.fence_epoch, b.pubkey AS expected_pubkey, b.implementation, p.source_channel_id, p.target_channel_id,
           s.channel_key AS source_channel_key, t.channel_key AS target_channel_key, p.principal_msat
         FROM executions e
         JOIN liquidity_proposals p ON p.id = e.proposal_id
         JOIN nodes n ON n.id = p.node_id
+        JOIN node_identity_bindings b ON b.node_id = n.id AND b.pubkey = n.expected_pubkey AND b.implementation = n.implementation
         JOIN channels s ON s.id = p.source_channel_id
         JOIN channels t ON t.id = p.target_channel_id
         WHERE e.id = ?`).get(executionId);
@@ -662,6 +683,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
     }),
 
     holds: (executionId, fenceEpoch) => run(() => {
+      assertExecutionIdentity(db, executionId);
       // MySQL: same, with NOW(6) for the clock
       return db.prepare(`SELECT 1 AS held FROM executions WHERE id = ? AND fence_epoch = ?
         AND (status NOT IN ('CLAIMED','PREFLIGHT') OR lease_expires_at > ${DB_NOW})`).get(executionId, fenceEpoch) !== undefined;
@@ -692,6 +714,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       writable('executions.takeOver');
       const lease = checkedLease(leaseMs);
       return immediate(db, () => {
+        assertExecutionIdentity(db, executionId);
         // MySQL: same, with NOW(6) and NOW(6) + INTERVAL ? * 1000 MICROSECOND for the clock
         const result = db.prepare(`UPDATE executions
           SET worker_id = ?, lease_expires_at = ${DB_NOW} + ?, fence_epoch = fence_epoch + 1, updated_at = ${DB_NOW}
@@ -803,6 +826,7 @@ export function executionsRepository(db: DatabaseSync, writable: (what: string) 
       writable('executions.takeUnresolved');
       const lease = checkedLease(leaseMs);
       return immediate(db, () => {
+        assertExecutionIdentity(db, executionId);
         // MySQL: JSON_UNQUOTE(JSON_EXTRACT(event.evidence_json, '$.reclaimedBy')) for the recorded recovery owner.
         const recovering = db.prepare(`SELECT 1 FROM executions e WHERE e.id = ? AND e.fence_epoch = ?
           AND e.worker_id <> ? AND e.lease_expires_at >= ${DB_NOW} AND EXISTS (

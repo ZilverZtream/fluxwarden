@@ -26,8 +26,9 @@ import { configStage, databaseStage, StageFailure } from './stages.js';
 export async function recoveryWorkflow(command: Command, io: Io, env: Environment, alerts?: AlertWriter): Promise<number> {
   let db: Database | undefined;
   try {
-    if (command.kind !== 'reconcile' && command.kind !== 'evidence export') throw new StageFailure(2, null, 'unknown recovery command');
-    const window = command.kind === 'reconcile' ? parseReconcileWindow({ ...(command.since === null ? {} : { since: command.since }), ...(command.until === null ? {} : { until: command.until }) }, Date.now()) : null;
+    if (command.kind !== 'reconcile' && command.kind !== 'nodes recover' && command.kind !== 'evidence export') throw new StageFailure(2, null, 'unknown recovery command');
+    const window = command.kind === 'reconcile' ? parseReconcileWindow({ ...(command.since === null ? {} : { since: command.since }), ...(command.until === null ? {} : { until: command.until }) }, Date.now())
+      : command.kind === 'nodes recover' ? parseReconcileWindow({}, Date.now()) : null;
     if (window !== null && !window.ok) throw new StageFailure(2, 'arguments', window.message);
     const config = configStage(command.config);
     db = databaseStage(config.database, command.kind === 'evidence export' ? 'read' : 'existing');
@@ -53,8 +54,13 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
     const sources: AccountingSource[] = [];
     const fingerprints = new Map<string, { readonly credentialFingerprint: string; readonly tlsFingerprint: string }>();
     const topologyBefore: unknown[] = [];
+    const recoveryFences = new Map<string, bigint>();
+    let synchronized = true;
     for (const node of nodes) {
       const session = await handshake(db, node, resolveConnection(node, command.connection, env));
+      synchronized &&= session.result.identity.syncedToChain;
+      if (command.kind === 'nodes recover' && !session.result.identity.syncedToChain) throw new StageFailure(5, 'chain-sync', 'recovery: the original node is not synced');
+      recoveryFences.set(session.rowId, db.nodes.fenceEpoch(session.rowId));
       const payment = await controller(node, config, session, db);
       if (payment.fingerprints !== undefined) fingerprints.set(node.name, payment.fingerprints);
       adapters.set(session.rowId, payment.adapter);
@@ -127,7 +133,11 @@ export async function recoveryWorkflow(command: Command, io: Io, env: Environmen
       ledgerAudit: { journals, balances: Object.fromEntries(db.ledger.balances()), steps: report.steps }, reconciliation: report, chaosResults: [],
     };
     writeRunRecord(config.database, await labEvidence(input, command.config, env, db));
-    const exit = pass.exit === 7 || checked.exitCode === 7 ? 7 : differences.length > 0 || pass.exit === 9 ? 9 : 0;
+    const exit = pass.exit === 5 ? 5 : pass.exit === 7 || checked.exitCode === 7 ? 7 : differences.length > 0 || pass.exit === 9 ? 9 : 0;
+    if (exit === 0) {
+      if (command.kind === 'nodes recover') for (const [id, epoch] of recoveryFences) db.nodes.recover(id, epoch);
+      if (command.kind === 'reconcile' && synchronized && command.node === null && command.since === null && command.until === null) db.state.completeRestore(scope.nodeIds);
+    }
     return emit(io, command.kind, report, exit, exit === 7 ? 'executions remain unresolved; do not retry' : exit === 9 ? 'node accounting differs from the ledger' : null);
   } catch (error) {
     if (error instanceof StageFailure) return refuse(io, command.kind, error.code, error.step, error.message);

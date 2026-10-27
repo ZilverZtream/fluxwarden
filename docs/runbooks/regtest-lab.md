@@ -54,6 +54,34 @@ Windows Node executable.
 only when `FLUXWARDEN_LAB_PLAN` is set; each needs its own declared inputs (for example
 `FLUXWARDEN_LAB_OWNER`, the owner declaration of a running lab) and fails when they are missing.
 
+For the complete owned selection, use a clean built checkout and a private absolute
+`FLUXWARDEN_CI_TMP_PARENT`, with private `TEMP`, `TMP`, `FLUXWARDEN_TEST_TMP`,
+`FLUXWARDEN_SENTINEL_DIR` and `FLUXWARDEN_EVIDENCE_DIR`. Run
+`node scripts/release-live.mjs prepare` and import its JSON environment map into the
+calling shell; GitHub Actions receives the same map through `GITHUB_ENV`. Preparation
+resolves only the trusted public repositories and full commits in
+`labs/fixtures/credential-reference-contract.json`, with bounded read-only Git fetches
+and no upstream execution. To use existing source objects, set
+`FLUXWARDEN_LAB_SOURCE_CHECKOUTS` to an absolute JSON file containing
+`{"macwarden":"<absolute Git root>","lnd":"<absolute Git root>","cln":"<absolute Git root>"}`.
+Their origin URLs, pinned commits and source bytes must match the contract.
+
+The prepared static source manifests and declarations survive every owner teardown.
+Run `node scripts/release-live.mjs measure` first and import its returned environment
+map locally. This completes the separately collected CP010 smoke selection, one real
+build and the actual setup/run/down/leak phases before CP006/R6 reads its reports.
+Then run `npm run test:lab` or `npm run test:chaos`. Each ordinary live file starts and
+cleans its own allocation; the CP006 and CP008 two-owner cohorts begin with the primary
+down. Planner captures and chaos inputs are derived from that file's current startup.
+Finish with `node scripts/release-live.mjs down`, including after failures.
+
+CP043 requires `FLUXWARDEN_FINAL_TARBALL` pointing to the exact candidate package and
+an exact current compiled commit. Its setup runs the existing full demo and retains
+the actual T05 observation, native history, execution verification and byte-exact
+runtime manifest before cleanup. The artifact assertion consumes the retained
+`FLUXWARDEN_DEMO_HANDOFF`. Missing evidence, native boundary conflicts and explicit
+GAP observations fail the selection.
+
 ## Credential references on Windows
 
 The credential references check POSIX file ownership and modes and refuse to run on Windows.

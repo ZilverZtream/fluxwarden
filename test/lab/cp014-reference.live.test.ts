@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
 import { loadCore } from '../helpers/cp004-reference.js';
+import { currentPlannerCapture } from '../helpers/live-profile.js';
 
 interface Ctx { nodeId: string; observedAt: number; blockHeight: number }
 interface Channel {
@@ -21,8 +22,7 @@ interface Channel {
 interface Normalize { normalizeLndChannel(raw: unknown, ctx: Ctx): Channel; normalizeClnChannel(raw: unknown, ctx: Ctx): Channel }
 
 function capture(name: string): unknown {
-  const dir = process.env['FLUXWARDEN_LAB_CAPTURE_DIR'];
-  if (!dir) throw new Error('lab capture directory is required');
+  const dir = currentPlannerCapture();
   return JSON.parse(readFileSync(join(dir, name), 'utf8')) as unknown;
 }
 const record = (value: unknown): Record<string, unknown> => value as Record<string, unknown>;
@@ -58,17 +58,28 @@ it('CP-014/R1 LND-R live channels normalize to bounded DERIVED_ESTIMATE figures'
   }
 });
 
-it('CP-014/R2 LND-R accepts an HTLC of exactly the derived spendable and refuses one msat more', async () => {
+// D29 conservative-spendable reference resolution; pinned LND 390b2d2b:
+// lnwallet/channel.go:3763,9210,9250 and rpcserver.go:5020-5069. The opener
+// margin is conservative; only the measured native maximum has an adjacent refusal.
+it('CP-014/R2 LND-R accepts the conservative derived spendable and proves an adjacent native refusal boundary', async () => {
   const normalize = await loadCore<Normalize>('normalize');
   const height = Number(record(capture('lnd-r/getinfo.json'))['block_height']);
   const channels = record(capture('lnd-r/listchannels.json'))['channels'] as Record<string, unknown>[];
   const probes = capture('lnd-r/spendable-probe.json') as { chan_id: string; accepted_msat: string; refused_msat: string }[];
+  const observations = record(capture('capture-receipt.json'))['observations'] as unknown[];
   expect(probes.length).toBeGreaterThan(0);
   for (const probe of probes) {
     const raw = channels.find(c => c['chan_id'] === probe.chan_id);
     expect(raw, probe.chan_id).toBeDefined();
     const n = normalize.normalizeLndChannel(raw, { nodeId: 'lnd-r', observedAt: Date.now(), blockHeight: height });
-    expect(BigInt(probe.accepted_msat), probe.chan_id).toBe(n.spendableMsat);
-    expect(BigInt(probe.refused_msat), probe.chan_id).toBe(n.spendableMsat + 1n);
+    expect(n.spendableMsat <= BigInt(probe.accepted_msat), `REFERENCE_CONFLICT CP-014/R2 unsafe declaration ${probe.chan_id}`).toBe(true);
+    expect(BigInt(probe.refused_msat), `native adjacent refusal ${probe.chan_id}`).toBe(BigInt(probe.accepted_msat) + 1n);
+    for (const observedAmount of [n.spendableMsat.toString(), probe.accepted_msat]) {
+      expect(observations, `actual declared/boundary acceptance ${probe.chan_id}`).toContainEqual({ chan_id: probe.chan_id, amount_msat: observedAmount, status: 'FAILED', failure: { code: 'INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS', failure_source_index: 1 }, outcome: 'accepted' });
+    }
+    expect(observations.some(value => {
+      const observed = record(value), failure = record(observed['failure']);
+      return observed['chan_id'] === probe.chan_id && observed['amount_msat'] === probe.refused_msat && observed['status'] === 'FAILED' && observed['outcome'] === 'refused' && failure['failure_source_index'] === 0 && typeof failure['code'] === 'string';
+    }), `actual local refusal ${probe.chan_id}`).toBe(true);
   }
 });

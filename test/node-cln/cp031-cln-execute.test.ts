@@ -38,7 +38,7 @@ import { loadClnRest } from '../helpers/adapter-interfaces.js';
 import { syntheticInvoice } from '../helpers/cp004-invoice.js';
 import { declareFixturePaths } from '../helpers/capture-fixture.js';
 import { testRoot } from '../helpers/env.js';
-import type { CircularRoute, RouteRequest } from '../helpers/cp028-executor.js';
+import { dbNow, type CircularRoute, type RouteRequest } from '../helpers/cp028-executor.js';
 import type { HopPolicy } from '../helpers/route-interfaces.js';
 import { prepare } from '../helpers/cp030-dispatch.js';
 import { labelOf, loadClnExecute, reservationState, rowOf, sha256, type ClnExecutionAdapter, type ExecutionAdapter } from '../helpers/cp030-execution.js';
@@ -466,7 +466,15 @@ async function endToEnd(prefix: string, methods: Partial<Record<string, ClnHandl
     route: () => ROUTE,
     // The worked-example route costs 202,101 msat over 132 blocks: approved at the policy caps 300,000 msat / 144 blocks.
     approval: a => ({ ...a, approvedMaxFeeMsat: 300_000n, approvedMaxCltvDelta: 144 }),
-    script: () => ({ before: () => [fakeChannel(CH2, LND_R), fakeChannel(CH5, CLN_R)], after: () => [fakeChannel(CH2, LND_R), fakeChannel(CH5, CLN_R)] }),
+    script: ({ path }) => {
+      // Admitted observations share the database clock used by dispatch.
+      // Explicit stale/future cases elsewhere retain their own timestamps.
+      const balances = () => {
+        const observedAt = dbNow(path);
+        return [fakeChannel(CH2, LND_R, { observedAt }), fakeChannel(CH5, CLN_R, { observedAt })];
+      };
+      return { before: balances, after: balances };
+    },
   });
   const { fake, cln } = await adapter({ invoice: invoiceHandler, ...methods }, { attemptDeadlineMs });
   const outcome = await r.run(composite(r.node, cln));

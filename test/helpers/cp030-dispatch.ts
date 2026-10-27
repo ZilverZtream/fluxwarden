@@ -1,11 +1,11 @@
 // Dispatch scenarios over a seeded PREFLIGHT execution (test/helpers/cp030-execution.ts Interface).
 import { circularRoute, fakeChannel } from '../fakes/preflight-node.js';
 import { ScriptedExecutionNode, type ExecutionScript } from '../fakes/execution-node.js';
-import { IN_PEER, loadPersistence, OUT_PEER, policyFor, PRINCIPAL, scratchDb, seedBase, type Base, type CircularRoute, type ExecDatabase } from './cp028-executor.js';
+import { dbNow, IN_PEER, loadPersistence, OUT_PEER, policyFor, PRINCIPAL, scratchDb, seedBase, type Base, type CircularRoute, type ExecDatabase } from './cp028-executor.js';
 import {
   loadDispatch, loadExecutionCore, seedExecution, sha256, type Alert, type DispatchInput, type DispatchOutcome, type ExecutionAdapter,
 } from './cp030-execution.js';
-import type { VerifiedApproval, ProposalOptions } from './cp028-executor.js';
+import type { VerifiedApproval, ProposalOptions, SeedNodeIdentity } from './cp028-executor.js';
 
 export const ROUTE_FEE = 150_000n;
 export const PREIMAGE = Buffer.from('3c9e0a51f2d47b86'.repeat(4), 'hex');
@@ -17,6 +17,8 @@ export const TOLERANCE = 1_000n;
 export const REGTEST_HANDSHAKE = { pubkey: `03${'cd'.repeat(32)}`, network: 'regtest', version: '0.21.4-beta commit=v0.21.4-beta', synced: true };
 
 export interface Options {
+  /** Register the intended implementation before proposals or execution history exist. */
+  readonly node?: SeedNodeIdentity;
   readonly approvalSeed?: ProposalOptions;
   readonly script?: (ctx: { base: Base; path: string; executionId: string }) => Partial<ExecutionScript>;
   readonly signal?: AbortSignal;
@@ -28,7 +30,12 @@ export interface Options {
 }
 
 export function balances(base: Base, source: bigint, target: bigint) {
-  return [fakeChannel(base.sourceKey, OUT_PEER, { localBalanceMsat: source }), fakeChannel(base.targetKey, IN_PEER, { localBalanceMsat: target })];
+  // Production workflow observations and execution freshness share database
+  // time. This changes only the default balances; options.script overrides
+  // below, including explicit future/stale observations, remain authoritative.
+  const observedAt = dbNow(base.path);
+  return [fakeChannel(base.sourceKey, OUT_PEER, { localBalanceMsat: source, observedAt }),
+    fakeChannel(base.targetKey, IN_PEER, { localBalanceMsat: target, observedAt })];
 }
 
 /** Channel balances after a settled rebalance of PRINCIPAL with the given fee (SPEC §8.7 step 5). */
@@ -40,7 +47,7 @@ export async function prepare(prefix: string, options: Options = {}) {
   const p = await loadPersistence();
   const { dispatchExecution } = await loadDispatch();
   const path = scratchDb(prefix);
-  const base = seedBase(p, path);
+  const base = seedBase(p, path, undefined, options.node);
   const route = options.route?.(base) ?? circularRoute(base.sourceKey, base.targetKey, ROUTE_FEE, 80);
   const seeded = seedExecution(base, { status: 'PREFLIGHT', route, plannedFeeMsat: route.totalFeeMsat, fenceEpoch: 3n,
     ...(options.approvalSeed === undefined ? {} : { proposalOptions: options.approvalSeed }) });
@@ -49,7 +56,8 @@ export async function prepare(prefix: string, options: Options = {}) {
   const policy = policyFor(base);
   // The dispatch input is a route approved on a node whose observed network is regtest (INV-15, SECURITY §4.4).
   const { proveRegtest, approveRoute } = await loadExecutionCore();
-  const proof = proveRegtest('regtest', REGTEST_HANDSHAKE);
+  const handshake = options.node?.implementation === 'cln' ? { ...REGTEST_HANDSHAKE, version: 'v26.06.9' } : REGTEST_HANDSHAKE;
+  const proof = proveRegtest('regtest', handshake);
   if (proof === null) throw new Error('proveRegtest refused regtest/regtest');
   const terms = { sourceChannelKey: route.sourceChannelKey, targetChannelKey: route.targetChannelKey, principalMsat: route.principalMsat };
   const approved = approveRoute(route, terms, approval, policy, proof);

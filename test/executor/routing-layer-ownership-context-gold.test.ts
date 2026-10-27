@@ -19,15 +19,17 @@ interface Observation { ownership: Ownership | undefined; row: ExecRow | undefin
 for (const routeAnswer of ['ready', 'refused'] as const) {
   it(`CP-029/REG-REC008 normal ${routeAnswer} preflight supplies live execution ownership before route assessment`, async () => {
     const p = await loadPersistence(), path = scratchDb(`owned-preflight-${routeAnswer}`);
-    const seeded = seedBase(p, path), sourceKey = '102x1x0', targetKey = '105x1x0';
-    exec(path, "UPDATE nodes SET name='cln-m', implementation='cln' WHERE id=?", seeded.nodeId);
+    const seeded = seedBase(p, path, undefined, { name: 'cln-m', implementation: 'cln' }), sourceKey = '102x1x0', targetKey = '105x1x0';
     exec(path, 'UPDATE channels SET channel_key=?, scid=? WHERE id=?', sourceKey, sourceKey, seeded.sourceChannelId);
     exec(path, 'UPDATE channels SET channel_key=?, scid=? WHERE id=?', targetKey, targetKey, seeded.targetChannelId);
     const base = { ...seeded, sourceKey, targetKey }, approval = seedProposal(base), policy = policyFor(base);
     const route = circularRoute(sourceKey, targetKey, 150_000n, 80);
     const node = new FakePreflightNode(sourceKey, targetKey, { version: 'v26.06.9',
-      channels: () => [fakeChannel(sourceKey, OUT_PEER, { nodeId: base.nodeId, scid: sourceKey }),
-        fakeChannel(targetKey, IN_PEER, { nodeId: base.nodeId, scid: targetKey })],
+      channels: () => {
+        const observedAt = dbNow(path);
+        return [fakeChannel(sourceKey, OUT_PEER, { nodeId: base.nodeId, scid: sourceKey, observedAt }),
+          fakeChannel(targetKey, IN_PEER, { nodeId: base.nodeId, scid: targetKey, observedAt })];
+      },
       route: () => routeAnswer === 'refused' ? { refusal: 'NO_FEASIBLE_ROUTE' }
         : { ...route, hops: route.hops.map((hop, index) => index === 1 ? { ...hop, channelKey: '103x1x0' } : hop) },
     });

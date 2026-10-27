@@ -178,8 +178,11 @@ export async function prepareExecution(deps: PreflightDeps, input: PreflightInpu
 
     const channels = await adapter.listChannels();
     if (!held()) return lost;
-    const fresh = (channel: NormalizedChannel | undefined): channel is NormalizedChannel =>
-      channel !== undefined && Math.abs(db.now() - channel.observedAt) <= policy.maxSnapshotAgeMs;
+    const fresh = (channel: NormalizedChannel | undefined): channel is NormalizedChannel => {
+      if (channel === undefined) return false;
+      const age = db.now() - channel.observedAt;
+      return Number.isSafeInteger(age) && age >= 0 && age <= policy.maxSnapshotAgeMs;
+    };
     const source = channels.find(channel => channel.channelKey === plan.sourceChannelKey);
     const target = channels.find(channel => channel.channelKey === plan.targetChannelKey);
     if (!fresh(source) || !fresh(target)) return refuse('STALE_SNAPSHOT');
@@ -246,9 +249,10 @@ export async function recoverPreflight(deps: Pick<PreflightDeps, 'db' | 'workerI
   readonly nodeIds?: ReadonlySet<string>;
 }): Promise<{ cancelled: readonly string[] }> {
   const { db, workerId, leaseMs } = deps;
+  for (const nodeId of deps.adapters?.keys() ?? []) db.nodes.assertIdentity(nodeId);
   const cancelled: string[] = [];
-  try {
-    for (const executionId of db.executions.lapsedClaims(deps.nodeIds === undefined ? undefined : [...deps.nodeIds])) {
+  for (const executionId of db.executions.lapsedClaims(deps.nodeIds === undefined ? undefined : [...deps.nodeIds])) {
+    try {
       const hash = db.executions.view(executionId)?.paymentHash ?? null;
       let adapter: Pick<ExecutionAdapter, 'invoiceState' | 'cancelUnpaidInvoice'> | undefined;
       if (hash !== null) {
@@ -281,9 +285,12 @@ export async function recoverPreflight(deps: Pick<PreflightDeps, 'db' | 'workerI
       }
       db.executions.transition(executionId, held.fenceEpoch, held.status, 'CANCELLED', { errorCode: 'APPROVAL_INVALID' });
       cancelled.push(executionId);
+    } catch (error) {
+      // A node await can outlive this candidate's lease. Its new owner keeps the row;
+      // stale attribution or cancellation must not prevent recovery of unrelated claims.
+      if (leaseLost(error)) continue;
+      throw error instanceof Error ? error : new Error(String(error));
     }
-  } catch (error) {
-    throw error instanceof Error ? error : new Error(String(error));
   }
   return { cancelled };
 }

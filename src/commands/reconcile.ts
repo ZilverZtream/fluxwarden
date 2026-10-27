@@ -59,7 +59,7 @@ export async function runReconcile(input: {
     observeFee: observation => { feeObservations.push(observation); },
   });
   const { postedJournalIds, feeBreach } = input.db.executions.postFeeCorrections(feeObservations);
-  const pending = input.executions.some(execution => execution.status === 'IN_FLIGHT' || execution.status === 'UNKNOWN');
+  const pending = input.executions.some(execution => execution.status === 'SUBMITTING' || execution.status === 'IN_FLIGHT' || execution.status === 'UNKNOWN');
   const exitCode = feeBreach ? ExitCode.INVARIANT_BREACH : pending ? ExitCode.OUTCOME_UNKNOWN : accounting.differences.length > 0 ? ExitCode.RECONCILIATION_ALERT : ExitCode.SUCCESS;
   return { exitCode, report: { verify, accounting, postedJournalIds } };
 }

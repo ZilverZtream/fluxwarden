@@ -99,7 +99,7 @@ it('CP-033/034 selecting live references retains the ordinary fake-node matrix a
   }
 }, 15_000);
 
-it('CP-036/B5 the actual chaos workflow command records real assertion outcomes in its scanned upload directory', () => {
+it('CP-036/B5 the actual chaos workflow command retains truthful failed assertion outcomes in its full scanned evidence directory', () => {
   const workflow = asRecord(parseYaml(readText('.github/workflows/ci.yml')), 'workflow');
   const chaos = asRecord(asRecord(workflow['jobs'], 'jobs')['chaos'], 'chaos');
   const stepsValue = chaos['steps'];
@@ -109,27 +109,15 @@ it('CP-036/B5 the actual chaos workflow command records real assertion outcomes 
   const install = steps.findIndex(step => typeof step['run'] === 'string' && /^node scripts\/ci-install\.mjs --root "\$PWD"$/.test(step['run'].trim()));
   const scan = steps.findIndex(step => typeof step['run'] === 'string' && /scripts\/leak-check\.mjs/.test(step['run']));
   const verify = steps.findIndex(step => typeof step['run'] === 'string' && /scripts\/ci-capture\.mjs verify\b/.test(step['run']));
-  const uploads = steps.map((step, index) => ({ step, index })).filter(({ step }) => typeof step['uses'] === 'string' &&
-    step['uses'].startsWith('actions/upload-artifact@') && asRecord(step['with'], 'upload options')['name'] === 'chaos-evidence');
-  expect(uploads, 'one original evidence-directory upload remains separate from the safe receipt').toHaveLength(1);
-  const upload = uploads[0]?.index ?? -1;
   expect(run, 'actual chaos command exists').toBeGreaterThanOrEqual(0);
   expect(install, 'trusted frozen-lock setup precedes candidate validation').toBeGreaterThanOrEqual(0);
   expect(run).toBeGreaterThan(install);
   expect(steps[run]?.['if'], 'original installer failure still enters evidence capture').toBe('always()');
   expect(verify, 'complete invocation verification follows generation').toBeGreaterThan(run);
-  expect(scan, 'evidence scan belongs to the same complete captured command').toBe(run);
-  expect(upload, 'upload follows complete invocation verification').toBeGreaterThan(verify);
-  expect(upload, 'only scanned evidence is uploaded').toBeGreaterThan(scan);
+  expect(scan, 'full evidence scan belongs to the same complete captured command').toBe(run);
   expect(steps[verify]?.['if'], 'capture is finalized on command failure').toBe('always()');
-  expect(String(steps[upload]?.['if'])).toContain("steps.capture-verify.outcome == 'success'");
-  const receiptUploads = steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@') &&
-    String(asRecord(step['with'], 'upload options')['path']).trim().endsWith('/receipt.json'));
-  expect(receiptUploads, 'a separate safe receipt accompanies the single evidence-directory upload').toHaveLength(1);
-  expect(steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'))).toHaveLength(2);
-  const uploadOptions = asRecord(steps[upload]?.['with'], 'upload options');
-  expect(uploadOptions['if-no-files-found'], 'missing evidence must remain an error').toBe('error');
-
+  // D29: raw private evidence need not be uploaded. The separate release B5
+  // oracle proves bounded JSON sealing/scanning and upload authorization.
   const scratch = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ce-'));
   const evidence = join(scratch, 'chaos-evidence');
   const sentinels = join(scratch, 'chaos-sentinels');
@@ -192,10 +180,9 @@ cp.spawn = function(command, args, options) {
     .replace(/\$\{FLUXWARDEN_SENTINEL_DIR\}|\$FLUXWARDEN_SENTINEL_DIR/g, sentinels)
     .replace(/\$\{FLUXWARDEN_CI_CAPTURE_DIR\}|\$FLUXWARDEN_CI_CAPTURE_DIR/g, capture)
     .replace(/\$PWD/g, fixture);
-  const uploaded = resolve(expand(String(uploadOptions['path'])));
-  const inside = relative(scratch, uploaded);
-  expect(inside && !inside.startsWith('..') && !isAbsolute(inside), 'upload stays in this run scratch').toBeTruthy();
-  expect(expand(String(steps[scan]?.['run'])).replace(/\\/g, '/'), 'scanner covers uploaded directory').toContain(uploaded.replace(/\\/g, '/'));
+  const uploaded = evidence; // retained full original evidence, not a raw-upload requirement
+  expect(expand(String(steps[scan]?.['run'])).replace(/\\/g, '/'), 'unchanged scanner covers full retained evidence')
+    .toContain(evidence.replace(/\\/g, '/'));
 
   const command = expand(String(steps[run]?.['run'])).trim();
   // Interpret simple argv only; do not execute workflow text through a shell.

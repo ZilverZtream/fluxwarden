@@ -8,6 +8,7 @@ import { loadClnRest,loadLndRest } from '../helpers/adapter-interfaces.js';
 import { loadClnExecute,loadLndExecute,sha256 } from '../helpers/cp030-execution.js';
 import { isCandidate,loadLndRoutes,loadRoute,type RouteChannel,type RouteConstraints } from '../helpers/route-interfaces.js';
 import { cli,clnConfig,clean,history,initializeRegistry,input,lndConfig,oracle,preflight,query,register,retain,setRunner,unchangedOld } from '../../labs/scenarios/chaos/live-reference.mjs';
+import { t18Record } from '../../labs/scenarios/chaos/t18-record.mjs';
 setRunner((file,args,options)=>spawnSync(file,args,options));
 function receivable(){const p=input(),nodes=p.manifest['nodes'] as Record<string,{pubkey:string}>,peer=nodes['lnd-r'];if(!peer)throw new Error('GAP owned native LND peer unavailable');const channel=(oracle('cln-m','listpeerchannels')['channels'] as Record<string,unknown>[]).find(v=>v['peer_id']===peer.pubkey);if(!channel)throw new Error('GAP owned native target channel unavailable');return BigInt(String(channel['receivable_msat']));}
 
@@ -80,8 +81,15 @@ it('CP-034/B1 T-18 public validator refuses an actual approved native LND route 
 
 // SPEC T-18 / INV-14: a quote based on graph capacity is not authority to
 // dispatch after a real last-hop/first-hop available balance has fallen.
-it('CP-034/B1 T-18 real bounded direct drain refuses last-hop availability and earlier first-hop reserve protection',async()=>{
-  initializeRegistry();await preflight('t18-before');const original=history(),p=input(),cln=clnConfig('t18-balance',true),lnd=lndConfig(true);
+it('CP-034/B1 T-18 LAST_HOP_RECEIVABLE CLI refusal with separately observed earlier reserve protection',async()=>{
+  initializeRegistry();const nativeBefore=await preflight('t18-before');const original=history(),p=input(),cln=clnConfig('t18-balance',true),lnd=lndConfig(true);
+  let lastHopStatus:'GAP'|'PARTIAL'|'PASS'|'INVALID'='GAP';const variantFacts:Record<string,unknown>={scope:'actual CLI; first-hop CLI stops at earlier RESERVE_FLOOR',nativeBefore};
+  const finish=async()=>{
+    try{await clean();variantFacts['nativeAfter']=await preflight('t18-after');}catch(error){lastHopStatus='INVALID';throw error;}
+    finally{
+      t18Record('t18-last-hop-cli','LAST_HOP_RECEIVABLE',lastHopStatus,variantFacts);
+    }
+  };
   try{
     const proposals:Record<string,string>={};
     for(const[name,fixture]of[['cln',cln],['lnd',lnd]]as const){
@@ -99,6 +107,7 @@ it('CP-034/B1 T-18 real bounded direct drain refuses last-hop availability and e
       await directCheckout(amount,count);
     }
     const after=receivable();retain('t18-drain-observations',{snapshots,afterReceivableMsat:after.toString()});expect(after).toBe(60000000n);
+    variantFacts['nativeDepletedChannels']={cln:oracle('cln-m','listpeerchannels'),lnd:oracle('lnd-r','listchannels')};
     const nodeBefore={clnPayments:oracle('cln-m','listsendpays'),clnInvoices:oracle('cln-m','listinvoices'),lndPayments:oracle('lnd-r','listpayments',['--include_incomplete'])};retain('t18-node-before-refusals',nodeBefore);
     const clnResult=cli(['actions','execute',proposals['cln']??'','--require-regtest'],'t18-cln-execute',cln.config);
     const lndResult=cli(['actions','execute',proposals['lnd']??'','--require-regtest'],'t18-lnd-execute',lnd.config);
@@ -107,6 +116,11 @@ it('CP-034/B1 T-18 real bounded direct drain refuses last-hop availability and e
     for(const[name,fixture]of[['cln',cln],['lnd',lnd]]as const)expect(query(fixture.database,'SELECT status,payment_hash FROM executions WHERE proposal_id = ?',(proposals[name]??'').replace(/^prop_/,''))).toEqual([{status:'CANCELLED',payment_hash:null}]);
     expect(clnResult).toMatchObject({exit:5,body:{error:{step:'LAST_HOP_RECEIVABLE'}}});
     expect(lndResult).toMatchObject({exit:5,body:{error:{step:'RESERVE_FLOOR'}}});unchangedOld(original,history());
-    retain('t18-first-hop-specific-gap',{status:'GAP',reason:'SPEC P3 reserve protection precedes V8 on the same native spendable snapshot; this live refusal does not prove FIRST_HOP_SPENDABLE.'});
-  }finally{await clean();await preflight('t18-after');}
+    Object.assign(variantFacts,{afterReceivableMsat:after.toString(),principalMsat:'100000000',nodeBefore,nodeAfter,clnResult,lndResult,databases:[cln.database,lnd.database]});
+    lastHopStatus='PASS';
+    // The independent worker case owns FIRST_HOP_SPENDABLE. Historic GAP
+    // artifacts remain retained; this CLI case publishes only its own variant.
+    retain('t18-cli-reserve-guard',{scope:'separate earlier CLI reserve protection; not first-hop variant completion',result:lndResult});
+  }catch(error){lastHopStatus='PARTIAL';throw error;}
+  finally{await finish();}
 });
