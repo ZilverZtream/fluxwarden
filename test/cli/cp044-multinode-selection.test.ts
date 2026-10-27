@@ -7,8 +7,10 @@ import { channel, getInfo } from '../fakes/lnd/responses.js';
 import { peerChannel } from '../fakes/cln/responses.js';
 import { clnNode, createDatabase, lndNode, nodeCert, runCli, scratch, writeConfig, writePolicy, type NodeEntry } from '../helpers/cp016-cli.js';
 import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 
 const servers: FakeServer[] = [];
+const beforeCredentialWrite = (path: string): void => declareFixturePaths([path]);
 afterEach(async () => { await Promise.all(servers.splice(0).map(server => server.close())); });
 
 for (const command of ['diagnose', 'plan'] as const) {
@@ -16,8 +18,8 @@ for (const command of ['diagnose', 'plan'] as const) {
     it(`CP-044/F06 ${command} refuses implicit multi-node selection before contact (${order})`, async () => {
       const dir = scratch('cp044-multinode'), database = join(dir, 'state', 'fluxwarden.db');
       await createDatabase(database);
-      const alpha = await lndNode(dir, servers, { info: getInfo({ pubkey: `02${'a1'.repeat(32)}` }), channels: [channel()] });
-      const bravo = await clnNode(dir, servers, { channels: [peerChannel()] });
+      const alpha = await lndNode(dir, servers, { info: getInfo({ pubkey: `02${'a1'.repeat(32)}` }), channels: [channel()], beforeCredentialWrite });
+      const bravo = await clnNode(dir, servers, { channels: [peerChannel()], beforeCredentialWrite });
       registerMoneySafetyCredentials([alpha.macaroon, bravo.runeFile]);
       const nodes: NodeEntry[] = [
         { name: 'alpha', implementation: 'lnd', url: alpha.url, tlsCert: nodeCert(), credential: alpha.macaroon, expectedPubkey: `02${'a1'.repeat(32)}` },
@@ -40,7 +42,8 @@ for (const command of ['diagnose', 'plan'] as const) {
   it(`CP-044/F06 ${command} supports explicit selection and a singleton default`, async () => {
     const dir = scratch('cp044-selected'), database = join(dir, 'state', 'fluxwarden.db');
     await createDatabase(database);
-    const alpha = await lndNode(dir, servers, { channels: [channel()] }), bravo = await clnNode(dir, servers, { channels: [peerChannel()] });
+    const alpha = await lndNode(dir, servers, { channels: [channel()], beforeCredentialWrite }),
+      bravo = await clnNode(dir, servers, { channels: [peerChannel()], beforeCredentialWrite });
     registerMoneySafetyCredentials([alpha.macaroon, bravo.runeFile]);
     const alphaEntry: NodeEntry = { name: 'alpha', implementation: 'lnd', url: alpha.url, tlsCert: nodeCert(),
       credential: alpha.macaroon, expectedPubkey: `02${'a1'.repeat(32)}` };

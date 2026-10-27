@@ -283,6 +283,8 @@ export interface ClnSetup {
   methods?: Partial<Record<string, ClnHandler>>;
   identity?: Identity;
   rune?: string;
+  /** Declare this exact synthetic input path before its first physical write. */
+  beforeCredentialWrite?: (path: string) => void;
 }
 
 export interface ClnNode { fake: FakeCln; runeFile: string; rune: string; url: string }
@@ -291,6 +293,7 @@ export interface ClnNode { fake: FakeCln; runeFile: string; rune: string; url: s
 export async function clnNode(dir: string, open: FakeServer[], setup: ClnSetup = {}): Promise<ClnNode> {
   const fresh = randomBytes(48).toString('base64url');
   const runeFile = join(dir, `${randomBytes(4).toString('hex')}.rune`);
+  setup.beforeCredentialWrite?.(runeFile);
   writeFileSync(runeFile, `${fresh}\n`);
   const fake = await startFakeCln({
     rune: setup.rune ?? fresh,
