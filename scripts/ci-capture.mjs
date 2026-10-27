@@ -113,7 +113,7 @@ function diagnostic(phase, result, reasons, errors = []) {
     complete: result.complete === true, leakFree: result.leakFree === true, policySatisfied: result.policySatisfied === true, reasons };
   // Public-looking paths and numeric metadata can themselves be literal sources.
   // Guard the complete JSON, including keys and hashes, before any emission.
-  const safe = safeDiagnostic({ ...base, details: { reports: ['harness', 'product'].map(diagnosticReport), errors } }) ?? safeDiagnostic(base);
+  const safe = safeDiagnostic({ ...base, details: { reports: ['harness', 'product', 'lab', 'chaos'].map(diagnosticReport), errors } }) ?? safeDiagnostic(base);
   if (safe !== null) process.stderr.write(safe + '\n');
 }
 function git(root, args, env = process.env, input) {

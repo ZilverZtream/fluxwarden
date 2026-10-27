@@ -848,12 +848,13 @@ function failureDetails(result: { stdout: string; stderr: string }): Record<stri
   expect(Array.isArray(details['reports']) && Array.isArray(details['errors']), 'diagnostics use fixed report and error arrays').toBe(true);
   return details;
 }
-function failureReport(details: Record<string, unknown>): Record<string, unknown> {
-  const reports = records(details['reports'], 'safe report metadata').filter(row => row['report'] === 'vitest-harness.json');
+const diagnosticReports = ['vitest-harness.json', 'vitest-lab.json', 'vitest-chaos.json'] as const;
+function failureReport(details: Record<string, unknown>, reportName = 'vitest-harness.json'): Record<string, unknown> {
+  const reports = records(details['reports'], 'safe report metadata').filter(row => row['report'] === reportName);
   expect(reports.length, 'the report is identified by its fixed basename').toBe(1);
   return reports[0] ?? {};
 }
-function diagnosticFixture() {
+function diagnosticFixture(reportName = 'vitest-harness.json') {
   const f = fixture(), relativeFile = 'test/diagnostic.test.mjs';
   const vitest = pathToFileURL(join(repoRoot, 'node_modules/vitest/dist/index.js')).href;
   writeFileSync(join(f.root, relativeFile), `import { expect, it } from ${JSON.stringify(vitest)};
@@ -869,11 +870,12 @@ allowOnly: false, passWithNoTests: false, maxWorkers: 1, fileParallelism: false 
     const result = spawnSync('git', args, { cwd: f.root, env: f.env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
     expect(result.status, 'diagnostic source provenance uses explicit tracked fixture inputs').toBe(0);
   }
-  return Object.assign(f, { relativeFile, reportPath: join(f.evidence, 'vitest-harness.json') });
+  return Object.assign(f, { relativeFile, reportPath: join(f.evidence, reportName) });
 }
 
-it('CP-044/CI-DIAGNOSTIC actual failed Vitest report exposes counts and hashes with a tracked source frame', () => {
-  const f = diagnosticFixture();
+for (const reportName of diagnosticReports) {
+it(`CP-044/CI-DIAGNOSTIC actual failed Vitest report exposes counts and hashes with a tracked source frame${reportName === 'vitest-harness.json' ? '' : ` (${reportName})`}`, () => {
+  const f = diagnosticFixture(reportName);
   f.script(`const { spawnSync } = await import('node:child_process');
 const run = spawnSync(process.execPath, ${JSON.stringify([join(repoRoot, 'scripts/ci-test-driver.mjs'), 'run',
     '--config', join(f.root, 'vitest.config.mjs'), '--root', f.root, '--maxWorkers=1', '--fileParallelism=false',
@@ -897,7 +899,7 @@ writeFileSync(join(scratch, 'owned.db'), bytes);`, 1);
   expect(f.receipt()['result']).toMatchObject({ exitCode: 1, leakFree: false, policySatisfied: false });
   const verification = f.invoke(true);
   expect(verification.status !== null && verification.status !== 0, 'actual failed-report diagnostics cannot excuse the deliberate source disclosure').toBe(true);
-  const metadata = failureReport(failureDetails(result));
+  const metadata = failureReport(failureDetails(result), reportName);
   expect(metadata).toMatchObject({ status: 'OK', passed: 1, failed: 1, pending: 0, sha256: digest(reportBytes) });
   const rows = records(metadata['failures'], 'failed case metadata');
   expect(rows).toHaveLength(1);
@@ -908,8 +910,8 @@ writeFileSync(join(scratch, 'owned.db'), bytes);`, 1);
     || JSON.stringify(metadata).includes(f.root), 'raw title, exception and absolute frame path remain private').toBe(false);
 }, 15_000);
 
-it('CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames cannot become public source paths', () => {
-  const f = diagnosticFixture(), marker = 'REPLACE_FIXTURE_SECRET';
+it(`CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames cannot become public source paths${reportName === 'vitest-harness.json' ? '' : ` (${reportName})`}`, () => {
+  const f = diagnosticFixture(reportName), marker = 'REPLACE_FIXTURE_SECRET';
   const suites = Array.from({ length: 17 }, (_, index) => {
     const path = index === 0 ? `${f.root}/../${marker}/escape.test.mjs` : `${f.root}/test/${marker}-${String(index)}.test.mjs`;
     return { name: path, status: 'failed', assertionResults: [{ fullName: `${marker} title ${String(index)}`, title: `${marker} title ${String(index)}`,
@@ -921,7 +923,7 @@ it('CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames
   // and retained copies belong to the outer fixture's prospective INPUT setup.
   declareFixtureCapture(f.capture, [], [{ path: f.reportPath, bytes: reportBytes }]);
   f.script(`const report = JSON.parse(${JSON.stringify(JSON.stringify(template))}.replaceAll(${JSON.stringify(marker)}, bytes.toString('hex')));
-writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 7);
+writeFileSync(join(evidence, ${JSON.stringify(reportName)}), JSON.stringify(report));`, 7);
   const result = f.invoke(), receipt = f.receipt(), verify = f.invoke(true);
   expect(result.error).toBeUndefined();
   expect(result.status, 'diagnostics preserve the original child failure').toBe(7);
@@ -931,7 +933,7 @@ writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 
   const published = Buffer.from(result.stdout + result.stderr + verify.stdout + verify.stderr + JSON.stringify(receipt));
   expect([f.seed, Buffer.from(f.seed.toString('hex')), Buffer.from(f.seed.toString('base64'))].every(bytes => !published.includes(bytes)),
     'synthetic registered secrets in title, message and path never appear in public channels').toBe(true);
-  const metadata = failureReport(failureDetails(result));
+  const metadata = failureReport(failureDetails(result), reportName);
   expect(metadata).toMatchObject({ status: 'OK', passed: 0, failed: 17, pending: 0, sha256: digest(reportBytes) });
   const rows = records(metadata['failures'], 'bounded poisoned case metadata');
   expect(rows, 'failure diagnostics have the original fixed sixteen-case bound').toHaveLength(16);
@@ -942,19 +944,20 @@ writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 
   expect(rows[0]).toMatchObject({ titleSha256: digest(String(first?.fullName).replaceAll(marker, f.seed.toString('hex'))),
     messageSha256: digest((first?.failureMessages ?? []).join('\n').replaceAll(marker, f.seed.toString('hex'))) });
 }, 15_000);
+}
 
-for (const status of ['INVALID', 'OVERSIZE', 'MISSING'] as const) {
-  it(`CP-044/CI-DIAGNOSTIC ${status} report cannot change original failure receipt or verification`, () => {
+for (const reportName of diagnosticReports) for (const status of reportName === 'vitest-harness.json' ? ['INVALID', 'OVERSIZE', 'MISSING'] : ['INVALID']) {
+  it(`CP-044/CI-DIAGNOSTIC ${status} report cannot change original failure receipt or verification${reportName === 'vitest-harness.json' ? '' : ` (${reportName})`}`, () => {
     const f = fixture();
-    const body = status === 'MISSING' ? '' : status === 'INVALID' ? "writeFileSync(join(evidence, 'vitest-harness.json'), '{');"
-      : "writeFileSync(join(evidence, 'vitest-harness.json'), ' '.repeat(16 * 1024 * 1024 + 1));";
+    const body = status === 'MISSING' ? '' : status === 'INVALID' ? `writeFileSync(join(evidence, ${JSON.stringify(reportName)}), '{');`
+      : `writeFileSync(join(evidence, ${JSON.stringify(reportName)}), ' '.repeat(16 * 1024 * 1024 + 1));`;
     f.script(body, 7);
     const result = f.invoke();
     expect(result.error, 'diagnostic parsing retains the ordinary capture deadline').toBeUndefined();
     expect(result.status, 'diagnostic-only refusal does not replace the original child failure').toBe(7);
     expect(f.receipt()['result']).toMatchObject({ exitCode: 7, complete: true, leakFree: true, policySatisfied: true });
     expect(f.invoke(true).status, 'report diagnostic status cannot alter independent evidence verification').toBe(0);
-    const metadata = failureReport(failureDetails(result));
+    const metadata = failureReport(failureDetails(result), reportName);
     expect(metadata['status']).toBe(status);
     expect(['passed', 'failed', 'pending'].every(key => metadata[key] === undefined || metadata[key] === null),
       'unvalidated reports cannot publish invented numeric counts').toBe(true);
