@@ -12,8 +12,8 @@ export const nativeFiles = [
 ];
 export function platformCommands({ os, node, shard }, environment) {
   if (!nodes.includes(node) || !['ubuntu-latest', 'windows-latest'].includes(os)) throw new Error('platform dispatch: unsupported target');
-  const windows = os === 'windows-latest', harness = /^harness-[1-8]$/.test(shard), core = /^core-[1-3]$/.test(shard);
-  if (!(windows ? harness || core || /^native-[12]$/.test(shard) : /^(product|harness)-[12]$/.test(shard))) throw new Error('platform dispatch: unsupported shard');
+  const windows = os === 'windows-latest', harness = /^harness-[1-8]$/.test(shard), core = /^core-[1-8]$/.test(shard);
+  if (!(windows ? harness || core || /^native-[12]$/.test(shard) : harness || /^product-[12]$/.test(shard))) throw new Error('platform dispatch: unsupported shard');
   if (!environment.FLUXWARDEN_EVIDENCE_DIR || !environment.TEMP) throw new Error('platform dispatch: private roots required');
   const suite = harness ? 'harness' : 'product', report = join(environment.FLUXWARDEN_EVIDENCE_DIR, `vitest-${suite}.json`);
   const commands = [['node', 'scripts/ci-install.mjs', 'verify', '--root', process.cwd()], ['npm', 'run', 'lint'], ['npm', 'run', 'build'], ['node', 'scripts/ci-database-check.mjs']];
@@ -22,7 +22,7 @@ export function platformCommands({ os, node, shard }, environment) {
     ...(windows && core ? [`--config=${join(environment.TEMP, 'vitest-windows-core.config.mjs')}`] : []),
     `--maxWorkers=${windows || harness ? '1' : '2'}`, ...windows || harness ? ['--fileParallelism=false'] : [],
     ...windows && !core && !harness ? nativeFiles : [],
-    `--shard=${shard.split('-').at(-1)}/${windows ? harness ? '8' : core ? '3' : '2' : '2'}`,
+    `--shard=${shard.split('-').at(-1)}/${harness || core ? '8' : '2'}`,
     '--reporter=default', '--reporter=json', `--outputFile.json=${report}`]);
   if (harness) commands.push(['node', 'scripts/no-pending.mjs', report]);
   return { suite, commands };

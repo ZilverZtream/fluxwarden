@@ -324,7 +324,7 @@ async function readOnlyIdentity(root, parent) {
     if (inside(parent, scratch) && dirname(scratch) === resolve(parent)) fs.rmSync(scratch, { recursive: true });
   }
 }
-async function closedCapture(root, capture, scratchParent) {
+export async function closedCapture(root, capture, scratchParent) {
   await assertPrivateDirectories([capture]);
   const receipt = read(join(capture, 'receipt.json'));
   const config = read(join(capture, 'private', 'config.json'));
@@ -339,7 +339,14 @@ async function closedCapture(root, capture, scratchParent) {
   retainedSourceIdentities(capture);
   return { receipt, config };
 }
-async function verify(root, capture) {
+export async function verifyCapture(root, capture) {
+  if (!diagnosticContext || diagnosticContext.root !== root || diagnosticContext.capture !== capture) {
+    let tests;
+    try { tests = new Set(git(root, ['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', 'test']).split('\0').filter(path => path.length <= 512 && /^test\/[A-Za-z0-9_./-]+\.test\.[cm]?[jt]sx?$/.test(path))); }
+    catch { /* Preserve the standalone verifier's refusal to trust untracked diagnostic frames. */ }
+    const environment = Object.freeze({ evidenceDir: process.env.FLUXWARDEN_EVIDENCE_DIR, sentinelDir: process.env.FLUXWARDEN_SENTINEL_DIR });
+    diagnosticContext = { root, capture, tests, environment, ...environment };
+  }
   const { receipt, config } = await closedCapture(root, capture);
   diagnosticContext.evidenceDir = config.evidenceDir;
   diagnosticContext.sentinelDir = config.sentinelDir;
@@ -541,7 +548,7 @@ async function main(args) {
   catch { /* A diagnostic without a trusted tracked-file allowlist emits no report fields. */ }
   const environment = Object.freeze({ evidenceDir: process.env.FLUXWARDEN_EVIDENCE_DIR, sentinelDir: process.env.FLUXWARDEN_SENTINEL_DIR });
   diagnosticContext = { root, capture, tests, environment, ...environment };
-  return verification ? verify(root, capture) : captureCommand(root, capture, args.slice(5));
+  return verification ? verifyCapture(root, capture) : captureCommand(root, capture, args.slice(5));
 }
 if (process.argv[1] && resolve(process.argv[1]) === script) {
   try { process.exitCode = await main(process.argv.slice(2)); }

@@ -140,7 +140,7 @@ export async function provePlatformPlans(): Promise<void> {
     const plan = await platformPlan(target, env), windows = target.os === 'windows-latest', harness = target.suite === 'harness';
     expect(plan.suite).toBe(target.suite);
     const core = target.shard.startsWith('core-'), native = target.shard.startsWith('native-');
-    const index = target.shard.split('-')[1] ?? '<missing>', shards = harness ? windows ? '8' : '2' : core ? '3' : '2';
+    const index = target.shard.split('-')[1] ?? '<missing>', shards = harness || core ? '8' : '2';
     const report = join(env['FLUXWARDEN_EVIDENCE_DIR'] ?? '', `vitest-${target.suite}.json`);
     const suite = ['npm', ...(harness ? ['run', 'test:harness'] : ['test']), '--',
       ...(core ? [`--config=${env['FLUXWARDEN_CI_CORE_CONFIG'] ?? '<missing>'}`] : []),

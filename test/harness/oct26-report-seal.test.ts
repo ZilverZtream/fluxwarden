@@ -1,7 +1,10 @@
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { asRecord, readJson } from '../helpers/cli.js';
+import { ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { capturedSealFixture, loadPublicSeal, REQUIRED_ROWS, runPublicSeal } from '../helpers/oct26-seal-fixture.js';
 import { sha256 } from '../helpers/oct26-release-gate.js';
 
@@ -83,6 +86,27 @@ it('CP-044/SEAL final bounded output scanning rejects registered credential byte
     expect(status !== 0 || !existsSync(fixture.leakPath), 'registered secret bytes cannot remain in authorized bounded output').toBe(true);
   } finally { if (existsSync(fixture.leakPath)) unlinkSync(fixture.leakPath); }
 }, 120_000);
+
+it('CP-044/SEAL-TRANSPORT descriptor output writes actually plant the same registered source for both synchronous write APIs', () => {
+  const fixture = capturedSealFixture(0), reportPath = join(fixture.output, 'report.json');
+  for (const method of ['writeFileSync', 'writeSync']) {
+    try {
+      const result = spawnSync(process.execPath, [...ownedCaptureToolArgs(['--import', pathToFileURL(join(fixture.source, 'seal-output-transport.mjs')).href,
+        '--input-type=module', '--eval', `import fs from 'node:fs';import {join} from 'node:path';
+const fd=fs.openSync(join(process.env.FLUXWARDEN_RELEASE_OUTPUT,'report.json'),'wx',0o600);
+try{fs[${JSON.stringify(method)}](fd,'{}');}finally{fs.closeSync(fd);}`])], {
+        cwd: fixture.source, env: { ...fixture.env, CONTROL_SEAL_SOURCE: join(fixture.source, 'test/sentinels/source.bin') }, windowsHide: true, timeout: 10_000,
+      });
+      expect(result.error).toBeUndefined(); expect(result.signal).toBeNull(); expect(result.status).toBe(0);
+      expect(result.stdout.toString('utf8').split('fixture-output-plant\n')).toHaveLength(2);
+      expect(existsSync(fixture.leakPath), 'actual descriptor content write must produce the registered leak plant').toBe(true);
+      expect(readFileSync(fixture.leakPath).includes(fixture.seed.toString('hex')), 'the planted value remains the existing registered SOURCE').toBe(true);
+    } finally {
+      if (existsSync(fixture.leakPath)) unlinkSync(fixture.leakPath);
+      if (existsSync(reportPath)) unlinkSync(reportPath);
+    }
+  }
+});
 
 it('CP-044/SEAL mutated original capture custody refuses before producing an authorized row', async () => {
   await loadPublicSeal(); const fixture = capturedSealFixture(0);

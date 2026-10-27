@@ -1,6 +1,10 @@
 // Source-bound producers and authenticated aggregate. GitHub's artifact digest
 // authenticates transport; each retained receipt binds actual bytes and job ID.
 import fs from 'node:fs';
+import { performance } from 'node:perf_hooks';
+import { Worker } from 'node:worker_threads';
+import { verifyCapture, closedCapture } from './ci-capture.mjs';
+import { binding as fileBinding } from './ci-capture-files.mjs';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -25,10 +29,10 @@ function sourceMatchesRunHead(head, source) {
   const object = spawnSync('git', ['cat-file', '-p', source], { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024 });
   return !object.error && object.status === 0 && object.stdout.split('\n\n', 1)[0].split('\n').includes(`parent ${head}`);
 }
-function run(command, args) {
+function run(command, args, timeout = 180_000) {
   if (command === 'node') command = process.execPath;
   if (command === 'npm') { args = [join(dirname(process.execPath), process.platform === 'win32' ? 'node_modules/npm/bin/npm-cli.js' : '../lib/node_modules/npm/bin/npm-cli.js'), ...args]; command = process.execPath; }
-  const result = spawnSync(command, args, { cwd: root, env: process.env, stdio: 'inherit', windowsHide: true, timeout: 180_000 });
+  const result = spawnSync(command, args, { cwd: root, env: process.env, stdio: 'inherit', windowsHide: true, timeout: Math.min(180_000, timeout) });
   check(!result.error && result.signal === null && result.status === 0);
 }
 function context() {
@@ -118,64 +122,124 @@ async function collectInventory(github, os, node) {
   put(join(ctx.output, 'inventory.json'), { schemaVersion: 1, ...binding(ctx), key: `${os}/${node}`, jobId: job.id, os, node, platform: process.platform, runtime: process.version, cases: inventory.cases });
 }
 export async function sealReport(github, key) {
-  const ctx = context(), suite = key.startsWith('live/') ? key.split('/')[1] : key.includes('/harness-') ? 'harness' : 'product';
-  const reportPath = join(process.env.FLUXWARDEN_EVIDENCE_DIR, `vitest-${suite}.json`);
-  const stat = fs.lstatSync(reportPath); check(stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= 64 * 1024 * 1024);
-  const bytes = fs.readFileSync(reportPath), original = JSON.parse(bytes.toString('utf8'));
-  const captured = read(join(process.env.FLUXWARDEN_CI_CAPTURE_DIR, 'receipt.json'));
-  let passed = captured.result?.exitCode === 0;
-  try { reportCases(original); } catch { passed = false; }
-  if (suite === 'chaos' && passed) {
-    // Explicit incompleteness already refuses authorization. Check it before
-    // expensive re-verification, without writing any output or crediting PASS.
-    const plan = read(process.env.FLUXWARDEN_LAB_PLAN), owner = plan.ownerPath ? read(plan.ownerPath) : plan.owner;
-    for (const name of fs.readdirSync(owner.evidenceRoot)) if (name.endsWith('.json')) {
-      check(observationPath(name));
-      const path = join(owner.evidenceRoot, name), info = fs.lstatSync(path);
-      if (resolve(path) === resolve(reportPath)) { rejectIncomplete(original); continue; }
-      check(info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 8 * 1024 * 1024);
-      rejectIncomplete(read(path));
+  const deadline = performance.now() + 600_000;
+  const remaining = () => { const left = deadline - performance.now(); check(left > 0); return Math.max(1, Math.floor(left)); };
+  // A clock-only thread enforces the same deadline even while synchronous Git
+  // or literal recognition occupies this process's main thread.
+  const watchdog = new Worker(`const {workerData}=require('node:worker_threads');setTimeout(()=>process.kill(process.pid),Math.max(1,workerData-process.uptime()*1000));`, { eval: true, workerData: process.uptime() * 1000 + remaining() });
+  const created = [];
+  const perform = async () => {
+    const captureDir = resolve(process.env.FLUXWARDEN_CI_CAPTURE_DIR);
+    const inputs = new Map(), staged = new Map();
+    const remember = path => {
+      const actual = fileBinding(path), previous = inputs.get(path);
+      check(!previous || JSON.stringify(previous) === JSON.stringify(actual));
+      inputs.set(path, actual); return actual;
+    };
+    const stableRead = path => { remember(path); const bytes = fs.readFileSync(path); remember(path); return bytes; };
+    const stage = (name, bytes) => { check(!staged.has(name)); staged.set(name, bytes); };
+    const stageJson = (name, value) => stage(name, Buffer.from(JSON.stringify(value) + '\n'));
+    for (const name of ['receipt.json', 'receipt.sha256', 'custody.json', 'private/config.json']) remember(join(captureDir, name));
+    remaining(); check(await verifyCapture(root, captureDir) === 0); remaining();
+    const verifiedConfig = JSON.parse(stableRead(join(captureDir, 'private/config.json')).toString('utf8'));
+    const verifiedFiles = new Map(JSON.parse(stableRead(join(captureDir, 'custody.json')).toString('utf8')).namespace.map(row => [row.path, row]));
+    const verifiedRead = path => { const bytes = stableRead(path); check(verifiedFiles.get(resolve(path))?.sha256 === hash(bytes)); return bytes; };
+    if (key.startsWith('live/')) {
+      const plan = JSON.parse(stableRead(process.env.FLUXWARDEN_LAB_PLAN).toString('utf8'));
+      if (plan.ownerPath) stableRead(plan.ownerPath);
     }
-  }
-  run('node', ['scripts/ci-capture.mjs', 'verify', '--root', root, '--capture-dir', process.env.FLUXWARDEN_CI_CAPTURE_DIR]);
-  if (passed) { run('node', ['scripts/no-pending.mjs', reportPath]); compareCompiled(ctx); }
-  const job = await officialJob(github, key), report = ref('report.json', bytes);
-  fs.writeFileSync(join(ctx.output, report.path), bytes, { mode: 0o600, flag: 'wx' });
-  const receipt = { ...binding(ctx), jobId: job.id, complete: captured.result.complete, exitCode: passed ? 0 : captured.result.exitCode || 1, reportSha256: report.sha256 };
-  put(join(ctx.output, 'receipt.json'), receipt);
-  const capture = fs.readFileSync(join(process.env.FLUXWARDEN_CI_CAPTURE_DIR, 'receipt.json'));
-  fs.writeFileSync(join(ctx.output, 'capture.json'), capture, { mode: 0o600, flag: 'wx' });
-  put(join(ctx.output, 'row.json'), { key, jobId: job.id, report, receipt: ref('receipt.json', fs.readFileSync(join(ctx.output, 'receipt.json'))) });
-  if (key.startsWith('live/')) {
-    const plan = read(process.env.FLUXWARDEN_LAB_PLAN); check(plan.sourceCommit === ctx.sourceCommit && plan.exclusive === true && plan.network === 'regtest');
-    const owner = plan.ownerPath ? read(plan.ownerPath) : plan.owner, ownerId = owner.id ?? plan.ownerId;
-    check(typeof ownerId === 'string' && ownerId.length > 0 && plan.ownerId === ownerId && plan.owner.evidenceRoot === owner.evidenceRoot &&
-      (!plan.ownerPath || owner.id === plan.owner.id));
-    put(join(ctx.output, 'owner-plan.json'), { schemaVersion: 1, sourceCommit: ctx.sourceCommit, exclusive: true, network: 'regtest', ownerId });
+    const ctx = context(), suite = key.startsWith('live/') ? key.split('/')[1] : key.includes('/harness-') ? 'harness' : 'product';
+    const reportPath = join(process.env.FLUXWARDEN_EVIDENCE_DIR, `vitest-${suite}.json`);
+    check(reportPath === join(verifiedConfig.evidenceDir, `vitest-${suite}.json`));
+    remember(ctx.tarballPath); check(inputs.get(ctx.tarballPath).sha256 === ctx.tarballSha256);
+    remember(join(root, 'dist/evidence/build-info.json'));
+    const stat = fs.lstatSync(reportPath); check(stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= 64 * 1024 * 1024);
+    const bytes = verifiedRead(reportPath), original = JSON.parse(bytes.toString('utf8'));
+    const captured = JSON.parse(stableRead(join(captureDir, 'receipt.json')).toString('utf8'));
+    let passed = captured.result?.exitCode === 0;
+    try { reportCases(original); } catch { passed = false; }
     if (suite === 'chaos' && passed) {
-      for (const id of requiredLiveRows) {
-        const assertions = original.testResults.filter(file => file.name.endsWith('.live.test.ts')).flatMap(file => file.assertionResults
-          .filter(assertion => assertion.fullName.includes(id)).map(assertion => ({ file: file.name, name: assertion.fullName, status: assertion.status })));
-        check(assertions.length > 0 && assertions.every(assertion => assertion.status === 'passed'));
-        const prefix = id.toLowerCase().replace('-', '') + '-';
-        const matches = fs.readdirSync(owner.evidenceRoot).filter(name => name.startsWith(prefix) && name.endsWith('.json'));
-        check(matches.length > 0);
-        const rawMembers = new Map();
-        const observations = matches.map(name => {
-          check(observationPath(name));
-          const path = join(owner.evidenceRoot, name), info = fs.lstatSync(path);
-          check(info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 8 * 1024 * 1024);
-          const bytes = fs.readFileSync(path); rawMembers.set(name, bytes);
-          fs.writeFileSync(join(ctx.output, name), bytes, { mode: 0o600, flag: 'wx' });
-          return ref(name, bytes);
-        });
-        const summary = { ...binding(ctx), row: id, complete: true, assertions, observations };
-        validateObservations(id, summary, reference => JSON.parse(rawMembers.get(reference.path).toString('utf8')), { ...binding(ctx), ownerId });
-        put(join(ctx.output, `${id}.json`), summary);
+      // Explicit incompleteness already refuses authorization. Check it before
+      // expensive re-verification, without writing any output or crediting PASS.
+      const plan = JSON.parse(stableRead(process.env.FLUXWARDEN_LAB_PLAN).toString('utf8')), owner = plan.ownerPath ? JSON.parse(stableRead(plan.ownerPath).toString('utf8')) : plan.owner;
+      for (const name of fs.readdirSync(owner.evidenceRoot)) if (name.endsWith('.json')) {
+        check(observationPath(name));
+        const path = join(owner.evidenceRoot, name), info = fs.lstatSync(path);
+        if (resolve(path) === resolve(reportPath)) { rejectIncomplete(original); continue; }
+        check(info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 8 * 1024 * 1024);
+        rejectIncomplete(JSON.parse(verifiedRead(path).toString('utf8')));
       }
     }
+    if (passed) { run('node', ['scripts/no-pending.mjs', reportPath], remaining()); compareCompiled(ctx); }
+    const job = await officialJob(github, key), report = ref('report.json', bytes);
+    remaining();
+    await closedCapture(root, captureDir);
+    remaining();
+    stage(report.path, bytes);
+    const receipt = { ...binding(ctx), jobId: job.id, complete: captured.result.complete, exitCode: passed ? 0 : captured.result.exitCode || 1, reportSha256: report.sha256 };
+    stageJson('receipt.json', receipt);
+    const capture = stableRead(join(captureDir, 'receipt.json'));
+    stage('capture.json', capture);
+    stageJson('row.json', { key, jobId: job.id, report, receipt: ref('receipt.json', staged.get('receipt.json')) });
+    if (key.startsWith('live/')) {
+      const plan = JSON.parse(stableRead(process.env.FLUXWARDEN_LAB_PLAN).toString('utf8')); check(plan.sourceCommit === ctx.sourceCommit && plan.exclusive === true && plan.network === 'regtest');
+      const owner = plan.ownerPath ? JSON.parse(stableRead(plan.ownerPath).toString('utf8')) : plan.owner, ownerId = owner.id ?? plan.ownerId;
+      check(typeof ownerId === 'string' && ownerId.length > 0 && plan.ownerId === ownerId && plan.owner.evidenceRoot === owner.evidenceRoot &&
+        (!plan.ownerPath || owner.id === plan.owner.id));
+      stageJson('owner-plan.json', { schemaVersion: 1, sourceCommit: ctx.sourceCommit, exclusive: true, network: 'regtest', ownerId });
+      if (suite === 'chaos' && passed) {
+        for (const id of requiredLiveRows) {
+          const assertions = original.testResults.filter(file => file.name.endsWith('.live.test.ts')).flatMap(file => file.assertionResults
+            .filter(assertion => assertion.fullName.includes(id)).map(assertion => ({ file: file.name, name: assertion.fullName, status: assertion.status })));
+          check(assertions.length > 0 && assertions.every(assertion => assertion.status === 'passed'));
+          const prefix = id.toLowerCase().replace('-', '') + '-';
+          const matches = fs.readdirSync(owner.evidenceRoot).filter(name => name.startsWith(prefix) && name.endsWith('.json'));
+          check(matches.length > 0);
+          const rawMembers = new Map();
+          const observations = matches.map(name => {
+            check(observationPath(name));
+            const path = join(owner.evidenceRoot, name), info = fs.lstatSync(path);
+            check(info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 8 * 1024 * 1024);
+            const bytes = verifiedRead(path); rawMembers.set(name, bytes);
+            stage(name, bytes);
+            return ref(name, bytes);
+          });
+          const summary = { ...binding(ctx), row: id, complete: true, assertions, observations };
+          validateObservations(id, summary, reference => JSON.parse(rawMembers.get(reference.path).toString('utf8')), { ...binding(ctx), ownerId });
+          stageJson(`${id}.json`, summary);
+        }
+      }
+    }
+    for (const path of inputs.keys()) remember(path);
+    remaining();
+    for (const [name, bytes] of staged) {
+      const path = join(ctx.output, name);
+      remaining();
+      const fd = fs.openSync(path, 'wx', 0o600);
+      try {
+        const identity = fs.fstatSync(fd, { bigint: true });
+        created.push({ path, identity });
+        fs.writeFileSync(fd, bytes);
+      } finally { fs.closeSync(fd); }
+      remaining();
+    }
+    scan([ctx.output]); remaining();
+    for (const path of inputs.keys()) remember(path);
+    await closedCapture(root, captureDir); remaining();
+  };
+  // Keep the independent deadline armed while any owned asynchronous work is
+  // pending. A rejected timeout race cannot cancel a provider's work.
+  try { await perform(); }
+  catch (error) {
+    for (const { path, identity } of created) {
+      const current = fs.lstatSync(path, { bigint: true, throwIfNoEntry: false });
+      if (current?.isFile() && current.dev === identity.dev && current.ino === identity.ino && current.birthtimeNs === identity.birthtimeNs)
+        fs.unlinkSync(path);
+    }
+    throw error;
+  } finally {
+    await watchdog.terminate();
   }
-  scan([ctx.output]);
 }
 async function producer(github, kind) {
   const ctx = context(), key = `release/${kind}`, job = await officialJob(github, key);

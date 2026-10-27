@@ -15,8 +15,10 @@ import { exec, seedExecution } from '../helpers/cp030-execution.js';
 import { lndNode, nodeCert, writeConfig, writePolicy } from '../helpers/cp016-cli.js';
 import { publishSentinel, sentinelRoot } from '../helpers/output.js';
 import { prepareMoneySafetyAlertKey, registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 
 const servers: FakeServer[] = [];
+const beforeCredentialWrite = (path: string): void => { declareFixturePaths([path]); };
 afterEach(async () => { await Promise.all(servers.splice(0).map(server => server.close())); });
 
 function capture() {
@@ -49,7 +51,7 @@ for (const scenario of [4, 7, 8, 9, 'alert-write-failure'] as const) {
     let phase: 'control' | 'daemon' = 'control', infos = 0, recovering = true;
     let stop: () => void = () => undefined;
     let alertFaultInjected = false;
-    const node = await lndNode(dir, servers, { info: getInfo({ pubkey: NODE_PUBKEY }), routes: {
+    const node = await lndNode(dir, servers, { info: getInfo({ pubkey: NODE_PUBKEY }), beforeCredentialWrite, routes: {
       'GET /v1/getinfo': (ctx, fake) => {
         if (phase === 'daemon') {
           infos += 1;

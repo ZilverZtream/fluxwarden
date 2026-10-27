@@ -15,8 +15,10 @@ import { NODE_PUBKEY, raw, scratchDb, seedBase, type ExecPersistence } from '../
 import { reservationState, rowOf, seedExecution } from '../helpers/cp030-execution.js';
 import { repoRoot } from '../helpers/cli.js';
 import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { declareFixturePaths } from '../helpers/capture-fixture.js';
 
 const servers: FakeServer[] = [];
+const beforeCredentialWrite = (path: string): void => { declareFixturePaths([path]); };
 afterEach(async () => { await Promise.all(servers.splice(0).map(server => server.close())); });
 
 async function persistence(): Promise<ExecPersistence> {
@@ -39,13 +41,13 @@ for (const identity of ['legacy-unbound', 'implementation-mismatch'] as const) {
       // Opening the public current database migrates the actual old fixture;
       // no new-schema provenance columns, clocks or identities are edited.
       p.openDatabase(database, { readOnly: false }).close();
-      const lnd = await lndNode(dir, servers, { info: getInfo({ pubkey: NODE_PUBKEY }) });
+      const lnd = await lndNode(dir, servers, { info: getInfo({ pubkey: NODE_PUBKEY }), beforeCredentialWrite });
       registerMoneySafetyCredentials([lnd.macaroon]);
       let entry: NodeEntry = { name: 'lnd-r', implementation: 'lnd', url: lnd.url, tlsCert: nodeCert(), credential: lnd.macaroon, expectedPubkey: NODE_PUBKEY };
       if (identity === 'implementation-mismatch') {
         const boundConfig = writeConfig(dir, { database, nodes: [entry] });
         expect((await runCli(['--json', 'nodes', 'inspect', 'lnd-r', '--config', boundConfig])).status).toBe(0);
-        const cln = await clnNode(dir, servers, { info: getinfo({ id: NODE_PUBKEY }) });
+        const cln = await clnNode(dir, servers, { info: getinfo({ id: NODE_PUBKEY }), beforeCredentialWrite });
         registerMoneySafetyCredentials([cln.runeFile]);
         entry = { ...entry, implementation: 'cln', url: cln.url, credential: cln.runeFile };
       }
@@ -78,7 +80,7 @@ for (const identity of ['legacy-unbound', 'implementation-mismatch'] as const) {
 it('CP-044/ARC-044-001 a genuinely new configured name can register its first observed identity', async () => {
   const p = await persistence(), database = scratchDb('arc044-new-name'), dir = dirname(database);
   p.openDatabase(database, { readOnly: false }).close();
-  const lnd = await lndNode(dir, servers);
+  const lnd = await lndNode(dir, servers, { beforeCredentialWrite });
   registerMoneySafetyCredentials([lnd.macaroon]);
   const config = writeConfig(dir, { database, nodes: [{ name: 'fresh-node', implementation: 'lnd', url: lnd.url,
     tlsCert: nodeCert(), credential: lnd.macaroon, expectedPubkey: LND_PUBKEY }] });
@@ -95,7 +97,7 @@ it('CP-044/ARC-044-001 a genuinely new configured name can register its first ob
 it('CP-044/ARC-044-001 a remote pubkey mismatch is probed safely without payment observations', async () => {
   const p = await persistence(), database = scratchDb('arc044-remote-pin'), dir = dirname(database);
   p.openDatabase(database, { readOnly: false }).close();
-  const info = getInfo({ pubkey: NODE_PUBKEY }), lnd = await lndNode(dir, servers, { info });
+  const info = getInfo({ pubkey: NODE_PUBKEY }), lnd = await lndNode(dir, servers, { info, beforeCredentialWrite });
   registerMoneySafetyCredentials([lnd.macaroon]);
   const config = writeConfig(dir, { database, nodes: [{ name: 'lnd-r', implementation: 'lnd', url: lnd.url,
     tlsCert: nodeCert(), credential: lnd.macaroon, expectedPubkey: NODE_PUBKEY }] });

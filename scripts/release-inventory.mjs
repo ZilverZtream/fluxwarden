@@ -27,8 +27,9 @@ export function reportedCaseName(assertion) {
 export function platformJobs() {
   const rows = [];
   for (const os of ['ubuntu-latest', 'windows-latest']) {
-    const shards = os === 'ubuntu-latest' ? ['product-1', 'product-2', 'harness-1', 'harness-2'] :
-      ['core-1', 'core-2', 'core-3', ...Array.from({ length: 8 }, (_, i) => `harness-${i + 1}`), 'native-1', 'native-2'];
+    const harness = Array.from({ length: 8 }, (_, i) => `harness-${i + 1}`);
+    const shards = os === 'ubuntu-latest' ? ['product-1', 'product-2', ...harness] :
+      [...Array.from({ length: 8 }, (_, i) => `core-${i + 1}`), ...harness, 'native-1', 'native-2'];
     for (const node of nodes) for (const shard of shards) rows.push({ os, node, shard, suite: shard.startsWith('harness-') ? 'harness' : 'product', key: `platform/${os}/${node}/${shard}` });
   }
   return rows;

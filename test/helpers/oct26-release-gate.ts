@@ -37,8 +37,10 @@ export function independentInventory(): Inventory {
   const platformJobs: PlatformJob[] = [];
   const casesByTarget: Inventory['casesByTarget'] = {};
   for (const os of ['ubuntu-latest', 'windows-latest']) {
-    const shards = os === 'ubuntu-latest' ? ['product-1', 'product-2', 'harness-1', 'harness-2']
-      : ['core-1', 'core-2', 'core-3', ...Array.from({ length: 8 }, (_, i) => `harness-${String(i + 1)}`), 'native-1', 'native-2'];
+    // D29/D30 explicit bounded-profile reference: 6 * (10 Linux + 18 Windows).
+    const harness = Array.from({ length: 8 }, (_, i) => `harness-${String(i + 1)}`);
+    const shards = os === 'ubuntu-latest' ? ['product-1', 'product-2', ...harness]
+      : [...Array.from({ length: 8 }, (_, i) => `core-${String(i + 1)}`), ...harness, 'native-1', 'native-2'];
     for (const node of ['22.23.2', '22.x', '24.18.1', '24.x', '26.5.1', '26.x']) {
       const eligible = frozen.casesByPlatform[os];
       if (!eligible) throw new Error('independent target fixture missing');

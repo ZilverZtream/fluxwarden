@@ -284,15 +284,15 @@ const split = async (value, count) => {
  const files = JSON.parse(value).map(moduleId => ({ moduleId }));
  return Promise.all(Array.from({ length: count }, (_, offset) => new BaseSequencer({ config: { root: process.cwd(), shard: { index: offset + 1, count } } }).shard(files)));
 };
-const [groups, product, harness, windowsHarness] = await Promise.all([split(process.env.CI_CORE_FILES, 3), split(process.env.CI_LINUX_PRODUCT_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 8)]);
+const [groups, product, harness, windowsHarness] = await Promise.all([split(process.env.CI_CORE_FILES, 8), split(process.env.CI_LINUX_PRODUCT_FILES, 2), split(process.env.CI_LINUX_HARNESS_FILES, 8), split(process.env.CI_LINUX_HARNESS_FILES, 8)]);
 const native = await Promise.all(JSON.parse(process.env.CI_NATIVE_SELECTIONS).map(async selection => {
  const files = selection.files.map(moduleId => ({ moduleId }));
  const selected = selection.sharded ? await new BaseSequencer({ config: { root: process.cwd(), shard: { index: selection.index, count: 2 } } }).shard(files) : files;
  return ['native-' + selection.version + '-' + selection.index, selected.map(file => file.moduleId)];
 }));
-console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second: groups[1].map(file => file.moduleId), third: groups[2].map(file => file.moduleId),
+console.log(JSON.stringify({ core: groups.map(group => group.map(file => file.moduleId)),
  productFirst: product[0].map(file => file.moduleId), productSecond: product[1].map(file => file.moduleId),
- harnessFirst: harness[0].map(file => file.moduleId), harnessSecond: harness[1].map(file => file.moduleId),
+ linuxHarness: harness.map(group => group.map(file => file.moduleId)),
  windowsHarness: windowsHarness.map(group => group.map(file => file.moduleId)), ...Object.fromEntries(native) }));`,
     encoding: 'utf8', windowsHide: true, timeout: 10000,
   });
@@ -307,7 +307,13 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
       return file;
     });
   };
-  const firstCore = shardFiles('first'), secondCore = shardFiles('second'), thirdCore = shardFiles('third');
+  const shardGroups = (key: string): string[][] => {
+    const groups = partitions[key];
+    if (!Array.isArray(groups) || !groups.every(group => Array.isArray(group) && group.every(file => typeof file === 'string'))) throw new Error('partition must contain file groups');
+    return groups;
+  };
+  const coreGroups = shardGroups('core');
+  expect(coreGroups, 'D29/D30 preserves every core file in eight bounded partitions').toHaveLength(8);
   expect(complete.length).toBeGreaterThan(nativeFiles.length);
   expect(native).toEqual([...nativeFiles].sort());
   for (const version of windowsVersions) {
@@ -315,12 +321,12 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
     expect([firstNative.length, secondNative.length], `${version}: native allocations are two nonempty six-file groups`).toEqual([6, 6]);
     expect(firstNative.filter(file => secondNative.includes(file)), `${version}: native allocations are disjoint`).toEqual([]);
     expect([...firstNative, ...secondNative].sort(), `${version}: native allocations preserve the exact twelve-file inventory`).toEqual([...nativeFiles].sort());
-    expect(firstCore.length, `${version}: first core shard is nonempty`).toBeGreaterThan(0);
-    expect(secondCore.length, `${version}: second core shard is nonempty`).toBeGreaterThan(0);
-    expect(thirdCore.length, `${version}: third core shard is nonempty`).toBeGreaterThan(0);
-    expect(firstCore.filter(file => secondCore.includes(file) || thirdCore.includes(file)), `${version}: first core shard is disjoint`).toEqual([]);
-    expect(secondCore.filter(file => thirdCore.includes(file)), `${version}: second and third core shards are disjoint`).toEqual([]);
-    expect([...firstCore, ...secondCore, ...thirdCore].sort(), `${version}: Windows core shards cover the complete original core inventory`).toEqual(coreFiles);
+    for (const [index, group] of coreGroups.entries()) {
+      expect(group.length, `${version}: core shard ${String(index + 1)} is nonempty`).toBeGreaterThan(0);
+      expect(group.filter(file => coreGroups.slice(index + 1).flat().includes(file)), `${version}: core shard ${String(index + 1)} is disjoint`).toEqual([]);
+      expect(group.filter(file => native.includes(file)), `${version}: native files never enter core`).toEqual([]);
+    }
+    expect(coreGroups.flat().sort(), `${version}: eight Windows core shards cover the complete original core inventory`).toEqual(coreFiles);
     const groups = partitions['windowsHarness'];
     if (!Array.isArray(groups)) throw new Error('Windows harness partitions are not a list');
     expect(groups).toHaveLength(8);
@@ -344,11 +350,13 @@ console.log(JSON.stringify({ first: groups[0].map(file => file.moduleId), second
   expect(coreFiles.filter(file => native.includes(file)), 'Windows shards are disjoint').toEqual([]);
   expect([...coreFiles, ...native].sort(), 'Windows shards cover the complete product inventory').toEqual(complete);
   for (const [suite, inventory] of [['product', complete], ['harness', fullHarness]] as const) {
-    const first = shardFiles(`${suite}First`), second = shardFiles(`${suite}Second`);
-    expect(first.length, `${suite} first Linux shard is nonempty`).toBeGreaterThan(0);
-    expect(second.length, `${suite} second Linux shard is nonempty`).toBeGreaterThan(0);
-    expect(first.filter(file => second.includes(file)), `${suite} Linux shards are disjoint`).toEqual([]);
-    expect([...first, ...second].sort(), `${suite} Linux shards preserve the complete original project inventory`).toEqual(inventory);
+    const groups = suite === 'product' ? [shardFiles('productFirst'), shardFiles('productSecond')] : shardGroups('linuxHarness');
+    expect(groups, `${suite}: D29/D30 exact Linux partition count`).toHaveLength(suite === 'product' ? 2 : 8);
+    for (const [index, group] of groups.entries()) {
+      expect(group.length, `${suite} Linux shard ${String(index + 1)} is nonempty`).toBeGreaterThan(0);
+      expect(group.filter(file => groups.slice(index + 1).flat().includes(file)), `${suite} Linux shards are disjoint`).toEqual([]);
+    }
+    expect(groups.flat().sort(), `${suite} Linux shards preserve the complete original project inventory`).toEqual(inventory);
   }
 
 

@@ -10,7 +10,7 @@ import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.j
 import { declareFixturePaths } from '../helpers/capture-fixture.js';
 
 const servers: FakeServer[] = [];
-const beforeCredentialWrite = (path: string): void => declareFixturePaths([path]);
+const beforeCredentialWrite = (path: string): void => { declareFixturePaths([path]); };
 afterEach(async () => { await Promise.all(servers.splice(0).map(server => server.close())); });
 
 for (const command of ['diagnose', 'plan'] as const) {

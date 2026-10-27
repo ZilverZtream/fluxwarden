@@ -128,8 +128,8 @@ function safeMetadata(f: ReturnType<typeof fixture>, extraEnv: NodeJS.ProcessEnv
   // This output destination is outside every sealed invocation scope.
   const outputRoot = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ci-safe-metadata-output-'));
   const output = join(outputRoot, 'github-output.txt'), before = metadataNamespace(f);
-  const result = spawnSync(process.execPath, ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-safe-capture-metadata.mjs'),
-    '--root', f.root, '--capture-dir', f.capture]), { cwd: f.root, env: { ...f.env, ...extraEnv, GITHUB_OUTPUT: output },
+  const result = spawnSync(process.execPath, [...ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-safe-capture-metadata.mjs'),
+    '--root', f.root, '--capture-dir', f.capture])], { cwd: f.root, env: { ...f.env, ...extraEnv, GITHUB_OUTPUT: output },
     encoding: 'utf8', windowsHide: true, timeout: 10_000 });
   expect(result.error === undefined, 'metadata attestation completes within the existing capture command budget').toBe(true);
   expect(result.signal).toBeNull(); expect(result.status).not.toBeNull();
@@ -610,6 +610,11 @@ it('CP-044/CI-CAPTURE live positive control retains its originally registered so
 // enter through ci-platform.mjs. The dispatcher must prove the same public
 // captured command plan and failure propagation; its filename alone is no proof.
 function hostedCapture(name: string, steps: Record<string, unknown>[]): boolean {
+  const condition = (step: Record<string, unknown>): string => String(step['if'] ?? 'success()').trim().replace(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/, '$1').trim();
+  const guardedBy = (step: Record<string, unknown>, id: string): boolean => condition(step).split(/\s*&&\s*/)
+    .some(term => term === `steps.${id}.outcome == 'success'` || term === `steps.${id}.outcome == "success"`);
+  const ordinaryArgument = '(?:"[^"\\r\\n]+"|\'[^\'\\r\\n]+\'|[^\\s;&|]+)';
+  const verifyCommand = new RegExp(`^node scripts/ci-capture\\.mjs verify(?: --root ${ordinaryArgument})?(?: --capture-dir ${ordinaryArgument})?$`);
   const npmCommand = /\bnpm (?:test\b|run test:(?:harness|lab|chaos)\b)/;
   const dispatcher = /\bnode scripts\/ci-platform\.mjs\b/;
   const commandSteps = steps.filter(step => typeof step['run'] === 'string' && (npmCommand.test(step['run']) || dispatcher.test(step['run'])));
@@ -631,18 +636,64 @@ function hostedCapture(name: string, steps: Record<string, unknown>[]): boolean 
     }
   }
   const lastCommand = Math.max(...commandSteps.map(step => steps.indexOf(step)));
-  const verification = steps.findIndex((step, index) => index > lastCommand && typeof step['run'] === 'string' && /ci-capture\.mjs\s+verify\b/.test(step['run']));
+  const standalone = steps.filter(step => /ci-capture\.mjs\s+verify\b/.test(String(step['run'] ?? '')));
+  expect(standalone.length, 'one standalone census verifier suffices when present').toBeLessThanOrEqual(1);
+  for (const step of standalone) {
+    expect(String(step['run']).trim(), 'verification must be an actual unmasked command').toMatch(verifyCommand);
+    expect(steps.indexOf(step)).toBeGreaterThan(lastCommand);
+    expect(condition(step), 'standalone verification always runs').toBe('always()');
+    expect(step['continue-on-error'] ?? false).toBe(false);
+  }
+  const seals = steps.filter(step => /release-ci\.mjs[\s\S]*\bseal\b/.test(String(step['run'] ?? '')));
+  expect(seals.length, 'a report has one actual verification/seal phase').toBeLessThanOrEqual(1);
+  for (const step of seals) {
+    const key = name === 'test' ? 'platform/${{ matrix.os }}/${{ matrix.node }}/${{ matrix.shard }}' : `live/${name}`;
+    expect(['test', 'lab', 'chaos'], 'unsealed producer and inventory jobs retain standalone verification').toContain(name);
+    const command = String(step['run']).trim();
+    expect([`node scripts/release-ci.mjs seal --key "${key}"`, `node scripts/release-ci.mjs seal --key '${key}'`,
+      ...(name === 'test' ? [] : [`node scripts/release-ci.mjs seal --key ${key}`])], 'only the exact public seal command and original row key qualify').toContain(command);
+    expect(step['continue-on-error'] ?? false).toBe(false);
+    const previous = standalone[0];
+    if (previous && condition(step) !== 'always()') {
+      expect(steps.indexOf(step)).toBeGreaterThan(steps.indexOf(previous));
+      expect(condition(step).split(/\s*&&\s*/)).toHaveLength(2);
+      expect(condition(step).startsWith('always() && ')).toBe(true);
+      expect(guardedBy(step, String(previous['id']))).toBe(true);
+    } else expect(condition(step), 'composed verification has no stale or disabled prerequisite').toBe('always()');
+  }
+  const verifier = seals[0] ?? standalone[0], verification = verifier ? steps.indexOf(verifier) : -1;
   expect(verification, `${name}: final invocation census verification follows generated outputs`).toBeGreaterThan(lastCommand);
-  expect(String(steps[verification]?.['if']), `${name}: failures still receive final verification`).toMatch(/always\(\)/);
+  expect(typeof verifier?.['id'], 'the verification step has a real explicit id').toBe('string');
+  expect(String(verifier?.['id']), 'upload credit identifies the actual verification phase').toMatch(/^[A-Za-z_][A-Za-z0-9_-]*$/);
   const uploads = steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
   expect(uploads.length, `${name}: safe receipt is retained`).toBeGreaterThan(0);
+  let releaseUploads = 0;
   for (const step of uploads) {
     expect(steps.indexOf(step), 'safe upload follows final verification').toBeGreaterThan(verification);
     const options = asRecord(step['with'], 'upload options');
     expect(options['if-no-files-found']).toBe('error');
     expect(String(options['path']), 'raw source roots are never upload paths').not.toMatch(/SENTINEL|sentinel|sources|inputs/i);
-    expect(String(step['if']), 'upload is conditional on successful final verification').toMatch(/success/);
+    const guard = condition(step);
+    expect(guard, 'upload guards cannot bypass verification with an alternative or disabled expression').not.toMatch(/\|\||\bfalse\b/);
+    expect(guard).toMatch(/^(?:always|success)\(\)\s*&&/);
+    for (const match of guard.matchAll(/\bsteps\.([\w-]+)\.outcome\b/g)) expect(steps.some(candidate => candidate['id'] === match[1]), 'outcome guards reference real retained steps').toBe(true);
+    const metadata = steps.find(candidate => candidate['id'] && guardedBy(step, String(candidate['id']))
+      && String(candidate['run'] ?? '').trim() === 'node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"');
+    if (metadata && String(options['path']) === '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json') {
+      expect(steps.indexOf(step)).toBeGreaterThan(steps.indexOf(metadata));
+      expect(condition(metadata)).toBe('always()'); expect(metadata['continue-on-error'] ?? false).toBe(false);
+      expect(guard.split(/\s*&&\s*/)).toContain(`steps.${String(metadata['id'])}.outputs.available == 'true'`);
+    } else if (String(options['path']) === '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json'
+      && standalone[0] && guardedBy(step, String(standalone[0]['id']))) {
+      // Legacy receipt-only retention still has full independent verification;
+      // it cannot stand in for a sealed release report upload.
+      if (!seals.length) releaseUploads++;
+    } else {
+      expect(guardedBy(step, String(verifier?.['id'])), 'release uploads require success of the actual standalone or composed verifier').toBe(true);
+      releaseUploads++;
+    }
   }
+  expect(releaseUploads, 'diagnostic confidentiality eligibility cannot replace validation upload credit').toBeGreaterThan(0);
   return dispatches;
 }
 
@@ -662,7 +713,7 @@ it('CP-044/CI-CAPTURE every current hosted job captures commands before a final 
 
 it('CP-044/CI-CAPTURE dispatcher selection still refuses unwrapped suites late capture missing final verification and unsafe uploads', () => {
   const run = { run: 'node scripts/ci-platform.mjs --os "${{ matrix.os }}" --node "${{ matrix.node }}" --shard "${{ matrix.shard }}"' };
-  const verify = { run: 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"', if: 'always()' };
+  const verify = { id: 'capture-verify', run: 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"', if: 'always()' };
   const upload = { uses: `actions/upload-artifact@${'a'.repeat(40)}`, if: "always() && steps.capture-verify.outcome == 'success'",
     with: { path: '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json', 'if-no-files-found': 'error' } };
   expect(hostedCapture('test', [run, verify, upload])).toBe(true);
@@ -672,10 +723,51 @@ it('CP-044/CI-CAPTURE dispatcher selection still refuses unwrapped suites late c
     [{ run: `${run.run}\nnpm test` }, verify, upload],
     [{ run: `${run.run}; node unrelated.mjs` }, verify, upload],
     [run, upload], [run, { ...verify, if: 'success()' }, upload],
+    [run, { ...verify, if: 'always() && false' }, upload], [run, { ...verify, 'continue-on-error': true }, upload],
+    [run, { ...verify, run: `echo ${verify.run}` }, upload],
     [run, upload, verify], [run, verify, { ...upload, if: 'always()' }],
     [run, verify, { ...upload, with: { ...upload.with, path: '${{ env.FLUXWARDEN_SENTINEL_DIR }}' } }],
   ]) expect(() => hostedCapture('test', steps)).toThrow();
   expect(() => hostedCapture('lab', [run, verify, upload]), 'live jobs cannot use the platform delegation exception').toThrow();
+});
+
+it('CP-044/CI-CAPTURE exact always-run composed verification seals preserve legacy checks and cannot borrow diagnostic credit', () => {
+  const verify = { id: 'capture-verify', if: 'always()', run: 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"' };
+  const upload = { uses: `actions/upload-artifact@${'a'.repeat(40)}`, if: "always() && steps.report-seal.outcome == 'success'",
+    with: { path: '${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/report.json', 'if-no-files-found': 'error' } };
+  for (const name of ['test', 'lab', 'chaos']) {
+    const run = { run: name === 'test' ? 'node scripts/ci-platform.mjs --os "${{ matrix.os }}" --node "${{ matrix.node }}" --shard "${{ matrix.shard }}"'
+      : `node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- npm run test:${name}` };
+    const key = name === 'test' ? 'platform/${{ matrix.os }}/${{ matrix.node }}/${{ matrix.shard }}' : `live/${name}`;
+    const seal = { id: 'report-seal', if: 'always()', run: `node scripts/release-ci.mjs seal --key "${key}"` };
+    expect(hostedCapture(name, [run, seal, upload])).toBe(name === 'test');
+    expect(hostedCapture(name, [run, verify, { ...seal, if: "always() && steps.capture-verify.outcome == 'success'" },
+      { ...upload, if: "always() && steps.capture-verify.outcome == 'success' && steps.report-seal.outcome == 'success'" }])).toBe(name === 'test');
+    for (const steps of [
+      [run, upload], [run, { ...seal, run: `echo ${seal.run}` }, upload],
+      [run, { ...seal, run: 'node scripts/release-ci.mjs seal --key live/unrelated' }, upload],
+      [run, { ...seal, run: `${seal.run} || true` }, upload],
+      [run, { ...seal, if: 'success()' }, upload], [run, { ...seal, if: 'always() && false' }, upload],
+      [run, { ...seal, if: "always() && steps.capture-verify.outcome == 'success'" }, upload],
+      [run, { ...seal, 'continue-on-error': true }, upload], [seal, run, upload], [run, upload, seal],
+      [run, seal, { ...upload, if: "always() && steps.capture-verify.outcome == 'success'" }],
+      [run, seal, { ...upload, if: "always() || steps.report-seal.outcome == 'success'" }],
+    ]) expect(() => hostedCapture(name, steps)).toThrow();
+    const metadata = { id: 'capture-metadata', if: 'always()', run: 'node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"' };
+    const diagnostic = { ...upload, if: "always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'",
+      with: { ...upload.with, path: '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json' } };
+    expect(hostedCapture(name, [run, seal, upload, metadata, diagnostic])).toBe(name === 'test');
+    expect(() => hostedCapture(name, [run, seal, metadata, diagnostic]), 'diagnostics alone provide no release credit').toThrow();
+    expect(() => hostedCapture(name, [run, seal, metadata, { ...upload, if: diagnostic.if }]), 'diagnostic eligibility cannot publish release reports').toThrow();
+    expect(() => hostedCapture(name, [run, seal, upload, metadata, { ...diagnostic, if: "always() && steps.capture-metadata.outcome == 'success'" }]),
+      'diagnostic upload also requires independent confidentiality availability').toThrow();
+  }
+  const unsealed = { run: 'node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- npm test' };
+  const unsealedUpload = { ...upload, if: "success() && steps.capture-verify.outcome == 'success'" };
+  for (const name of ['inventory', 'demo']) {
+    expect(hostedCapture(name, [unsealed, verify, unsealedUpload])).toBe(false);
+    expect(() => hostedCapture(name, [unsealed, unsealedUpload]), 'unsealed producers retain actual standalone verification').toThrow();
+  }
 });
 
 it('CP-044/CI-CAPTURE clean unlisted capture-root files have complete content identity and reject tampering', () => {

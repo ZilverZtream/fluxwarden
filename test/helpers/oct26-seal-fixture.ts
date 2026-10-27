@@ -60,9 +60,14 @@ await sealReport({listJobs:()=>Promise.resolve([{id:4242,name:'live/chaos',head_
   // Clearing an old output directory cannot accidentally satisfy this control.
   writeFileSync(join(source, 'seal-output-transport.mjs'), `import fs from 'node:fs';import fsp from 'node:fs/promises';import {join,resolve} from 'node:path';import {syncBuiltinESMExports} from 'node:module';
 const write=fs.writeFileSync,copy=fs.copyFileSync,asyncWrite=fsp.writeFile,asyncCopy=fsp.copyFile;let planted=false;
-function plant(path){if(planted||resolve(String(path))!==join(process.env.FLUXWARDEN_RELEASE_OUTPUT,'report.json'))return;planted=true;
+const open=fs.openSync,close=fs.closeSync,writeSync=fs.writeSync,descriptors=new Map();
+const filePath=path=>typeof path==='number'?descriptors.get(path):resolve(String(path));
+fs.openSync=function(path,...args){const fd=open.call(this,path,...args);descriptors.set(fd,resolve(String(path)));return fd;};
+fs.closeSync=function(fd,...args){const result=close.call(this,fd,...args);descriptors.delete(fd);return result;};
+function plant(path){if(planted||filePath(path)!==join(process.env.FLUXWARDEN_RELEASE_OUTPUT,'report.json'))return;planted=true;
 write(join(process.env.FLUXWARDEN_RELEASE_OUTPUT,'planted-leak.json'),JSON.stringify({value:fs.readFileSync(process.env.CONTROL_SEAL_SOURCE).toString('hex')}));process.stdout.write('fixture-output-plant\\n');}
 fs.writeFileSync=function(path,...args){const result=write.call(this,path,...args);plant(path);return result;};
+fs.writeSync=function(fd,...args){const result=writeSync.call(this,fd,...args);plant(fd);return result;};
 fs.copyFileSync=function(from,to,...args){const result=copy.call(this,from,to,...args);plant(to);return result;};
 fsp.writeFile=async function(path,...args){const result=await asyncWrite.call(this,path,...args);plant(path);return result;};
 fsp.copyFile=async function(from,to,...args){const result=await asyncCopy.call(this,from,to,...args);plant(to);return result;};syncBuiltinESMExports();

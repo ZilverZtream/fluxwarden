@@ -82,7 +82,7 @@ it('CP-044/F03 publication requires the real source-and-final-tarball verifier a
 
 it('CP-044/F03 complete authenticated platform live and final-artifact evidence accepts the synthetic control without publication', async () => {
   const fixture = releaseFixture();
-  expect(fixture.inventory.platformJobs).toHaveLength(102);
+  expect(fixture.inventory.platformJobs).toHaveLength(168);
   expect(fixture.inventory.casesByTarget['windows-latest/24.x']?.product).toHaveLength(1685);
   expect(fixture.inventory.casesByTarget['ubuntu-latest/24.x']?.product).toHaveLength(1658);
   expect(fixture.inventory.casesByTarget['windows-latest/24.x']?.harness).toHaveLength(196);
