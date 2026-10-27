@@ -267,6 +267,39 @@ export const MIGRATIONS: readonly (readonly string[])[] = [V1, [
   `-- MySQL: BEFORE DELETE trigger with SIGNAL SQLSTATE '45000'; conclusive cleanup keeps its ownership evidence.
   CREATE TRIGGER routing_layers_no_delete BEFORE DELETE ON routing_layers
     BEGIN SELECT RAISE(ABORT, 'routing layer ownership is durable'); END`,
+], [
+  // No legacy backfill: the mutable nodes row cannot prove the identity that owned its history.
+  `-- MySQL: node_id CHAR(26) ascii_bin PRIMARY KEY, implementation ENUM('lnd','cln'), pubkey CHAR(66) ascii
+  CREATE TABLE node_identity_bindings (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id),
+    implementation TEXT NOT NULL CHECK (implementation IN ('lnd','cln')),
+    pubkey TEXT NOT NULL
+  ) STRICT`,
+  `-- MySQL: same AFTER INSERT trigger with INSERT INTO node_identity_bindings.
+  CREATE TRIGGER nodes_bind_identity AFTER INSERT ON nodes BEGIN
+    INSERT INTO node_identity_bindings (node_id, implementation, pubkey) VALUES (NEW.id, NEW.implementation, NEW.expected_pubkey); END`,
+  `-- MySQL: BEFORE UPDATE trigger with SIGNAL SQLSTATE '45000'.
+  CREATE TRIGGER nodes_identity_immutable BEFORE UPDATE OF implementation, expected_pubkey ON nodes
+    WHEN NEW.implementation <> OLD.implementation OR NEW.expected_pubkey <> OLD.expected_pubkey
+    BEGIN SELECT RAISE(ABORT, 'node identity is immutable'); END`,
+  `-- MySQL: BEFORE UPDATE trigger with SIGNAL SQLSTATE '45000'.
+  CREATE TRIGGER node_identity_bindings_no_update BEFORE UPDATE ON node_identity_bindings
+    BEGIN SELECT RAISE(ABORT, 'node identity binding is immutable'); END`,
+  `-- MySQL: BEFORE DELETE trigger with SIGNAL SQLSTATE '45000'.
+  CREATE TRIGGER node_identity_bindings_no_delete BEFORE DELETE ON node_identity_bindings
+    BEGIN SELECT RAISE(ABORT, 'node identity binding is durable'); END`,
+  `-- MySQL: n/a; a duplicate key fails, REPLACE is never used.
+  CREATE TRIGGER node_identity_bindings_no_replace AFTER INSERT ON node_identity_bindings BEGIN
+    SELECT RAISE(ABORT, 'node identity binding is durable') WHERE EXISTS (SELECT 1 FROM append_only_keys
+      WHERE table_name = 'node_identity_bindings' AND key_text = NEW.node_id);
+    INSERT INTO append_only_keys (table_name, key_text) VALUES ('node_identity_bindings', NEW.node_id); END`,
+], [
+  '-- MySQL: same\nALTER TABLE nodes ADD COLUMN fence_epoch INTEGER NOT NULL DEFAULT 0',
+  `-- MySQL: id INTEGER PRIMARY KEY, fence_epoch BIGINT, pending BOOLEAN
+  CREATE TABLE restore_barrier (id INTEGER PRIMARY KEY CHECK (id = 1), fence_epoch INTEGER NOT NULL,
+    pending INTEGER NOT NULL CHECK (pending IN (0,1))) STRICT`,
+  `-- MySQL: node_id CHAR(26) ascii_bin PRIMARY KEY, implementation ENUM('lnd','cln'), pubkey CHAR(66) ascii
+  CREATE TABLE restore_required_nodes (node_id TEXT PRIMARY KEY REFERENCES nodes(id), implementation TEXT NOT NULL, pubkey TEXT NOT NULL) STRICT`,
 ]];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

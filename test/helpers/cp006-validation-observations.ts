@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { reportedCaseName } from '../../labs/scenarios/live-profile.mjs';
 
 export class LabInvalidError extends Error {
   constructor(reason: string) { super(reason); this.name = 'LabInvalidError'; }
@@ -28,6 +29,9 @@ function text(value: unknown): string {
 }
 function number(value: unknown): number {
   requireObservation(typeof value === 'number' && Number.isSafeInteger(value) && value >= 0, 'measured nonnegative integer required'); return value;
+}
+function reporterMilliseconds(value: unknown): number {
+  requireObservation(typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER, 'finite nonnegative original reporter milliseconds required'); return value;
 }
 function interval(value: unknown): Interval {
   const raw = record(value), startedAt = number(raw['startedAt']), finishedAt = number(raw['finishedAt']);
@@ -141,18 +145,29 @@ function verify(input: string | undefined): ValidationSummary {
     const command = matching[0]; requireObservation(command, 'original report command required');
     requireObservation(number(report['startTime']) >= command.startedAt && number(report['startTime']) <= command.finishedAt, 'stale original Vitest report timestamp');
     const files = list(report['testResults']); requireObservation(files.length > 0, 'original Vitest shard must be nonempty');
-    let count = 0;
+    let count = 0, minimumSuites = files.length;
     for (const entry of files) {
       const file = record(entry); requireObservation(file['status'] === 'passed', 'nonpassing original test file');
-      requireObservation(number(file['startTime']) >= command.startedAt && number(file['endTime']) <= command.finishedAt && number(file['endTime']) >= number(file['startTime']), 'test file timestamp outside the original subprocess');
+      requireObservation(reporterMilliseconds(file['startTime']) >= command.startedAt && reporterMilliseconds(file['endTime']) <= command.finishedAt && reporterMilliseconds(file['endTime']) >= reporterMilliseconds(file['startTime']), 'test file timestamp outside the original subprocess');
       const assertions = list(file['assertionResults']); requireObservation(assertions.length > 0, 'original test file has no results');
+      const observedSuites = new Set<string>();
       for (const result of assertions) {
         const assertion = record(result); requireObservation(assertion['status'] === 'passed' && list(assertion['failureMessages']).length === 0, 'skipped pending invalid or failed original case');
-        number(assertion['duration']);
-        actual.push(caseIdentity(sourceRoot, { file: file['name'], fullName: assertion['fullName'] })); ++count;
+        reporterMilliseconds(assertion['duration']);
+        const displayName = reportedCaseName(assertion);
+        const ancestors = assertion['ancestorTitles'] as string[];
+        for (let length = 1; length <= ancestors.length; ++length) {
+          const prefix = ancestors.slice(0, length).filter(title => title !== '');
+          if (prefix.length) observedSuites.add(JSON.stringify(prefix));
+        }
+        actual.push(caseIdentity(sourceRoot, { file: file['name'], fullName: displayName })); ++count;
       }
+      minimumSuites += observedSuites.size;
     }
-    requireObservation(report['numTotalTests'] === count && report['numPassedTests'] === count && report['numTotalTestSuites'] === files.length && report['numPassedTestSuites'] === files.length, 'original Vitest summary disagrees with individual results');
+    const totalSuites = number(report['numTotalTestSuites']), passedSuites = number(report['numPassedTestSuites']);
+    // Reporter suites include describe blocks. Empty/repeated names are not
+    // fully recoverable from assertions; observed structural paths give a minimum.
+    requireObservation(report['numTotalTests'] === count && report['numPassedTests'] === count && totalSuites >= minimumSuites && passedSuites === totalSuites, 'original Vitest summary disagrees with individual results');
     for (const key of ['numFailedTests', 'numPendingTests', 'numTodoTests', 'numFailedTestSuites', 'numPendingTestSuites']) requireObservation(report[key] === 0, 'original report contains failed pending or todo results');
     requireObservation(report['success'] === true, 'original Vitest report did not succeed');
   }

@@ -10,3 +10,5 @@ Use these procedures with disposable regtest nodes. Preserve execution IDs, paym
 - [Lab troubleshooting](lab-troubleshooting.md)
 - [Approval key rotation](key-rotation.md)
 - [Node quarantine](quarantine.md)
+- [State backup and restore](backup-restore.md)
+- [Operational support and capacity observations](../operations.md)

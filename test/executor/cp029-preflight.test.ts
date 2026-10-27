@@ -35,6 +35,12 @@ interface Scenario {
   readonly keys?: readonly string[];
 }
 
+/** Ordinary admitted snapshots use the production controller's database clock.
+ * Explicit snapshot ages supplied by clock-boundary cases remain authoritative. */
+function admittedChannel(base: Base, key: string, peer: string, fields: Partial<ReturnType<typeof fakeChannel>> = {}) {
+  return fakeChannel(key, peer, { observedAt: dbNow(base.path), ...fields });
+}
+
 async function scenario(prefix: string, s: Scenario = {}) {
   const p = await loadPersistence();
   const { prepareExecution } = await loadPreflight();
@@ -44,7 +50,10 @@ async function scenario(prefix: string, s: Scenario = {}) {
   const stored = seedProposal(base, s.proposal ?? {});
   const approval = s.approval?.(stored) ?? stored;
   const policy = policyFor(base, s.policy?.(base) ?? {});
-  const fake = new FakePreflightNode(base.sourceKey, base.targetKey, s.script?.(base) ?? {});
+  const fake = new FakePreflightNode(base.sourceKey, base.targetKey, {
+    channels: () => [admittedChannel(base, base.sourceKey, OUT_PEER), admittedChannel(base, base.targetKey, IN_PEER)],
+    ...s.script?.(base),
+  });
   const db = p.openDatabase(path, { readOnly: false });
   let outcome: PreflightOutcome;
   try {
@@ -178,7 +187,7 @@ it('CP-029/B1 a source left below the reserve floor by principal plus fee cancel
   // Floor 50,000,000 + principal 100,000,000 + approved max fee 200,000 (route fee 200,000, so V8 and INV-14 agree).
   const atFloor = 50_000_000n + PRINCIPAL + APPROVED_MAX_FEE;
   const script = (spendable: bigint) => (base: Base): Partial<Script> => ({
-    channels: () => [fakeChannel(base.sourceKey, OUT_PEER, { spendableMsat: spendable }), fakeChannel(base.targetKey, IN_PEER)],
+    channels: () => [admittedChannel(base, base.sourceKey, OUT_PEER, { spendableMsat: spendable }), admittedChannel(base, base.targetKey, IN_PEER)],
     route: () => circularRoute(base.sourceKey, base.targetKey, APPROVED_MAX_FEE, 80),
   });
   expectCancelled(await scenario('floor-below', { script: script(atFloor - 1n) }), 5, 'RESERVE_FLOOR');
@@ -473,7 +482,7 @@ it('CP-029/B4 a live route whose out-peer is its in-peer (S and T both to one pe
   // Two channels to the same peer: the circle leaves and returns through that one node (lnd#4698).
   expectCancelled(await scenario('v7', {
     script: base => ({
-      channels: () => [fakeChannel(base.sourceKey, OUT_PEER), fakeChannel(base.targetKey, OUT_PEER)],
+      channels: () => [admittedChannel(base, base.sourceKey, OUT_PEER), admittedChannel(base, base.targetKey, OUT_PEER)],
       route: () => ({
         ...circularRoute(base.sourceKey, base.targetKey, 300n, 80),
         inPeer: OUT_PEER,
@@ -504,7 +513,7 @@ it('CP-029/B4 a live route that passes back through our node before the last hop
 
 it('CP-029/B4 a target whose fresh receivable is below the principal cancels with LAST_HOP_RECEIVABLE; exactly the principal passes (V9, INV-14)', async () => {
   const script = (receivable: bigint) => (base: Base): Partial<Script> => ({
-    channels: () => [fakeChannel(base.sourceKey, OUT_PEER), fakeChannel(base.targetKey, IN_PEER, { receivableMsat: receivable })],
+    channels: () => [admittedChannel(base, base.sourceKey, OUT_PEER), admittedChannel(base, base.targetKey, IN_PEER, { receivableMsat: receivable })],
   });
   expectCancelled(await scenario('v9-below', { script: script(PRINCIPAL - 1n) }), 5, 'LAST_HOP_RECEIVABLE');
   expect((await scenario('v9-at', { script: script(PRINCIPAL) })).outcome.kind).toBe('READY');
@@ -570,7 +579,7 @@ for (const d of routeDefects) {
 
 it('CP-029/B4 a target channel that is not ACTIVE in the fresh snapshot cancels with NO_FEASIBLE_ROUTE (V12)', async () => {
   expectCancelled(await scenario('v12-target', {
-    script: base => ({ channels: () => [fakeChannel(base.sourceKey, OUT_PEER), fakeChannel(base.targetKey, IN_PEER, { state: 'INACTIVE', nodeState: 'inactive' })] }),
+    script: base => ({ channels: () => [admittedChannel(base, base.sourceKey, OUT_PEER), admittedChannel(base, base.targetKey, IN_PEER, { state: 'INACTIVE', nodeState: 'inactive' })] }),
   }), 5, 'NO_FEASIBLE_ROUTE');
 });
 
@@ -616,6 +625,7 @@ it('CP-029/B1 a busy database during preflight never strands the execution in PR
   let locker: ReturnType<typeof spawn> | undefined;
   try {
     const fake = new FakePreflightNode(base.sourceKey, base.targetKey, {
+      channels: () => [admittedChannel(base, base.sourceKey, OUT_PEER), admittedChannel(base, base.targetKey, IN_PEER)],
       during: {
         // The lock outlives one busy timeout (300 ms) but not two.
         findCircularRoute: () => new Promise<void>((resolve, reject) => {

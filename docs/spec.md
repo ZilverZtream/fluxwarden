@@ -97,6 +97,8 @@ Planning checks active channels, exclusions, cooldowns, budget and unresolved co
 
 ## Commands and options
 
+`liquidity diagnose` and `liquidity plan` require `--node <name>` when more than one node is configured. Omitting it refuses with exit 2 before contacting any node. A configuration containing one node selects it by default.
+
 Top-level `fluxwarden --help` and `fluxwarden --version` need no configuration and exit 0. --json requests one schema-1 document. Missing or unreadable configuration is exit 2 for configured non-execution commands. Invalid arguments or environment settings remain exit 2. Command-specific help is not a separate interface.
 
 For `actions execute`, after valid argument and environment checks, missing, unreadable or malformed required configuration yields `SAFETY_REFUSAL` (exit 5) before credential or node access. An absent selected node, approval public key or execution credential also yields exit 5 before node contact. Configured non-regtest networks, including unknown network labels, yield the network-lock safety refusal.
@@ -106,6 +108,9 @@ For `actions execute`, after valid argument and environment checks, missing, unr
 | `fluxwarden doctor` | Check runtime, database and configured nodes. |
 | `fluxwarden nodes list` | Read stored node rows without contacting nodes. |
 | `fluxwarden nodes inspect <name> --capabilities` | Handshake and report capabilities. |
+| `fluxwarden nodes recover <name>` | Fresh original-node verification and same-node reconciliation before lifting quarantine. |
+| `fluxwarden state backup --out <new-bundle>` | Consistent SQLite backup with the original signing key, retained run records, signed alerts and integrity manifest. |
+| `fluxwarden state restore --from <bundle>` | Verify and restore to an absent private state directory; admission awaits full reconciliation. |
 | `fluxwarden channels --node <name> --sort inbound-deficit` | Collect channel snapshots and show liquidity; sort also accepts outbound or capacity. |
 | `fluxwarden liquidity diagnose --node <name> --horizon 1h` | Compare snapshots and targets. |
 | `fluxwarden liquidity plan --node <name> --policy policy.yaml --refresh` | Refresh snapshots and store proposals; --horizon overrides the demand horizon. |
@@ -154,15 +159,17 @@ Output schemas: [doctor](../schemas/output/doctor.schema.json), [node list](../s
 
 An Ed25519 approval signs the exact proposal and policy digests, approved fee and CLTV caps, expiry, nonce and key_id. key_id is the leading 16 bytes of SHA-256 of the raw public key. Tokens are at most 4 KiB. Nonces authorize one claim. Removing a key invalidates its unclaimed approvals.
 
-Execution progresses through CLAIMED, PREFLIGHT, SUBMITTING, IN_FLIGHT and either VERIFIED_SUCCESS, VERIFIED_FAILURE or UNKNOWN. Database-clock leases carry fence_epoch. Fenced mutations increment the epoch; a lost lease stops further work. Preflight checks identity, regtest, capability, snapshot freshness, budget, route, fee, CLTV, reserves and receiver capacity. Paths use distinct channel IDs and distinct endpoint peers; MPP and AMP are refused. After SUBMITTING an intent is never sent again.
+Execution progresses through CLAIMED, PREFLIGHT, SUBMITTING, IN_FLIGHT and either VERIFIED_SUCCESS, VERIFIED_FAILURE or UNKNOWN. Database-clock leases carry fence_epoch. Fenced mutations increment the epoch; a lost lease stops work on that execution, while reconciliation continues with unrelated candidates. Preflight checks identity, regtest, capability, snapshot freshness, budget, route, fee, CLTV, reserves and receiver capacity. Paths use distinct channel IDs and distinct endpoint peers; MPP and AMP are refused. After SUBMITTING an intent is never sent again.
 
 Success requires a preimage matching the persisted payment hash. A failure field cannot override that evidence. A failed payer observation with an HTLC in flight remains unresolved. Receiver invoice cancellation or deletion is required before declaring a failed unpaid attempt. NOT_FOUND is a lookup result, not proof of failure: cancel the unpaid invoice, read the payer again and wait at least the 120s submission window. A timeout does not prove terminal failure.
 
 Journal posting shares the state-transition transaction. Send moves principal plus route fee into clearing:inflight. Success moves principal to the receiver and actual fees to expense:routing_fees; differences use recon:difference. Failure reverses a send journal. Debits equal credits in exact msat arithmetic; duplicate events post once. An invariant error rolls back the entire transition. Correct history through reversing entries, never by editing old journals.
 
-The full daemon automatically sweeps expired CLAIMED/PREFLIGHT leases and cancels expired approvals before dispatch. It bootstraps persistent HMAC-signed alerts and reconciles by stored hash. Follow [stuck lease recovery](runbooks/stuck-lease.md) without editing execution rows.
+The full daemon automatically sweeps expired CLAIMED/PREFLIGHT leases and cancels expired approvals before dispatch. It bootstraps persistent HMAC-signed alerts and reconciles by stored hash. Each completed recovery operation releases its lease through a fenced write, leaving payment status and reservations unchanged. Recovery exits 4, 7 and 9 produce bounded warnings naming the affected node and are retried on later collection cycles. Exit 8, including an alert persistence failure, stops the daemon with exit 8. Other recovery refusals stop with their reported code. Follow [stuck lease recovery](runbooks/stuck-lease.md) without editing execution rows.
 
 ## Evidence and release validation
+
+State recovery is separate from public evidence export: backup bundles deliberately retain the private alert signing key and exact run sidecars. Restore installs a persistent approval/execution barrier. Only a successful full pinned reconciliation of every restored required node clears it; selected-node and failed passes cannot clear it. See [backup and restore](runbooks/backup-restore.md) for destination layout and failure handling.
 
 Evidence export writes manifest.json, topology-before.json, topology-after.json, proposals.json, execution-trace.ndjson, ledger-audit.json, reconciliation.json, chaos-results.json and checksums.sha256. Repeated exports of the same recorded run are deterministic. Credentials, payment secrets and preimages are removed. The manifest records the package version, build-time git commit, observed node versions and SHA-256 fingerprints of the loaded credential and certificate bytes. Missing build provenance is marked unavailable. The unavailable_evidence map explains why container image digests, simulation seeds and chaos scenario ids are absent from ordinary reconciliation runs; the node RPC does not provide container provenance.
 

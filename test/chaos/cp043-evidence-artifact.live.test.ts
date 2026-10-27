@@ -8,6 +8,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect,it } from 'vitest';
+import { qualifyReference } from '../../labs/scenarios/chaos/owned-reference.mjs';
+import { readRetainedDemoRuntime } from '../../labs/scenarios/live-profile.mjs';
 
 type Row=Record<string,unknown>;
 function row(value:unknown):Row{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('GAP CP-043 artifact object unavailable');return value as Row;}
@@ -16,10 +18,13 @@ function json(path:string):Row{return row(JSON.parse(readFileSync(path,'utf8')) 
 
 it('CP-043/B1 actual full-demo export binds known owner image pins and observed T-05 recovery into its bundle',()=>{
   const handoffPath=process.env['FLUXWARDEN_DEMO_HANDOFF'];if(!handoffPath)throw new Error('GAP CP-043 explicit retained demo handoff required');
-  const handoff=json(handoffPath),owner=json(String(handoff['owner'])),runtime=json(join(String(owner['runtimeRoot']),'lab.json'));
+  const handoff=json(handoffPath),{owner,runtime}=readRetainedDemoRuntime(handoff);
   const bundle=process.env['FLUXWARDEN_DEMO_BUNDLE']??String(handoff['bundle']),manifest=json(join(bundle,'manifest.json'));
   const actual=json(String(handoff['actualT05Path'])),native=json(String(handoff['nativeHistoryPath'])),verification=json(String(handoff['verificationPath']));
-  const project='fluxwarden-lab-demo-final-20261014';expect(owner['project']).toBe(project);expect(runtime['project']).toBe(project);expect(native['project']).toBe(project);
+  // D29: a new exclusively owned allocation has new names/ports. Historical
+  // project literals are provenance of older runs, not the current oracle.
+  qualifyReference(owner,runtime);
+  const project=String(owner['project']);expect(project).toMatch(/^fluxwarden-lab-[a-z0-9-]+$/);expect(runtime['project']).toBe(project);expect(native['project']).toBe(project);
   const resources=records(native['resources']),services=['bitcoind','lnd-p','lnd-r','cln-p','cln-r','cln-m','toxiproxy'];
   expect(resources.map(v=>String(v['service'])).sort()).toEqual([...services].sort());
   const pins=row(runtime['images']),expectedDigests=new Set<string>();

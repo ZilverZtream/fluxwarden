@@ -1,0 +1,9 @@
+{
+  "baseline": "143019c4792434c07d63eafd2dae1bb7ea074597",
+  "schemaVersion": 4,
+  "source": "src/persistence/schema.ts",
+  "sourceSha256": "03e1911da75d4b309e5fa6b3f89f901fdea4ba23c9564123de07febabbd43b77",
+  "fixtureSha256": "54973462f38817f013c3a5944224d50dd67c71fafccdd0535aa0edf7ff2f61d2",
+  "containsRecords": false,
+  "purpose": "Frozen pre-upgrade schema for original-identity provenance regression. Scenario records and historical overwrite are created only in owned private scratch."
+}

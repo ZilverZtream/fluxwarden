@@ -8,7 +8,7 @@ import { createPrivateDirectory } from './private-scratch.mjs';
 import { findLeaks } from './leak-check.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const topLevel = new Set(['package.json', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md']);
+const topLevel = new Set(['package.json', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md', 'NOTICE-SOURCE-REUSE.md']);
 const buildMetadata = 'dist/evidence/build-info.json';
 
 export function inspectTarball(path) {

@@ -20,6 +20,7 @@ import { recoverPreflight } from '../executor/preflight.js';
 import { randomUUID } from 'node:crypto';
 import { nodeFailure } from '../commands/handshake.js';
 import { runLab } from './lab.js';
+import { stateWorkflow } from '../commands/state.js';
 
 export interface Deps {
   readonly output: Output;
@@ -78,6 +79,7 @@ function run(command: Command, deps: Deps): number | Promise<number> {
   if (refusal !== null) return refuse(io, command.kind, ExitCode.INVALID_INPUT, 'environment', refusal);
   // No node is contacted, so connection settings play no part.
   if (command.kind === 'keys generate') return keysGenerate(command.out, command.json, deps.output);
+  if (command.kind === 'state backup' || command.kind === 'state restore') return stateWorkflow(command, io);
   if (command.kind.startsWith('lab ')) {
     const controller = new AbortController();
     deps.onGracefulStop?.(() => { controller.abort(); });
@@ -98,6 +100,7 @@ function run(command: Command, deps: Deps): number | Promise<number> {
     case 'daemon':
       return daemon(command, deps, io);
     case 'reconcile':
+    case 'nodes recover':
     case 'evidence export':
       return recoveryWorkflow(command, io, env);
     default: {
@@ -121,6 +124,7 @@ async function daemon(command: Command, deps: Deps, io: Io): Promise<number> {
 
 async function collectDaemon(command: Command, deps: Deps, io: Io, controller: AbortController, output: RenderOutput): Promise<number> {
   const silent: Io = { json: true, output: { write: () => undefined, wrote: () => false } };
+  const recovery: { exitCode: number | null } = { exitCode: null };
   let alerts: ReturnType<typeof bootstrapAlerts> | undefined;
   if (command.kind === 'daemon' && !command.collect) {
     try {
@@ -156,14 +160,29 @@ async function collectDaemon(command: Command, deps: Deps, io: Io, controller: A
         try { await recoverPreflight({ db, workerId: randomUUID(), leaseMs: 60_000 }); } finally { db.close(); }
         for (const node of cycle.nodes) {
           if (node.state !== 'ONLINE' || stopped()) continue;
-          await recoveryWorkflow({ ...command, kind: 'reconcile', node: node.name, since: null, until: null }, silent, deps.env ?? {}, alerts);
+          let code: number;
+          try {
+            code = await recoveryWorkflow({ ...command, kind: 'reconcile', node: node.name, since: null, until: null }, silent, deps.env ?? {}, alerts);
+          } catch {
+            // Alert persistence failures and other internal errors stop the safety loop.
+            code = ExitCode.INVARIANT_BREACH;
+          }
+          if (code !== ExitCode.SUCCESS) {
+            await output.write(`fluxwarden daemon: warning recovery-failed ${node.name} (exit ${String(code)})\n`, { stream: 'stderr' });
+            if (code !== ExitCode.NODE_UNREACHABLE && code !== ExitCode.OUTCOME_UNKNOWN && code !== ExitCode.RECONCILIATION_ALERT) {
+              recovery.exitCode = code;
+              controller.abort();
+              break;
+            }
+          }
         }
       }
     } }),
   });
+  const exitCode = recovery.exitCode ?? result.exitCode;
   if (command.json) {
-    const error = result.exitCode === ExitCode.SUCCESS ? null : { code: result.exitCode, step: null, message: 'the collector stopped; see the lines on stderr' };
+    const error = exitCode === ExitCode.SUCCESS ? null : { code: exitCode, step: null, message: 'the collector stopped; see the lines on stderr' };
     deps.output.write('stdout', renderEnvelope(envelope('daemon', { cycles: result.cycles }, error)));
   }
-  return result.exitCode;
+  return exitCode;
 }

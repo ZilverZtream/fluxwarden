@@ -5,7 +5,7 @@
 // Interface:
 // - `npm run build` then `npm pack` (scripts allowed, so a `prepack` clean build is honoured) yields
 //   `fluxwarden-<version>.tgz` holding only package.json, README.md, LICENSE, SECURITY.md,
-//   CHANGELOG.md and compiled files under dist/ (`.js`, `.d.ts`, and their `.map` files), each
+//   CHANGELOG.md, NOTICE-SOURCE-REUSE.md (October 26 audit F09), and compiled files under dist/ (`.js`, `.d.ts`, and their `.map` files), each
 //   compiled from a file under src/ of the same relative path, plus dist/evidence/build-info.json
 //   containing only the build's git commit; the installed package.json supplies its version.
 // - `npm install --global --prefix <dir> --ignore-scripts --offline <tgz>` installs a working
@@ -29,6 +29,7 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { asRecord, childEnv, isRecord, readJson, readText, repoRoot } from '../helpers/cli.js';
 import { testRoot } from '../helpers/env.js';
 import { parseYaml, type Yaml } from '../helpers/yaml.js';
+import { proveChaosUpload } from '../helpers/oct26-chaos-upload.js';
 import { unlinkFixture } from '../helpers/fixture-links.js';
 import { count, demo, rows, storedId } from '../helpers/cpw-cli.js';
 import { channel, loadPersistence } from '../helpers/cp015-persistence.js';
@@ -38,7 +39,7 @@ import type { FakeServer } from '../fakes/https.js';
 // Release plan: private validation releases 0.1.0, 0.2.0 and 0.3.0, then the public 1.0.0.
 const RELEASES = ['0.1.0', '0.2.0', '0.3.0', '1.0.0'] as const;
 const ENGINES = '^22.23.2 || ^24.18.1 || >=26.5.1';
-const TOP_LEVEL = ['CHANGELOG.md', 'LICENSE', 'README.md', 'SECURITY.md', 'package.json'];
+const TOP_LEVEL = ['CHANGELOG.md', 'LICENSE', 'NOTICE-SOURCE-REUSE.md', 'README.md', 'SECURITY.md', 'package.json'];
 const RUNTIME_FIELDS = ['dependencies', 'optionalDependencies', 'peerDependencies', 'bundleDependencies', 'bundledDependencies'];
 const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepare'];
 const BUILD_METADATA = 'dist/evidence/build-info.json';
@@ -443,38 +444,10 @@ it('CP-018/B3 the release workflow runs only for pushed version tags, pins every
   expect(runText(all[indexes[5] ?? -1]), 'the tag is compared with the package version').toMatch(/package\.json|npm pkg get version|\.version\b/);
 });
 
-it('CP-036/B5 the chaos job runs only on dispatch, scans its evidence for leaks and uploads it on every outcome without reading a secret', () => {
-  const wf = map(parseYaml(readText('.github/workflows/ci.yml')), 'ci workflow');
-  expect(Object.keys(map(wf['on'], 'on'))).toContain('workflow_dispatch');
-  const chaos = map(map(wf['jobs'], 'jobs')['chaos'], 'chaos');
-  expect(String(chaos['if'])).toMatch(/github\.event_name\s*==\s*'workflow_dispatch'/);
-  if (chaos['permissions'] !== undefined) expect(chaos['permissions']).toEqual({ contents: 'read' });
-  expect(JSON.stringify(chaos)).not.toMatch(/secrets\./);
-  const all = steps(chaos, 'chaos');
-  const run = firstIndex(all, /\bnpm run test:chaos\b/);
-  const scan = firstIndex(all, /\bscripts\/leak-check\.mjs\b/);
-  const upload = all.findIndex(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
-  expect(run, 'chaos run').toBeGreaterThanOrEqual(0);
-  if (scan === run) {
-    const command = runText(all[run]);
-    const chaosCommand = command.indexOf('npm run test:chaos');
-    const finalStage = command.indexOf('--finally');
-    const scannerCommand = command.indexOf('scripts/leak-check.mjs');
-    expect(command, 'one finite capture contains the actual ordered job commands').toMatch(/scripts\/ci-capture\.mjs\b.*\s--\s+node scripts\/ci-job\.mjs\b/);
-    expect(finalStage, 'scanner is an unconditional final command after chaos, including a failed chaos exit').toBeGreaterThan(chaosCommand);
-    expect(scannerCommand, 'the actual unchanged scanner follows the final-stage delimiter').toBeGreaterThan(finalStage);
-    expect(command.slice(finalStage), 'final stage executes the unchanged scanner directly').toMatch(/^--finally node scripts\/leak-check\.mjs\b/);
-  } else expect(scan, 'separate leak scan step follows the run').toBeGreaterThan(run);
-  expect(upload, 'upload after the scan').toBeGreaterThan(scan);
-  const uploadStep = all[upload] ?? {};
-  expect(String(uploadStep['uses'])).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
-  expect(String(uploadStep['if'])).toMatch(/\balways\(\)/);
-  const uploaded = String(map(uploadStep['with'], 'upload.with')['path']).trim();
-  expect(uploaded.length).toBeGreaterThan(0);
-  // Lab runtime state holds credential paths and node material; it is never uploaded.
-  expect(uploaded).not.toMatch(/\.runtime|labs\/?$|\bsentinels?\b/);
-  const evidenceVariable = (value: string): string => value.replace(/\$\{\{\s*env\.FLUXWARDEN_EVIDENCE_DIR\s*\}\}/g, '$FLUXWARDEN_EVIDENCE_DIR');
-  expect(evidenceVariable(runText(all[scan])), 'the scan covers the uploaded path').toContain(evidenceVariable(uploaded.split(/\r?\n/)[0] ?? ''));
+it('CP-036/B5 the chaos job retains unconditional full scanning and independently verified bounded uploads with minimal read permissions', () => {
+  const workflow = asRecord(parseYaml(readText('.github/workflows/ci.yml')), 'ci workflow');
+  const chaos = asRecord(asRecord(workflow['jobs'], 'jobs')['chaos'], 'chaos');
+  proveChaosUpload(workflow, chaos);
 });
 
 function releaseSections(text: string): { version: string; date: string; body: string }[] {

@@ -4,5 +4,5 @@
     "rootDir": ".",
     "noEmit": true
   },
-  "include": ["test/**/*.ts", "vitest*.config.ts", "labs/scenarios/chaos/*.d.mts"]
+  "include": ["test/**/*.ts", "vitest*.config.ts", "labs/scenarios/**/*.d.mts"]
 }

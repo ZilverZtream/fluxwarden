@@ -24,8 +24,10 @@ beforeAll(() => {
   mkdirSync(join(source, 'dist/cli'), { recursive: true });
   mkdirSync(join(source, 'dist/evidence'));
   writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'fluxwarden', version: '9.8.7',
-    type: 'module', bin: { fluxwarden: 'dist/cli/bin.js' }, files: ['dist', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md'] }));
+    type: 'module', bin: { fluxwarden: 'dist/cli/bin.js' }, files: ['dist', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md', 'NOTICE-SOURCE-REUSE.md'] }));
   for (const name of ['README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md']) writeFileSync(join(source, name), 'Synthetic offline smoke fixture.\n');
+  // Audit F09: a valid smoke fixture must carry the actual upstream reuse notice.
+  writeFileSync(join(source, 'NOTICE-SOURCE-REUSE.md'), readFileSync(join(repoRoot, 'NOTICE-SOURCE-REUSE.md')));
   writeFileSync(join(source, 'dist/evidence/build-info.json'), JSON.stringify({ gitCommit: 'a'.repeat(40) }));
   writeFileSync(join(source, 'dist/cli/bin.js'), `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';

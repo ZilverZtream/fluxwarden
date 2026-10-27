@@ -29,6 +29,9 @@ export type Command =
   | Common & { readonly kind: 'lab chaos'; readonly caseId: string | null; readonly seed: string | null }
   | Common & { readonly kind: 'doctor' }
   | Common & { readonly kind: 'nodes list' }
+  | Common & { readonly kind: 'nodes recover'; readonly node: string }
+  | Common & { readonly kind: 'state backup'; readonly out: string }
+  | Common & { readonly kind: 'state restore'; readonly from: string }
   | Common & { readonly kind: 'nodes inspect'; readonly node: string; readonly capabilities: boolean }
   | Common & { readonly kind: 'channels'; readonly node: string | null; readonly sort: SortKey | null }
   | Common & { readonly kind: 'daemon'; readonly collect: boolean }
@@ -50,7 +53,7 @@ export type Parsed =
 
 export const DEFAULT_CONFIG = 'fluxwarden.yaml';
 
-const COMMANDS = new Set(['doctor', 'nodes', 'channels', 'daemon', 'keys', 'liquidity', 'actions', 'ledger', 'reconcile', 'evidence', 'lab']);
+const COMMANDS = new Set(['doctor', 'nodes', 'state', 'channels', 'daemon', 'keys', 'liquidity', 'actions', 'ledger', 'reconcile', 'evidence', 'lab']);
 /** Options taking a value, by command name; every command takes --config and the connection flags. */
 const VALUE_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   'lab up': ['--seed'], 'lab down': [], 'lab workload': ['--type', '--count', '--seed'], 'lab chaos': ['--case', '--seed'],
@@ -58,6 +61,7 @@ const VALUE_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   'liquidity diagnose': ['--node', '--horizon'], 'liquidity plan': ['--node', '--horizon', '--policy'], 'liquidity explain': [],
   'liquidity approve': ['--key', '--max-fee-msat', '--max-cltv-delta', '--expires-in'], 'actions execute': [], 'actions status': [],
   'ledger verify': [], reconcile: ['--node', '--since', '--until'], 'evidence export': ['--run-id', '--out'],
+  'state backup': ['--out'], 'state restore': ['--from'], 'nodes recover': [],
 };
 const SWITCHES: Readonly<Record<string, readonly string[]>> = {
   'lab up': [], 'lab down': [], 'lab workload': [], 'lab chaos': ['--all'],
@@ -96,7 +100,7 @@ export function parseArgs(argv: readonly string[]): Parsed {
   if (!first.operand || !COMMANDS.has(first.text)) return { kind: 'usage', json, command: null, reason: first.operand ? 'unknown command' : 'unknown option' };
   let name = first.text;
   let rest = tokens.slice(1);
-  if (['nodes', 'liquidity', 'actions', 'ledger', 'evidence', 'lab'].includes(name)) {
+  if (['nodes', 'state', 'liquidity', 'actions', 'ledger', 'evidence', 'lab'].includes(name)) {
     const sub = rest[0];
     if (sub === undefined || !sub.operand) return { kind: 'usage', json, command: null, reason: 'missing command' };
     if (VALUE_OPTIONS[`${name} ${sub.text}`] === undefined) return { kind: 'usage', json, command: null, reason: 'unknown command' };
@@ -153,6 +157,24 @@ function commandFrom(name: string, tokens: readonly { text: string; operand: boo
   );
   const common: Common = { json, config: values.get('--config') ?? DEFAULT_CONFIG, connection };
   switch (name) {
+    case 'state backup': {
+      if (operands.length !== 0) throw new Usage('unexpected operand');
+      const out = values.get('--out');
+      if (out === undefined) throw new Usage('missing option value');
+      return { ...common, kind: name, out };
+    }
+    case 'state restore': {
+      if (operands.length !== 0) throw new Usage('unexpected operand');
+      const from = values.get('--from');
+      if (from === undefined) throw new Usage('missing option value');
+      return { ...common, kind: name, from };
+    }
+    case 'nodes recover': {
+      const node = operands[0];
+      if (node === undefined) throw new Usage('missing operand');
+      if (operands.length > 1) throw new Usage('unexpected operand');
+      return { ...common, kind: name, node };
+    }
     case 'lab up':
     case 'lab down':
       if (operands.length > 0) throw new Usage('unexpected operand');

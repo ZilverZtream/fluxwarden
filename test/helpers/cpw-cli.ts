@@ -197,7 +197,7 @@ export async function prepareDemoFixtures(): Promise<DemoFixtures> {
   return Object.freeze({ database, key: Object.freeze(key) });
 }
 
-function copyDemoFixture(source: string, destination: string): void {
+export function copyDemoFixture(source: string, destination: string): void {
   copyFileSync(source, destination, constants.COPYFILE_EXCL);
   if (process.platform !== 'win32') return;
   // The parent already grants only the owner access. Keep that entry explicitly and protect the copy's DACL.
