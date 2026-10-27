@@ -5,7 +5,7 @@
 // and scanned output are publishable; original source bytes remain private.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, statSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
@@ -113,6 +113,114 @@ process.exitCode = ${String(exitCode)};
     receipt() { return asRecord(JSON.parse(readFileSync(join(capture, 'receipt.json'), 'utf8')) as unknown, 'safe receipt'); },
   };
 }
+
+function metadataNamespace(f: ReturnType<typeof fixture>): unknown[] {
+  const walk = (path: string): string[] => [path, ...(lstatSync(path).isDirectory()
+    ? readdirSync(path).flatMap(name => walk(join(path, name))) : [])];
+  return [f.root, f.sourceRoot, f.scratch, f.evidence, f.capture, f.temp].flatMap(walk).map(path => {
+    const info = lstatSync(path, { bigint: true });
+    return { pathSha256: digest(path), dev: String(info.dev), ino: String(info.ino), mode: String(info.mode), nlink: String(info.nlink),
+      mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs), sha256: info.isFile() ? digest(readFileSync(path)) : null };
+  });
+}
+
+function safeMetadata(f: ReturnType<typeof fixture>, extraEnv: NodeJS.ProcessEnv = {}) {
+  // This output destination is outside every sealed invocation scope.
+  const outputRoot = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ci-safe-metadata-output-'));
+  const output = join(outputRoot, 'github-output.txt'), before = metadataNamespace(f);
+  const result = spawnSync(process.execPath, ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-safe-capture-metadata.mjs'),
+    '--root', f.root, '--capture-dir', f.capture]), { cwd: f.root, env: { ...f.env, ...extraEnv, GITHUB_OUTPUT: output },
+    encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  expect(result.error === undefined, 'metadata attestation completes within the existing capture command budget').toBe(true);
+  expect(result.signal).toBeNull(); expect(result.status).not.toBeNull();
+  const githubOutput = existsSync(output) ? readFileSync(output, 'utf8') : '';
+  expect(metadataNamespace(f), 'diagnostic eligibility cannot rewrite any original sealed namespace or receipt').toEqual(before);
+  expect(readdirSync(outputRoot), 'the helper creates no diagnostic export or copied private artifact').toEqual(existsSync(output) ? ['github-output.txt'] : []);
+  const published = Buffer.from(result.stdout + result.stderr + githubOutput);
+  const sources = [f.seed, f.macaroon, f.macaroon.subarray(1), f.signature, f.pem, f.der,
+    ...(existsSync(f.runtimeSource) ? [f.runtime] : [])];
+  expect(sources.every(bytes => !published.includes(bytes) && !published.includes(bytes.toString('hex')) && !published.includes(bytes.toString('base64'))),
+    'attestation never emits original source literals through public channels').toBe(true);
+  return { status: result.status, available: githubOutput.split(/\r?\n/).includes('available=true') };
+}
+
+function changeMetadataReceipt(f: ReturnType<typeof fixture>, change: (receipt: Record<string, unknown>) => void): void {
+  const receipt = f.receipt(); change(receipt);
+  const bytes = Buffer.from(JSON.stringify(receipt)), sidecarPath = join(f.capture, 'receipt.sha256');
+  const sidecar = asRecord(JSON.parse(readFileSync(sidecarPath, 'utf8')) as unknown, 'existing closed receipt sidecar');
+  sidecar['receiptSha256'] = digest(bytes);
+  // Keep the existing stable ordinary files and all other sidecar identities.
+  writeFileSync(join(f.capture, 'receipt.json'), bytes); writeFileSync(sidecarPath, JSON.stringify(sidecar));
+}
+
+it('CP-044/CI-SAFE-METADATA diagnostic availability preserves both normal verification and original failed-policy refusal', () => {
+  for (const leak of [false, true]) {
+    const f = fixture(); if (leak) f.script("process.stdout.write(bytes.toString('hex'))");
+    const result = f.invoke(); expect(result.error).toBeUndefined();
+    expect(result.status === 0).toBe(!leak);
+    expect(f.receipt()['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: !leak, policySatisfied: !leak });
+    const before = f.invoke(true); expect(before.status === 0).toBe(!leak);
+    expect(safeMetadata(f)).toEqual({ status: 0, available: true });
+    expect(f.invoke(true).status === 0, 'diagnostic availability never converts a rejected capture into accepted validation').toBe(!leak);
+  }
+});
+
+it('CP-044/CI-SAFE-METADATA absent unclosed mismatched linked and source-incomplete receipts never become available', () => {
+  for (const mode of ['missing', 'unclosed', 'mismatched', 'linked', 'source-incomplete']) {
+    const f = fixture();
+    if (mode !== 'missing') {
+      expect(f.invoke().status, 'each integrity fault starts with an actual closed clean capture').toBe(0);
+      if (mode === 'unclosed') changeMetadataReceipt(f, receipt => { asRecord(receipt['result'], 'closed result')['complete'] = false; });
+      if (mode === 'mismatched') appendFileSync(join(f.capture, 'receipt.json'), '\n');
+      if (mode === 'linked') {
+        const aliasRoot = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ci-linked-metadata-'));
+        linkSync(join(f.capture, 'receipt.json'), join(aliasRoot, 'receipt-alias.json'));
+      }
+      if (mode === 'source-incomplete') rmSync(join(f.capture, 'private/sources', digest(f.runtime)));
+    }
+    const metadata = safeMetadata(f);
+    expect(metadata.available, 'integrity refusal cannot authorize diagnostic upload').toBe(false);
+    expect(metadata.status !== 0, 'unavailable metadata fails closed with an actual process exit').toBe(true);
+  }
+});
+
+it('CP-044/CI-SAFE-METADATA a runtime source literal in a rehashed safe-claim receipt cannot hide behind a declaration', () => {
+  const f = fixture(), receiptPath = join(f.capture, 'receipt.json');
+  // This exact deliberate poisoned metadata is outer fixture INPUT only. The
+  // independent metadata attestor receives no authority to exempt its literal.
+  declareFixturePaths([receiptPath]);
+  writeFileSync(join(f.scratch, 'declared-out.txt'), `${receiptPath}\n`, { mode: 0o600 });
+  expect(f.invoke().status).toBe(0);
+  expect(f.receipt()['result']).toMatchObject({ complete: true, leakFree: true, policySatisfied: true });
+  changeMetadataReceipt(f, receipt => { receipt['diagnosticLiteral'] = f.runtime.toString('hex'); });
+  const metadata = safeMetadata(f);
+  expect(metadata.available, 'no testTmp or declaration exemption applies to receipt metadata').toBe(false);
+  expect(metadata.status !== 0).toBe(true);
+});
+
+it('CP-044/CI-SAFE-METADATA unchanged physical source bytes cannot conceal changed Git text normalization', () => {
+  const f = fixture(), candidate = join(f.root, 'candidate.txt');
+  const git = (args: string[]): string => {
+    const result = spawnSync('git', args, { cwd: f.root, env: f.env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    expect(result.status, 'the independent Git normalization witness completes').toBe(0);
+    return result.stdout.trim();
+  };
+  git(['config', 'core.autocrlf', 'false']);
+  writeFileSync(candidate, 'frozen synthetic CRLF candidate\r\n');
+  git(['add', '--', 'candidate.txt']);
+  git(['-c', 'user.name=CI normalization fixture', '-c', 'user.email=fixture@invalid', '-c', 'commit.gpgsign=false',
+    'commit', '--quiet', '-m', 'tracked original CRLF source']);
+  const physicalSha256 = digest(readFileSync(candidate));
+  const originalNormalized = git(['hash-object', '--path=candidate.txt', 'candidate.txt']);
+  expect(f.invoke().status, 'the genuine CRLF capture is clean before interpretation changes').toBe(0);
+  writeFileSync(join(f.root, '.git/info/attributes'), 'candidate.txt text eol=lf\n');
+  expect(digest(readFileSync(candidate)), 'the original physical source bytes remain untouched').toBe(physicalSha256);
+  expect(git(['hash-object', '--path=candidate.txt', 'candidate.txt']), 'Git now interprets the same source under a different normalized identity')
+    .not.toBe(originalNormalized);
+  const metadata = safeMetadata(f);
+  expect(metadata.available, 'physical read-set equality cannot replace original Git interpretation parity').toBe(false);
+  expect(metadata.status !== 0).toBe(true);
+});
 
 it('CP-044/CI-SENTINELS concurrent fixture registration preserves every immutable source and strict capture provenance', () => {
   const f = fixture();

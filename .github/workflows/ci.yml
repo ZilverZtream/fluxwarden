@@ -49,8 +49,12 @@ jobs:
           name: fluxwarden-final-package
           path: ${{ env.FLUXWARDEN_FINAL_TARBALL }}
           if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
       - name: Retain final-package-capture
-        if: always() && steps.capture-verify.outcome == 'success'
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: final-package-capture
@@ -258,8 +262,12 @@ jobs:
             ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/receipt.json
             ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/capture.json
           if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
       - name: Retain ci-capture-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.shard }}
-        if: always() && steps.capture-verify.outcome == 'success'
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ci-capture-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.shard }}
@@ -330,8 +338,12 @@ jobs:
           path: |
             ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/*.json
           if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
       - name: Retain lab-capture
-        if: always() && steps.capture-verify.outcome == 'success'
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: lab-capture
@@ -400,8 +412,12 @@ jobs:
           path: |
             ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/*.json
           if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
       - name: Retain chaos-capture
-        if: always() && steps.capture-verify.outcome == 'success'
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: chaos-capture

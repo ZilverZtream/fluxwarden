@@ -96,11 +96,16 @@ function scan(paths) {
   check(findLeaks({ root, sentinels: join(root, 'test/sentinels.json'), sentinelDir: process.env.FLUXWARDEN_SENTINEL_DIR,
     testTmp: process.env.FLUXWARDEN_TEST_TMP, evidenceDir: process.env.FLUXWARDEN_EVIDENCE_DIR, paths }) === null);
 }
+let fetchPhase;
 async function fetchCandidate(github) {
+  fetchPhase = 'list-artifacts';
   const source = process.env.GITHUB_SHA, runId = Number(process.env.GITHUB_RUN_ID), artifacts = await github.listArtifacts(runId);
+  fetchPhase = 'authenticate-package';
   const files = await namedArtifact(github, artifacts, 'fluxwarden-final-package', source, runId);
+  fetchPhase = 'validate-package';
   const expected = `fluxwarden-${read(join(root, 'package.json')).version}.tgz`;
   check(files.size === 1 && files.has(expected) && compiledSource(files.get(expected)) === source);
+  fetchPhase = 'retain-package';
   const destination = process.env.FLUXWARDEN_FINAL_TARBALL;
   if (fs.existsSync(destination)) {
     const info = fs.lstatSync(destination); check(info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && fs.readFileSync(destination).equals(files.get(expected)));
@@ -305,5 +310,15 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       else if (operation === 'aggregate' && args.length === 0) await aggregateEvidence(github);
       else throw new Error('release evidence: unsupported operation');
     }
-  } catch { process.stderr.write('release evidence: authenticated prerequisite unavailable or validation failed\n'); process.exitCode = 1; }
+  } catch (error) {
+    process.stderr.write('release evidence: authenticated prerequisite unavailable or validation failed\n');
+    if (process.argv[2] === 'fetch') {
+      // Static operation phase and an allowlisted category only. In particular,
+      // the transport's generic validation error cannot establish an HTTP cause.
+      const category = ['AbortError', 'TimeoutError', 'TypeError'].includes(error?.name) ? error.name : 'UNKNOWN';
+      const phase = fetchPhase ?? 'initialize';
+      process.stderr.write(JSON.stringify({ stage: 'release-fetch', phase, category }) + '\n');
+    }
+    process.exitCode = 1;
+  }
 }

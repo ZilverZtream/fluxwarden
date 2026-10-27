@@ -160,9 +160,9 @@ function dependencyTree(root, env, capture) {
   }
   return { dependencyTree: git(root, ['write-tree'], env), dependencyNamespaceSha256: hash(JSON.stringify(directories.sort())) };
 }
-function identity(root, capture) {
+function identity(root, capture, objectDirectory) {
   const index = join(capture, 'private', 'checkout.index');
-  const env = { ...process.env, GIT_INDEX_FILE: index };
+  const env = { ...process.env, GIT_INDEX_FILE: index, ...(objectDirectory ? { GIT_OBJECT_DIRECTORY: objectDirectory, GIT_ALTERNATE_OBJECT_DIRECTORIES: '' } : {}) };
   try {
     const sourceNames = git(root, ['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean).filter(path => !inside(join(root, 'node_modules'), resolve(root, path)));
     const stagedDeletions = git(root, ['diff', '--cached', '--diff-filter=D', '--name-only', '-z', 'HEAD']);
@@ -293,7 +293,38 @@ function custody(capture, config) {
   const paths = [...config.roots, ...config.outputs.filter(path => fs.existsSync(path)), ...registered(config.root), join(config.root, 'test/sentinels.json'), capture];
   return { parents: parentBindings([...config.roots, ...config.outputs.filter(path => fs.existsSync(path)), capture, config.root].map(dirname)), namespace: namespace(paths, new Set(metadata)) };
 }
-async function verify(root, capture) {
+async function readOnlyIdentity(root, parent) {
+  const scratch = await createPrivateDirectory(parent, 'capture-identity-');
+  try {
+    fs.mkdirSync(join(scratch, 'private'), { mode: 0o700 });
+    const objects = join(scratch, 'objects');
+    fs.mkdirSync(objects, { mode: 0o700 });
+    fs.mkdirSync(join(objects, 'pack'), { mode: 0o700 });
+    fs.mkdirSync(join(objects, 'info'), { mode: 0o700 });
+    // git-rev-list(1) --no-walk retains HEAD's commit/tree/blob objects without
+    // history traversal. git-pack-objects(1) --stdout only reads the original
+    // store; index-pack writes exclusively to the separate object directory.
+    // No alternates: even Git's object timestamp freshening stays in scratch.
+    const names = git(root, ['rev-list', '--objects', '--no-object-names', '--no-walk', 'HEAD']);
+    const pack = join(scratch, 'head.pack');
+    let fd = fs.openSync(pack, 'wx', 0o600);
+    try {
+      const result = spawnSync('git', ['-C', root, 'pack-objects', '--stdout'], { input: names + '\n', stdio: ['pipe', fd, 'pipe'], windowsHide: true });
+      if (result.status !== 0) throw new Error('capture identity object read failed');
+    } finally { fs.closeSync(fd); }
+    fd = fs.openSync(pack, 'r');
+    try {
+      const result = spawnSync('git', ['-C', root, 'index-pack', '--stdin'], { env: { ...process.env, GIT_OBJECT_DIRECTORY: objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: '' }, stdio: [fd, 'pipe', 'pipe'], windowsHide: true });
+      if (result.status !== 0) throw new Error('capture identity object copy failed');
+    } finally { fs.closeSync(fd); }
+    // Keep the original repository's attributes, normalization and mode rules,
+    // computing every identity field afresh with its ordinary implementation.
+    return identity(root, scratch, objects);
+  } finally {
+    if (inside(parent, scratch) && dirname(scratch) === resolve(parent)) fs.rmSync(scratch, { recursive: true });
+  }
+}
+async function closedCapture(root, capture, scratchParent) {
   await assertPrivateDirectories([capture]);
   const receipt = read(join(capture, 'receipt.json'));
   const config = read(join(capture, 'private', 'config.json'));
@@ -301,11 +332,15 @@ async function verify(root, capture) {
   await assertPrivateDirectories(config.roots);
   const seal = read(join(capture, 'receipt.sha256'));
   if (digest(join(capture, 'receipt.json')) !== seal.receiptSha256 || !same(seal.metadata, ['receipt.json', 'receipt.sha256', 'custody.json'].map(name => ({ name, ...anchor(join(capture, name)) })))) throw new Error('capture receipt changed');
-  if (!same(identity(root, capture), receipt.identity.after)) throw new Error('capture checkout changed');
+  if (!same(scratchParent ? await readOnlyIdentity(root, scratchParent) : identity(root, capture), receipt.identity.after)) throw new Error('capture checkout changed');
   const expected = read(join(capture, 'custody.json'));
   if (digest(join(capture, 'custody.json')) !== receipt.custodySha256) throw new Error('capture custody record changed');
   if (!same(custody(capture, config), expected)) throw new Error('capture custody changed');
   retainedSourceIdentities(capture);
+  return { receipt, config };
+}
+async function verify(root, capture) {
+  const { receipt, config } = await closedCapture(root, capture);
   diagnosticContext.evidenceDir = config.evidenceDir;
   diagnosticContext.sentinelDir = config.sentinelDir;
   if (!receipt.result.complete || !receipt.result.policySatisfied) {
@@ -323,6 +358,64 @@ async function verify(root, capture) {
     return 1;
   }
   return 0;
+}
+// Diagnostic eligibility is independent of policy acceptance. The original
+// verifier above still rejects every recorded policy failure.
+export async function safeCaptureMetadata(root, capture, output) {
+  root = resolve(root); capture = resolve(capture); output = resolve(output);
+  const receiptPath = join(capture, 'receipt.json');
+  const original = binding(receiptPath);
+  const preliminary = read(join(capture, 'private', 'config.json'));
+  const scopes = [root, capture, ...preliminary.roots, ...preliminary.outputs];
+  if (scopes.some(path => inside(path, output))) throw new Error('capture metadata output overlaps closure');
+  ancestry(dirname(output));
+  // Windows PowerShell's read-only ACL query creates policy-test temp files.
+  // Keep that tooling outside the closed namespace too, using the already
+  // disjoint caller-owned command-file parent, then restore the caller's env.
+  const prior = { TEMP: process.env.TEMP, TMP: process.env.TMP };
+  let closed;
+  try {
+    if (process.platform === 'win32') process.env.TEMP = process.env.TMP = dirname(output);
+    closed = await closedCapture(root, capture, dirname(output));
+  } finally {
+    for (const name of ['TEMP', 'TMP']) {
+      if (prior[name] === undefined) Reflect.deleteProperty(process.env, name); else process.env[name] = prior[name];
+    }
+  }
+  const { receipt, config } = closed;
+  if (receipt.result?.complete !== true || !same(receipt.identity.before, receipt.identity.after)) throw new Error('capture not closed');
+  if (!same(config.registered, registered(root))) throw new Error('capture source membership changed');
+  const retained = records(capture, config).filter(row => row.purpose === 'INPUT' || row.purpose === 'SECRET_OUTPUT');
+  const pool = join(capture, 'private', 'sources');
+  const expected = [...new Set(retained.map(row => row.sha256))].sort();
+  if (!same(files(pool).sort(), expected.map(sha => join(pool, sha)).sort())) throw new Error('capture source pool incomplete');
+  for (const sha of expected) {
+    for (const path of [join(pool, sha), join(capture, 'private', 'bytes', sha)]) {
+      const info = fs.lstatSync(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || digest(path) !== sha) throw new Error('capture source pool changed');
+    }
+  }
+  const redact = sentinelRedactor({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: pool });
+  const sources = retained.flatMap(row => equivalents(fs.readFileSync(join(pool, row.sha256))).map(bytes => ({
+    path: redact(row.path), ...(redact(row.path) !== row.path ? { pathSha256: hash(row.path) } : {}), sha256: hash(bytes), purpose: row.purpose,
+  })));
+  if (!same(sources, receipt.sources)) throw new Error('capture receipt source membership changed');
+  // No testTmp, declarations, evidence priority or authorized-output exemption.
+  const options = { root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: pool };
+  if (findLeaks({ ...options, paths: [receiptPath] }) || findLeaks({ ...options, commandOutput: 'available=true\n' })) throw new Error('capture metadata unsafe');
+  if (fs.existsSync(output)) {
+    const info = fs.lstatSync(output);
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw new Error('capture metadata output linked');
+  }
+  // Recheck the protected custody and the exact scanned receipt before the sole
+  // output write; the SHA sidecar by itself never supplies source authority.
+  if (!same(custody(capture, config), read(join(capture, 'custody.json'))) || !same(original, binding(receiptPath)) || fs.lstatSync(receiptPath).nlink !== 1) throw new Error('capture metadata changed');
+  const fd = fs.openSync(output, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  try {
+    const info = fs.fstatSync(fd, { bigint: true });
+    if (!info.isFile() || info.nlink !== 1n || !same(anchor(output), { realpath: fs.realpathSync.native(output), dev: String(info.dev), ino: String(info.ino), birthtimeNs: String(info.birthtimeNs), type: 'file' })) throw new Error('capture metadata output changed');
+    fs.writeSync(fd, 'available=true\n');
+  } finally { fs.closeSync(fd); }
 }
 async function captureCommand(root, capture, command) {
   if (!fs.existsSync(capture)) {
