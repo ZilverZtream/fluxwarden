@@ -88,7 +88,7 @@ export default defineConfig(
     },
   },
   {
-    files: ['test/**/*.ts', 'vitest*.config.ts', 'labs/scenarios/chaos/*.d.mts'],
+    files: ['test/**/*.ts', 'vitest*.config.ts', 'labs/scenarios/**/*.d.mts'],
     languageOptions: {
       parserOptions: { projectService: false, project: './tsconfig.tests.json' },
     },

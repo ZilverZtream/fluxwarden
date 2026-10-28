@@ -12,6 +12,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      actions: read
       id-token: write
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -37,7 +38,23 @@ jobs:
       - name: Verify release tag
         run: node --input-type=module -e 'import fs from "node:fs"; const p=JSON.parse(fs.readFileSync("package.json")); if(process.env.GITHUB_REF_NAME !== `v${p.version}` || !/^[1-9][0-9]*\.[0-9]+\.[0-9]+$/.test(p.version)) process.exit(1); fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_VERSION=${p.version}\n`)'
       - run: npm pack --pack-destination "$RUNNER_TEMP"
+      - name: Retrieve original final CI tarball and authenticated evidence reference
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/release-candidate.mjs --source "$GITHUB_SHA" --tarball "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz" --evidence "$FLUXWARDEN_EVIDENCE_DIR/release-manifest.json"
       - run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz"
       - run: node scripts/release-smoke.mjs "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz"
+      - name: Authenticate complete same-source final-artifact release evidence
+        id: release-verify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/release-gate.mjs --source "$GITHUB_SHA" --tarball "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz" --evidence "$FLUXWARDEN_EVIDENCE_DIR/release-manifest.json"
+      - name: Retain final tarball hash and authenticated evidence reference
+        if: success() && steps.release-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-publication-evidence
+          path: ${{ runner.temp }}/fluxwarden-${{ env.RELEASE_VERSION }}.tgz.publication-evidence.json
+          if-no-files-found: error
       - name: Publish validated tarball
         run: npm publish "$RUNNER_TEMP/fluxwarden-${RELEASE_VERSION}.tgz" --provenance --access public

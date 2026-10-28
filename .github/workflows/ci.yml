@@ -4,26 +4,144 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-# A newer pull request or dispatched feature-branch run cancels the run it supersedes;
-# dispatched runs on main complete, so each validated main commit keeps its own result.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
-  test:
+  final-package:
+    name: release/final-package
+    outputs:
+      tarballSha256: ${{ steps.package.outputs.sha256 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Create and smoke the sole final package
+        id: package
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/release-ci.mjs package --finally node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_FINAL_TARBALL"
+      - name: Verify complete invocation custody
+        if: always()
+        id: capture-verify
+        run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain fluxwarden-final-package
+        if: success() && steps.capture-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_FINAL_TARBALL }}
+          if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain final-package-capture
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final-package-capture
+          path: ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
+          if-no-files-found: error
+  inventory:
+    name: inventory/${{ matrix.os }}/${{ matrix.node }}
+    needs: [final-package]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['22.23.2', '22.x', '24.18.1', '24.x', '26.5.1', '26.x']
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '${{ matrix.node }}'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Independently collect all eligible source cases
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next node scripts/release-ci.mjs inventory --os "${{ matrix.os }}" --node "${{ matrix.node }}"
+      - name: Verify complete independent collection custody
+        if: always()
+        id: capture-verify
+        run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Independently scan collected inventory output
+        if: always()
+        id: output-verify
+        run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_RELEASE_OUTPUT"
+      - name: Retain fluxwarden-inventory-${{ matrix.os }}-${{ matrix.node }}
+        if: success() && steps.capture-verify.outcome == 'success' && steps.output-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-inventory-${{ matrix.os }}-${{ matrix.node }}
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/inventory.json
+          if-no-files-found: error
+  test:
+    name: platform/${{ matrix.os }}/${{ matrix.node }}/${{ matrix.shard }}
+    needs: [final-package]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     strategy:
       # Every platform reports its own result; one failure does not cancel the rest.
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        node: ['22.23.2', '22.x', '24.18.1', '24.x']
-        shard: [product-1, product-2, harness-1, harness-2]
+        node: ['22.23.2', '22.x', '24.18.1', '24.x', '26.5.1', '26.x']
+        shard: [product-1, product-2, harness-1, harness-2, harness-3, harness-4, harness-5, harness-6, harness-7, harness-8]
         include:
-          - { os: windows-latest, node: '22.23.2', shard: core-1, coreShard: '1/3' }
-          - { os: windows-latest, node: '22.23.2', shard: core-2, coreShard: '2/3' }
-          - { os: windows-latest, node: '22.23.2', shard: core-3, coreShard: '3/3' }
+          - { os: windows-latest, node: '22.23.2', shard: core-1, coreShard: '1/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-2, coreShard: '2/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-3, coreShard: '3/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-4, coreShard: '4/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-5, coreShard: '5/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-6, coreShard: '6/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-7, coreShard: '7/8' }
+          - { os: windows-latest, node: '22.23.2', shard: core-8, coreShard: '8/8' }
           - { os: windows-latest, node: '22.23.2', shard: harness-1, harnessShard: '1/8' }
           - { os: windows-latest, node: '22.23.2', shard: harness-2, harnessShard: '2/8' }
           - { os: windows-latest, node: '22.23.2', shard: harness-3, harnessShard: '3/8' }
@@ -34,9 +152,50 @@ jobs:
           - { os: windows-latest, node: '22.23.2', shard: harness-8, harnessShard: '8/8' }
           - { os: windows-latest, node: '22.23.2', shard: native-1, nativeShard: '1/2' }
           - { os: windows-latest, node: '22.23.2', shard: native-2, nativeShard: '2/2' }
-          - { os: windows-latest, node: '24.x', shard: core-1, coreShard: '1/3' }
-          - { os: windows-latest, node: '24.x', shard: core-2, coreShard: '2/3' }
-          - { os: windows-latest, node: '24.x', shard: core-3, coreShard: '3/3' }
+          - { os: windows-latest, node: '22.x', shard: core-1, coreShard: '1/8' }
+          - { os: windows-latest, node: '22.x', shard: core-2, coreShard: '2/8' }
+          - { os: windows-latest, node: '22.x', shard: core-3, coreShard: '3/8' }
+          - { os: windows-latest, node: '22.x', shard: core-4, coreShard: '4/8' }
+          - { os: windows-latest, node: '22.x', shard: core-5, coreShard: '5/8' }
+          - { os: windows-latest, node: '22.x', shard: core-6, coreShard: '6/8' }
+          - { os: windows-latest, node: '22.x', shard: core-7, coreShard: '7/8' }
+          - { os: windows-latest, node: '22.x', shard: core-8, coreShard: '8/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-1, harnessShard: '1/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-2, harnessShard: '2/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-3, harnessShard: '3/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-4, harnessShard: '4/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-5, harnessShard: '5/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-6, harnessShard: '6/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-7, harnessShard: '7/8' }
+          - { os: windows-latest, node: '22.x', shard: harness-8, harnessShard: '8/8' }
+          - { os: windows-latest, node: '22.x', shard: native-1, nativeShard: '1/2' }
+          - { os: windows-latest, node: '22.x', shard: native-2, nativeShard: '2/2' }
+          - { os: windows-latest, node: '24.18.1', shard: core-1, coreShard: '1/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-2, coreShard: '2/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-3, coreShard: '3/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-4, coreShard: '4/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-5, coreShard: '5/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-6, coreShard: '6/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-7, coreShard: '7/8' }
+          - { os: windows-latest, node: '24.18.1', shard: core-8, coreShard: '8/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-1, harnessShard: '1/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-2, harnessShard: '2/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-3, harnessShard: '3/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-4, harnessShard: '4/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-5, harnessShard: '5/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-6, harnessShard: '6/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-7, harnessShard: '7/8' }
+          - { os: windows-latest, node: '24.18.1', shard: harness-8, harnessShard: '8/8' }
+          - { os: windows-latest, node: '24.18.1', shard: native-1, nativeShard: '1/2' }
+          - { os: windows-latest, node: '24.18.1', shard: native-2, nativeShard: '2/2' }
+          - { os: windows-latest, node: '24.x', shard: core-1, coreShard: '1/8' }
+          - { os: windows-latest, node: '24.x', shard: core-2, coreShard: '2/8' }
+          - { os: windows-latest, node: '24.x', shard: core-3, coreShard: '3/8' }
+          - { os: windows-latest, node: '24.x', shard: core-4, coreShard: '4/8' }
+          - { os: windows-latest, node: '24.x', shard: core-5, coreShard: '5/8' }
+          - { os: windows-latest, node: '24.x', shard: core-6, coreShard: '6/8' }
+          - { os: windows-latest, node: '24.x', shard: core-7, coreShard: '7/8' }
+          - { os: windows-latest, node: '24.x', shard: core-8, coreShard: '8/8' }
           - { os: windows-latest, node: '24.x', shard: harness-1, harnessShard: '1/8' }
           - { os: windows-latest, node: '24.x', shard: harness-2, harnessShard: '2/8' }
           - { os: windows-latest, node: '24.x', shard: harness-3, harnessShard: '3/8' }
@@ -47,212 +206,501 @@ jobs:
           - { os: windows-latest, node: '24.x', shard: harness-8, harnessShard: '8/8' }
           - { os: windows-latest, node: '24.x', shard: native-1, nativeShard: '1/2' }
           - { os: windows-latest, node: '24.x', shard: native-2, nativeShard: '2/2' }
+          - { os: windows-latest, node: '26.5.1', shard: core-1, coreShard: '1/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-2, coreShard: '2/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-3, coreShard: '3/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-4, coreShard: '4/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-5, coreShard: '5/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-6, coreShard: '6/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-7, coreShard: '7/8' }
+          - { os: windows-latest, node: '26.5.1', shard: core-8, coreShard: '8/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-1, harnessShard: '1/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-2, harnessShard: '2/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-3, harnessShard: '3/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-4, harnessShard: '4/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-5, harnessShard: '5/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-6, harnessShard: '6/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-7, harnessShard: '7/8' }
+          - { os: windows-latest, node: '26.5.1', shard: harness-8, harnessShard: '8/8' }
+          - { os: windows-latest, node: '26.5.1', shard: native-1, nativeShard: '1/2' }
+          - { os: windows-latest, node: '26.5.1', shard: native-2, nativeShard: '2/2' }
+          - { os: windows-latest, node: '26.x', shard: core-1, coreShard: '1/8' }
+          - { os: windows-latest, node: '26.x', shard: core-2, coreShard: '2/8' }
+          - { os: windows-latest, node: '26.x', shard: core-3, coreShard: '3/8' }
+          - { os: windows-latest, node: '26.x', shard: core-4, coreShard: '4/8' }
+          - { os: windows-latest, node: '26.x', shard: core-5, coreShard: '5/8' }
+          - { os: windows-latest, node: '26.x', shard: core-6, coreShard: '6/8' }
+          - { os: windows-latest, node: '26.x', shard: core-7, coreShard: '7/8' }
+          - { os: windows-latest, node: '26.x', shard: core-8, coreShard: '8/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-1, harnessShard: '1/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-2, harnessShard: '2/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-3, harnessShard: '3/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-4, harnessShard: '4/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-5, harnessShard: '5/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-6, harnessShard: '6/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-7, harnessShard: '7/8' }
+          - { os: windows-latest, node: '26.x', shard: harness-8, harnessShard: '8/8' }
+          - { os: windows-latest, node: '26.x', shard: native-1, nativeShard: '1/2' }
+          - { os: windows-latest, node: '26.x', shard: native-2, nativeShard: '2/2' }
     defaults:
       run:
         shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '${{ matrix.node }}'
       - name: Prepare private test directories
         env:
           FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { appendFile, writeFile } from 'node:fs/promises';
-          import { win32, join } from 'node:path';
-          import { createPrivateDirectory, assertPrivateDirectories, realDirectory } from './scripts/private-scratch.mjs';
-          let parent = process.env.FLUXWARDEN_CI_TMP_PARENT;
-          if (process.platform === 'win32') {
-            // Hosted temp drives and runner profiles can have mutable or foreign-owned ancestors.
-            // Avoid both: restrict only a unique directory we create directly on the OS drive.
-            const systemRoot = process.env.SystemRoot;
-            if (!systemRoot || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) throw new Error('a Windows system directory on an absolute drive is required');
-            const drive = win32.parse(systemRoot).root;
-            await realDirectory(systemRoot);
-            await realDirectory(drive);
-            parent = await createPrivateDirectory(drive, 'fluxwarden-ci-');
-          }
-          const roots = [];
-          for (const [name, prefix] of [['TEMP', 'ci-temp-'], ['TMP', 'ci-tmp-'], ['FLUXWARDEN_TEST_TMP', 'ci-tests-'], ['FLUXWARDEN_SENTINEL_DIR', 'ci-sentinels-'], ['FLUXWARDEN_EVIDENCE_DIR', 'ci-evidence-'], ['FLUXWARDEN_CI_CAPTURE_DIR', 'ci-capture-']]) {
-            roots.push([name, await createPrivateDirectory(parent, prefix)]);
-          }
-          await assertPrivateDirectories([...(process.platform === 'win32' ? [parent] : []), ...roots.map(([, directory]) => directory)]);
-          const temp = roots.find(([name]) => name === 'TEMP')[1], evidence = roots.find(([name]) => name === 'FLUXWARDEN_EVIDENCE_DIR')[1];
-          for (const [name, filename] of [['NPM_CONFIG_USERCONFIG', 'npm-user.npmrc'], ['NPM_CONFIG_GLOBALCONFIG', 'npm-global.npmrc']]) {
-            const path = join(temp, filename); await writeFile(path, '', { flag: 'wx', mode: 0o600 }); roots.push([name, path]);
-          }
-          roots.push(['NPM_CONFIG_CACHE', await createPrivateDirectory(temp, 'npm-validation-cache-')], ['NPM_CONFIG_LOGS_DIR', await createPrivateDirectory(evidence, 'npm-validation-logs-')], ['NPM_CONFIG_UPDATE_NOTIFIER', 'false']);
-          await appendFile(process.env.GITHUB_ENV, [
-            ...(process.platform === 'win32' ? [['FLUXWARDEN_CI_OWNED_ROOT', parent]] : []), ...roots,
-          ].map(([name, directory]) => `${name}=${directory}\n`).join(''));
-          NODE
+        run: node scripts/ci-prepare.mjs
       - name: Install locked toolchain without lifecycle scripts
         run: node scripts/ci-install.mjs --root "$PWD"
-      # Keep each complete capture and its independent recheck inside the job budget.
-      # The two deterministic shards of each project retain its complete file inventory.
-      # Hosted Linux runners have two CPUs; retain the original product worker bound.
-      - name: Test Linux product
-        if: always() && matrix.os == 'ubuntu-latest' && startsWith(matrix.shard, 'product-')
-        run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=2
-          --shard=${{ matrix.shard == 'product-1' && '1/2' || '2/2' }}
-          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
-      - name: Test Linux harness
-        if: always() && matrix.os == 'ubuntu-latest' && startsWith(matrix.shard, 'harness-')
-        run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm run test:harness -- --maxWorkers=1 --fileParallelism=false
-          --shard=${{ matrix.shard == 'harness-1' && '1/2' || '2/2' }}
-          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
-          --next node scripts/no-pending.mjs "$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
-      # Separate Windows VMs keep native process and owner-lifecycle proofs from competing with core tests.
-      - name: Test Windows core product
-        env:
-          FLUXWARDEN_CI_CORE_CONFIG: ${{ env.TEMP }}/vitest-windows-core.config.mjs
-        if: always() && matrix.os == 'windows-latest' && startsWith(matrix.shard, 'core-')
-        run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next node scripts/ci-windows-core.mjs --next npm test -- --config="$FLUXWARDEN_CI_CORE_CONFIG" --maxWorkers=1 --fileParallelism=false
-          --shard=${{ matrix.coreShard }}
-          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
-      - name: Test Windows harness
-        if: always() && matrix.os == 'windows-latest' && startsWith(matrix.shard, 'harness-')
-        run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm run test:harness -- --maxWorkers=1 --fileParallelism=false
-          --shard=${{ matrix.harnessShard }}
-          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
-          --next node scripts/no-pending.mjs "$FLUXWARDEN_EVIDENCE_DIR/vitest-harness.json"
-      - name: Test Windows native product
-        if: always() && matrix.os == 'windows-latest' && startsWith(matrix.shard, 'native-')
-        run: >-
-          node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run lint --next npm run build --next node scripts/ci-database-check.mjs --next npm test -- --maxWorkers=1 --fileParallelism=false
-          test/labs/cp006-cp008-owner-lifecycle.test.ts
-          test/persistence/cp015-concurrency.test.ts
-          test/chaos/t01-t12.test.ts
-          test/cli/cp038-reconcile-evidence.test.ts
-          test/commands/cp043-driver.test.ts
-          test/executor/cp029-preflight.test.ts
-          test/output/cp003-output.test.ts
-          test/persistence/cp015-command-data-readonly.test.ts
-          test/persistence/cp015-persistence.test.ts
-          test/daemon/cp041-daemon.test.ts
-          test/ledger/cp037-ledger.test.ts
-          test/commands/cp043-t05-repository.test.ts
-          --shard=${{ matrix.nativeShard }}
-          --reporter=default --reporter=json --outputFile.json="$FLUXWARDEN_EVIDENCE_DIR/vitest-product.json"
-      - name: Verify complete invocation custody
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Validate installed final artifact on this runtime
+        run: node scripts/release-smoke.mjs "$FLUXWARDEN_FINAL_TARBALL"
+      - name: Run original complete shard inside capture
         if: always()
-        id: capture-verify
-        run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
-      - name: Upload verified safe capture
-        if: always() && steps.capture-verify.outcome == 'success'
+        run: node scripts/ci-platform.mjs --os "${{ matrix.os }}" --node "${{ matrix.node }}" --shard "${{ matrix.shard }}"
+      - name: Bind actual complete report and final artifact
+        id: report-seal
+        if: always()
+        run: node scripts/release-ci.mjs seal --key "platform/${{ matrix.os }}/${{ matrix.node }}/${{ matrix.shard }}"
+      - name: Retain fluxwarden-platform-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.shard }}
+        if: always() && steps.report-seal.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-platform-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.shard }}
+          path: |
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/row.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/report.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/receipt.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/capture.json
+          if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain ci-capture-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.shard }}
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ci-capture-${{ matrix.os }}-${{ matrix.node }}-${{ matrix.shard }}
-          path: |
-            ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
+          path: ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
           if-no-files-found: error
-  # The regtest lab and chaos runs: Linux only, started by hand, never a test loop.
   lab:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
-        with:
-          node-version: '22.23.2'
-      - name: Prepare private test directories
-        env:
-          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { appendFile, writeFile } from 'node:fs/promises';
-          import { join } from 'node:path';
-          import { createPrivateDirectory, assertPrivateDirectories } from './scripts/private-scratch.mjs';
-          const roots = [];
-          for (const name of ['TEMP', 'TMP', 'FLUXWARDEN_TEST_TMP', 'FLUXWARDEN_SENTINEL_DIR', 'FLUXWARDEN_EVIDENCE_DIR', 'FLUXWARDEN_CI_CAPTURE_DIR']) roots.push([name, await createPrivateDirectory(process.env.FLUXWARDEN_CI_TMP_PARENT, 'lab-' + name.toLowerCase() + '-')]);
-          await assertPrivateDirectories(roots.map(([, path]) => path));
-          const temp = roots.find(([name]) => name === 'TEMP')[1], evidence = roots.find(([name]) => name === 'FLUXWARDEN_EVIDENCE_DIR')[1];
-          for (const [name, filename] of [['NPM_CONFIG_USERCONFIG', 'npm-user.npmrc'], ['NPM_CONFIG_GLOBALCONFIG', 'npm-global.npmrc']]) {
-            const path = join(temp, filename); await writeFile(path, '', { flag: 'wx', mode: 0o600 }); roots.push([name, path]);
-          }
-          roots.push(['NPM_CONFIG_CACHE', await createPrivateDirectory(temp, 'npm-validation-cache-')], ['NPM_CONFIG_LOGS_DIR', await createPrivateDirectory(evidence, 'npm-validation-logs-')], ['NPM_CONFIG_UPDATE_NOTIFIER', 'false']);
-          await appendFile(process.env.GITHUB_ENV, roots.map(([name, path]) => name + '=' + path + '\n').join(''));
-          NODE
-      - name: Install locked toolchain without lifecycle scripts
-        run: node scripts/ci-install.mjs --root "$PWD"
-      - if: always()
-        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run build --next npm run test:lab
-      - name: Verify complete invocation custody
-        if: always()
-        id: capture-verify
-        run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
-      - name: Upload verified safe capture
-        if: always() && steps.capture-verify.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: lab-capture
-          path: |
-            ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
-          if-no-files-found: error
-
-  chaos:
+    name: live/lab
+    needs: [final-package]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
-          node-version: '22.23.2'
+          node-version: '24.18.1'
       - name: Prepare private test directories
         env:
           FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { appendFile, writeFile } from 'node:fs/promises';
-          import { join } from 'node:path';
-          import { createPrivateDirectory, assertPrivateDirectories } from './scripts/private-scratch.mjs';
-          const roots = [];
-          for (const name of ['TEMP', 'TMP', 'FLUXWARDEN_TEST_TMP', 'FLUXWARDEN_SENTINEL_DIR', 'FLUXWARDEN_EVIDENCE_DIR', 'FLUXWARDEN_CI_CAPTURE_DIR']) roots.push([name, await createPrivateDirectory(process.env.FLUXWARDEN_CI_TMP_PARENT, 'chaos-' + name.toLowerCase() + '-')]);
-          await assertPrivateDirectories(roots.map(([, path]) => path));
-          const temp = roots.find(([name]) => name === 'TEMP')[1], evidence = roots.find(([name]) => name === 'FLUXWARDEN_EVIDENCE_DIR')[1];
-          for (const [name, filename] of [['NPM_CONFIG_USERCONFIG', 'npm-user.npmrc'], ['NPM_CONFIG_GLOBALCONFIG', 'npm-global.npmrc']]) {
-            const path = join(temp, filename); await writeFile(path, '', { flag: 'wx', mode: 0o600 }); roots.push([name, path]);
-          }
-          roots.push(['NPM_CONFIG_CACHE', await createPrivateDirectory(temp, 'npm-validation-cache-')], ['NPM_CONFIG_LOGS_DIR', await createPrivateDirectory(evidence, 'npm-validation-logs-')], ['NPM_CONFIG_UPDATE_NOTIFIER', 'false']);
-          await appendFile(process.env.GITHUB_ENV, roots.map(([name, path]) => name + '=' + path + '\n').join(''));
-          NODE
+        run: node scripts/ci-prepare.mjs
       - name: Install locked toolchain without lifecycle scripts
         run: node scripts/ci-install.mjs --root "$PWD"
-      - if: always()
-        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run build --next npm run test:chaos -- --reporter=default --reporter=json --outputFile.json "$FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json" --finally node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
-
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Prepare exclusively owned disposable live inputs
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ env.TEMP }}
+        run: node scripts/release-live.mjs prepare
+      - name: Measure independent CP010 smoke invocation for R6
+        run: node scripts/release-live.mjs measure
+      - name: Run complete required live selection
+        if: always()
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run build --next npm run test:lab -- --reporter=default --reporter=json --outputFile.json "$FLUXWARDEN_EVIDENCE_DIR/vitest-lab.json" --next node scripts/no-pending.mjs "$FLUXWARDEN_EVIDENCE_DIR/vitest-lab.json"
+      - name: Remove exclusively owned disposable live resources
+        if: always()
+        run: node scripts/release-live.mjs down
+      - name: Bind complete actual live report
+        id: report-seal
+        if: always()
+        run: node scripts/release-ci.mjs seal --key live/lab
+      - name: Retain fluxwarden-live-lab
+        if: always() && steps.report-seal.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-live-lab
+          path: |
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/*.json
+          if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain lab-capture
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lab-capture
+          path: ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
+          if-no-files-found: error
+  chaos:
+    name: live/chaos
+    needs: [final-package]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Prepare exclusively owned disposable live inputs
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ env.TEMP }}
+        run: node scripts/release-live.mjs prepare
+      - name: Run complete required live selection
+        if: always()
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next npm run build --next npm run test:chaos -- --reporter=default --reporter=json --outputFile.json "$FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json" --next node scripts/no-pending.mjs "$FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json" --finally node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_EVIDENCE_DIR"
+      - name: Remove exclusively owned disposable live resources
+        if: always()
+        run: node scripts/release-live.mjs down
+      - name: Bind complete actual live report
+        id: report-seal
+        if: always()
+        run: node scripts/release-ci.mjs seal --key live/chaos
+      - name: Retain fluxwarden-live-chaos
+        if: always() && steps.report-seal.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-live-chaos
+          path: |
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/*.json
+          if-no-files-found: error
+      - name: Independently validate diagnostic receipt confidentiality
+        if: always()
+        id: capture-metadata
+        run: node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain chaos-capture
+        if: always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chaos-capture
+          path: ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
+          if-no-files-found: error
+  demo:
+    name: release/demo
+    needs: [final-package]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Execute actual demo producer
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next node scripts/release-ci.mjs producer --kind demo
       - name: Verify complete invocation custody
         if: always()
         id: capture-verify
         run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
-      - name: Upload scanned evidence
-        if: always() && steps.capture-verify.outcome == 'success'
+      - name: Retain fluxwarden-release-demo
+        if: success() && steps.capture-verify.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: chaos-evidence
-          path: ${{ env.FLUXWARDEN_EVIDENCE_DIR }}
-          if-no-files-found: error
-      - name: Upload verified safe capture
-        if: always() && steps.capture-verify.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: chaos-capture
+          name: fluxwarden-release-demo
           path: |
-            ${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/row.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/evidence.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/scenario.json
+          if-no-files-found: error
+  installed-smoke:
+    name: release/installed-smoke
+    needs: [final-package]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Execute actual installed-smoke producer
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next node scripts/release-ci.mjs producer --kind installed-smoke
+      - name: Verify complete invocation custody
+        if: always()
+        id: capture-verify
+        run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain fluxwarden-release-installed-smoke
+        if: success() && steps.capture-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-release-installed-smoke
+          path: |
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/row.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/evidence.json
+          if-no-files-found: error
+  publisher:
+    name: release/publisher
+    needs: [final-package]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Verify actual protected publisher configuration
+        id: publisher-verify
+        env:
+          NPM_TRUST_READ_TOKEN: ${{ secrets.NPM_TRUST_READ_TOKEN }}
+        run: node scripts/release-ci.mjs producer --kind publisher
+      - name: Independently scan protected publisher output
+        if: always()
+        id: output-verify
+        run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_RELEASE_OUTPUT"
+      - name: Retain fluxwarden-release-publisher
+        if: success() && steps.publisher-verify.outcome == 'success' && steps.output-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-release-publisher
+          path: |
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/row.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/evidence.json
+          if-no-files-found: error
+  leak-scan:
+    name: release/leak-scan
+    needs: [final-package, test, lab, chaos, demo, installed-smoke]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Execute actual leak-scan producer
+        run: node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- node scripts/ci-job.mjs --commands-only -- node scripts/ci-install.mjs verify --root "$PWD" --next node scripts/release-ci.mjs producer --kind leak-scan
+      - name: Verify complete invocation custody
+        if: always()
+        id: capture-verify
+        run: node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"
+      - name: Retain fluxwarden-release-leak-scan
+        if: success() && steps.capture-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-release-leak-scan
+          path: |
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/row.json
+            ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/evidence.json
+          if-no-files-found: error
+  release-evidence:
+    name: release/evidence
+    needs: [final-package, inventory, test, lab, chaos, demo, installed-smoke, publisher, leak-scan]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      FLUXWARDEN_EXPECTED_TARBALL_SHA256: ${{ needs.final-package.outputs.tarballSha256 }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.18.1'
+      - name: Prepare private test directories
+        env:
+          FLUXWARDEN_CI_TMP_PARENT: ${{ runner.temp }}
+        run: node scripts/ci-prepare.mjs
+      - name: Install locked toolchain without lifecycle scripts
+        run: node scripts/ci-install.mjs --root "$PWD"
+      - name: Download the sole final package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fluxwarden-final-package
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}
+      - name: Consume original final compressed package
+        run: node scripts/release-ci.mjs fetch
+      - name: Build exact candidate source
+        run: npm run build
+      - name: Authenticate complete reports and final artifact into aggregate
+        id: evidence-verify
+        run: node scripts/release-ci.mjs aggregate
+      - name: Independently scan authenticated aggregate output
+        if: always()
+        id: output-verify
+        run: node scripts/leak-check.mjs --sentinels test/sentinels.json --sentinel-dir "$FLUXWARDEN_SENTINEL_DIR" "$FLUXWARDEN_RELEASE_OUTPUT/aggregate"
+      - name: Retain fluxwarden-release-evidence
+        if: success() && steps.evidence-verify.outcome == 'success' && steps.output-verify.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fluxwarden-release-evidence
+          path: ${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/aggregate/
           if-no-files-found: error

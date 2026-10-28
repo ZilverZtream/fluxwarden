@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
+import { dirname } from 'node:path';
+import { writeOwnerOnlyFile } from '../output/private-file.js';
 import type { ExecutionRecord, LedgerBook, StoredJournal, Transaction } from '../core/ledger.js';
 import type { ChannelState, Confidence, NormalizedChannel } from '../core/normalize.js';
 import { lastTerminal, type TerminalTimes } from './budget.js';
@@ -13,8 +15,11 @@ import { commandData, type CommandData } from './command-data.js';
 import { routingLayersRepository, type RoutingLayersRepository } from './routing-layers.js';
 import { postAccountTransfer, postOpening } from '../ledger/post.js';
 import { channelLocalAccount } from '../ledger/accounts.js';
-import { checkReadablePath, prepareWritablePath, secureSideFiles } from './paths.js';
+import { checkPrivateDirectory, checkReadablePath, prepareWritablePath, secureSideFiles } from './paths.js';
 import { MIGRATIONS, SCHEMA_VERSION } from './schema.js';
+import { assertNodeIdentity } from './node-identity.js';
+import { assertRecoveryResolved } from './recovery-state.js';
+import { assertStateAdmitted, completeRestore, installRestoreBarrier } from './restore-barrier.js';
 import { bigintColumn, checkedCount, checkedMsat, DB_NOW, dbNow, immediate, newUlid, numberColumn, textColumn } from './sql.js';
 
 export interface OpenOptions {
@@ -82,16 +87,23 @@ export interface SnapshotRow {
 }
 
 export interface Database {
+  backupTo(path: string): Promise<void>;
+  integrityCheck(): void;
+  readonly state: { assertAdmitted(): void; installRestoreBarrier(): void; completeRestore(nodeIds: readonly string[]): void };
   readonly commandData: CommandData;
   readonly routingLayers: RoutingLayersRepository;
   close(): void;
   /** The journal mode and synchronous level of the live connection. */
   pragmas(): { journalMode: string; synchronous: number };
   readonly nodes: {
+    fenceEpoch(nodeId: string): bigint;
+    recover(nodeId: string, fenceEpoch: bigint): void;
+    /** Refuses a legacy node whose original binding cannot be established from durable provenance. */
+    assertIdentity(nodeId: string): void;
     insert(node: NodeRecord): void;
     /** Every stored node, by name. */
     list(): StoredNode[];
-    /** Creates or updates the row of the named node with the probe outcome; last_probed_at is the database clock. */
+    /** Records probe metadata without rebinding an existing identity; last_probed_at is the database clock. */
     recordProbe(record: ProbeRecord): ProbeRecordResult;
     /** Marks the named node OFFLINE when it is ONLINE; a quarantined node or a node without a row is left alone. */
     markOffline(name: string): void;
@@ -483,6 +495,27 @@ function repositories(db: DatabaseSync, readOnly: boolean, unchanged: () => void
   };
 
   return {
+    integrityCheck() {
+      run(() => {
+        // MySQL: CHECK TABLE and referential checks, run before adopting a restored book.
+        const rows = db.prepare('PRAGMA integrity_check').all();
+        if (rows.length !== 1 || rows[0]?.['integrity_check'] !== 'ok' || db.prepare('PRAGMA foreign_key_check').all().length !== 0) {
+          throw new Error('state: SQLite integrity validation failed');
+        }
+      });
+    },
+    async backupTo(path) {
+      unchanged();
+      checkPrivateDirectory(dirname(path));
+      if (writeOwnerOnlyFile(path, new Uint8Array()) !== 'written') throw new PersistenceError('UNSAFE_PATH', 'backup: destination is occupied or unsafe');
+      await process.getBuiltinModule('node:sqlite').backup(db, path);
+      unchanged();
+    },
+    state: {
+      assertAdmitted: () => { run(() => { assertStateAdmitted(db); }); },
+      installRestoreBarrier: () => { writable('state.restore'); installRestoreBarrier(db); },
+      completeRestore: nodeIds => { writable('state.completeRestore'); completeRestore(db, nodeIds); },
+    },
     commandData: commandData(db, writable, run),
     routingLayers: routingLayersRepository(db, writable, run),
     close: () => { if (db.isOpen) db.close(); },
@@ -507,6 +540,24 @@ function repositories(db: DatabaseSync, readOnly: boolean, unchanged: () => void
     }),
 
     nodes: {
+      fenceEpoch: nodeId => run(() => {
+        // MySQL: same.
+        const row = db.prepare('SELECT fence_epoch FROM nodes WHERE id = ?').get(nodeId);
+        if (row === undefined) throw new PersistenceError('NOT_FOUND', 'identity: no stored node');
+        return bigintColumn(row, 'fence_epoch');
+      }),
+      recover(nodeId, fenceEpoch) {
+        writable('nodes.recover');
+        immediate(db, () => {
+          assertNodeIdentity(db, nodeId);
+          assertRecoveryResolved(db, nodeId);
+          // MySQL: same; only the exact fresh probe can authorize lifting quarantine.
+          const result = db.prepare(`UPDATE nodes SET state = 'ONLINE', fence_epoch = fence_epoch + 1
+            WHERE id = ? AND fence_epoch = ? AND state IN ('ONLINE','QUARANTINED')`).run(nodeId, fenceEpoch);
+          if (Number(result.changes) === 0) throw new PersistenceError('NODE_IDENTITY_CHANGED', 'identity: the node changed during recovery');
+        });
+      },
+      assertIdentity: nodeId => { run(() => { assertNodeIdentity(db, nodeId); }); },
       insert(node: NodeRecord): void {
         writable('nodes.insert');
         run(() => {
@@ -544,14 +595,21 @@ function repositories(db: DatabaseSync, readOnly: boolean, unchanged: () => void
             .get(record.expectedPubkey, record.name);
           if (holder !== undefined) return { heldBy: textColumn(holder, 'name') };
           // MySQL: same
-          const existing = db.prepare('SELECT id, state FROM nodes WHERE name = ?').get(record.name);
+          const existing = db.prepare('SELECT id, state, implementation, expected_pubkey FROM nodes WHERE name = ?').get(record.name);
           if (existing !== undefined) {
+            assertNodeIdentity(db, textColumn(existing, 'id'));
+            // The node row owns channel and execution history. Rebinding it would let a replacement
+            // resolve the original node's hashes, including UNKNOWN payments and terminal history.
+            if (textColumn(existing, 'implementation') !== record.implementation
+              || textColumn(existing, 'expected_pubkey') !== record.expectedPubkey) {
+              throw new PersistenceError('NODE_IDENTITY_CHANGED', 'identity: the configured node differs from its stored identity; preserve the original database and restore its verified connection');
+            }
             const id = textColumn(existing, 'id');
             const quarantined = textColumn(existing, 'state') === 'QUARANTINED' || record.state === 'QUARANTINED';
             // MySQL: same, with NOW(6) for the clock
-            db.prepare(`UPDATE nodes SET implementation = ?, expected_pubkey = ?, observed_version = ?, capabilities_json = ?, state = ?,
+            db.prepare(`UPDATE nodes SET observed_version = ?, capabilities_json = ?, state = ?, fence_epoch = fence_epoch + 1,
                 last_probed_at = ${DB_NOW} WHERE id = ?`)
-              .run(record.implementation, record.expectedPubkey, record.observedVersion, capabilities, quarantined ? 'QUARANTINED' : record.state, id);
+              .run(record.observedVersion, capabilities, quarantined ? 'QUARANTINED' : record.state, id);
             return { id, quarantined };
           }
           const id = newUlid();
@@ -567,7 +625,7 @@ function repositories(db: DatabaseSync, readOnly: boolean, unchanged: () => void
         writable('nodes.markOffline');
         run(() => {
           // MySQL: same
-          db.prepare(`UPDATE nodes SET state = 'OFFLINE' WHERE name = ? AND state = 'ONLINE'`).run(name);
+          db.prepare(`UPDATE nodes SET state = 'OFFLINE', fence_epoch = fence_epoch + 1 WHERE name = ? AND state = 'ONLINE'`).run(name);
         });
       },
     },

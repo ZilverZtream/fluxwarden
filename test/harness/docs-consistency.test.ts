@@ -23,17 +23,19 @@ import { loadConfig } from '../../src/config/config.js';
 import { loadPolicy } from '../../src/policy/load.js';
 import { asRecord, readText, repoRoot, runCli, scratchDir } from '../helpers/cli.js';
 
-// SPEC §10.3, ledger verification §9.5 and daemon §10.4. Lab commands are listed but never run here (they drive Docker).
+// SPEC §10.3, ledger verification §9.5 and daemon §10.4. Owner-routed D29
+// public recovery interfaces add state backup/restore and nodes recover.
+// Lab commands are listed but never run here (they drive Docker).
 const COMMANDS = [
   'doctor', 'nodes list', 'nodes inspect', 'channels', 'liquidity diagnose', 'liquidity plan', 'liquidity explain',
   'liquidity approve', 'actions execute', 'actions status', 'ledger verify', 'reconcile', 'evidence export', 'lab up', 'lab down',
-  'lab workload', 'lab chaos', 'keys generate', 'daemon',
+  'lab workload', 'lab chaos', 'keys generate', 'daemon', 'state backup', 'state restore', 'nodes recover',
 ] as const;
 // Flags named by SPEC §10.1 and §10.3.
 const FLAGS = [
   '--config', '--json', '--help', '--version', '--capabilities', '--node', '--sort', '--horizon', '--policy', '--refresh',
   '--key', '--max-fee-msat', '--max-cltv-delta', '--expires-in', '--require-regtest', '--watch', '--since', '--run-id',
-  '--out', '--seed', '--type', '--count', '--all',
+  '--out', '--from', '--seed', '--type', '--count', '--all',
 ];
 // SPEC §10.2.
 const EXIT_CODES: Record<number, string> = {
@@ -110,10 +112,16 @@ function yamlKeys(text: string): Set<string> {
   return new Set([...text.matchAll(/^\s*(?:-\s+)?([a-z_][a-z0-9_]*):(?:\s|$)/gm)].map(match => match[1] ?? ''));
 }
 
-it('CP-042/B1 the command mapping recognises ledger verify and refuses unknown ledger commands', () => {
-  // SPEC §9.5 and the ledger command contract require this public verification entry point.
+it('CP-042/B1 the command mapping recognises specified verification and recovery commands and refuses unknown names', () => {
+  // SPEC §9.5 and owner-approved public recovery interfaces; do not admit
+  // arbitrary state/node subcommands merely because their top-level noun exists.
   expect(commandOf(commandWords('fluxwarden ledger verify --json'))).toBe('ledger verify');
+  expect(commandOf(commandWords('fluxwarden state backup --out /private/backup --json'))).toBe('state backup');
+  expect(commandOf(commandWords('fluxwarden state restore --from /private/backup --json'))).toBe('state restore');
+  expect(commandOf(commandWords('fluxwarden nodes recover node-1 --json'))).toBe('nodes recover');
   expect(commandOf(commandWords('fluxwarden ledger repair --json'))).toBeNull();
+  expect(commandOf(commandWords('fluxwarden state repair --json'))).toBeNull();
+  expect(commandOf(commandWords('fluxwarden nodes unquarantine node-1 --json'))).toBeNull();
   expect(commandOf(commandWords('fluxwarden unknown verify --json'))).toBeNull();
 });
 
@@ -157,6 +165,8 @@ it('CP-042/B1 every specified command is dispatched by the binary: a missing con
     'liquidity explain': ['proposal-1'], 'liquidity approve': ['proposal-1', '--key', join(work, 'operator.key')],
     'actions execute': ['proposal-1', '--require-regtest'], 'actions status': ['execution-1'], 'ledger verify': [], reconcile: [],
     'evidence export': ['--run-id', 'run-1', '--out', join(work, 'bundle')], daemon: [],
+    'state backup': ['--out', join(work, 'backup')], 'state restore': ['--from', join(work, 'backup')],
+    'nodes recover': ['node-1'],
   };
   for (const [command, rest] of Object.entries(argv)) {
     const run = await runCli([...command.split(' '), ...rest, '--config', config, '--json']);
@@ -302,14 +312,20 @@ it('CP-042/B2 the runbooks exist, are indexed and state the specified recovery b
   expect(exits(keys, 2), 'key-rotation: exit 2 for an unknown key_id').toBe(true);
   expect(exits(keys, 5), 'key-rotation: exit 5 when no stored approval verifies').toBe(true);
 
-  // SPEC §5.2 H3, §10.4 DM2/DM5, INV-12. The specification defines no command that lifts a quarantine;
-  // the runbook says so and names none.
+  // SPEC §5.2 H3, §10.4 DM2/DM5, INV-12, and owner-routed D29 recovery:
+  // nodes recover now exists; original identity and read-only reconciliation
+  // gate recovery, while attempts/history and HELD reservations survive.
   const quarantine = read('quarantine');
   for (const term of ['QUARANTINED', 'expected_pubkey', 'expected_network', 'node-quarantined', 'identity']) expect(quarantine, `quarantine: ${term}`).toContain(term);
   expect(exits(quarantine, 5), 'quarantine: exit 5').toBe(true);
   expect(quarantine).toMatch(/daemon[^.]*\babort/i);
-  expect(quarantine).toMatch(/\bno\b[^.]*\bcommand\b[^.]*quarantin|quarantin[^.]*\bno\b[^.]*\bcommand\b/i);
-  expect(quarantine).not.toMatch(/\bUPDATE\s+nodes\b|\bunquarantine\b/i);
+  expect(quarantine).toContain('fluxwarden nodes recover');
+  expect(quarantine).toMatch(/original[^.]*\b(?:identity|expected_pubkey)\b|\b(?:identity|expected_pubkey)\b[^.]*original/i);
+  expect(quarantine).toMatch(/read[- ]only[^.]*reconcil|reconcil[^.]*read[- ]only/i);
+  expect(quarantine).toMatch(/\b(?:do not|never|must not)\b[^.]*\bSQL\b/i);
+  expect(quarantine).toMatch(/\b(?:do not|never|must not)\b[^.]*\b(?:erase|delete)\b[^.]*\bhistory\b/i);
+  for (const term of ['attempts', 'hashes', 'HELD', 'terminal evidence']) expect(quarantine, `quarantine preserves ${term}`).toContain(term);
+  expect(quarantine).not.toMatch(/\bUPDATE\s+nodes\b/i);
 });
 
 // Positioning claims (public positioning rule). Prose documents take the strict phrase list; the

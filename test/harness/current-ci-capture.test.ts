@@ -5,7 +5,7 @@
 // and scanned output are publishable; original source bytes remain private.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, statSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
@@ -16,6 +16,7 @@ import { parseYaml } from '../helpers/yaml.js';
 import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { registerSentinels, sentinels } from '../helpers/output.js';
 import { registerMoneySafetyCredentials } from '../helpers/public-money-safety.js';
+import { proveDispatcherExit, provePlatformPlans } from '../helpers/oct26-ci-oracles.js';
 
 const captureCli = join(repoRoot, 'scripts/ci-capture.mjs');
 const digest = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex');
@@ -112,6 +113,114 @@ process.exitCode = ${String(exitCode)};
     receipt() { return asRecord(JSON.parse(readFileSync(join(capture, 'receipt.json'), 'utf8')) as unknown, 'safe receipt'); },
   };
 }
+
+function metadataNamespace(f: ReturnType<typeof fixture>): unknown[] {
+  const walk = (path: string): string[] => [path, ...(lstatSync(path).isDirectory()
+    ? readdirSync(path).flatMap(name => walk(join(path, name))) : [])];
+  return [f.root, f.sourceRoot, f.scratch, f.evidence, f.capture, f.temp].flatMap(walk).map(path => {
+    const info = lstatSync(path, { bigint: true });
+    return { pathSha256: digest(path), dev: String(info.dev), ino: String(info.ino), mode: String(info.mode), nlink: String(info.nlink),
+      mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs), sha256: info.isFile() ? digest(readFileSync(path)) : null };
+  });
+}
+
+function safeMetadata(f: ReturnType<typeof fixture>, extraEnv: NodeJS.ProcessEnv = {}) {
+  // This output destination is outside every sealed invocation scope.
+  const outputRoot = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ci-safe-metadata-output-'));
+  const output = join(outputRoot, 'github-output.txt'), before = metadataNamespace(f);
+  const result = spawnSync(process.execPath, [...ownedCaptureToolArgs([join(repoRoot, 'scripts/ci-safe-capture-metadata.mjs'),
+    '--root', f.root, '--capture-dir', f.capture])], { cwd: f.root, env: { ...f.env, ...extraEnv, GITHUB_OUTPUT: output },
+    encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  expect(result.error === undefined, 'metadata attestation completes within the existing capture command budget').toBe(true);
+  expect(result.signal).toBeNull(); expect(result.status).not.toBeNull();
+  const githubOutput = existsSync(output) ? readFileSync(output, 'utf8') : '';
+  expect(metadataNamespace(f), 'diagnostic eligibility cannot rewrite any original sealed namespace or receipt').toEqual(before);
+  expect(readdirSync(outputRoot), 'the helper creates no diagnostic export or copied private artifact').toEqual(existsSync(output) ? ['github-output.txt'] : []);
+  const published = Buffer.from(result.stdout + result.stderr + githubOutput);
+  const sources = [f.seed, f.macaroon, f.macaroon.subarray(1), f.signature, f.pem, f.der,
+    ...(existsSync(f.runtimeSource) ? [f.runtime] : [])];
+  expect(sources.every(bytes => !published.includes(bytes) && !published.includes(bytes.toString('hex')) && !published.includes(bytes.toString('base64'))),
+    'attestation never emits original source literals through public channels').toBe(true);
+  return { status: result.status, available: githubOutput.split(/\r?\n/).includes('available=true') };
+}
+
+function changeMetadataReceipt(f: ReturnType<typeof fixture>, change: (receipt: Record<string, unknown>) => void): void {
+  const receipt = f.receipt(); change(receipt);
+  const bytes = Buffer.from(JSON.stringify(receipt)), sidecarPath = join(f.capture, 'receipt.sha256');
+  const sidecar = asRecord(JSON.parse(readFileSync(sidecarPath, 'utf8')) as unknown, 'existing closed receipt sidecar');
+  sidecar['receiptSha256'] = digest(bytes);
+  // Keep the existing stable ordinary files and all other sidecar identities.
+  writeFileSync(join(f.capture, 'receipt.json'), bytes); writeFileSync(sidecarPath, JSON.stringify(sidecar));
+}
+
+it('CP-044/CI-SAFE-METADATA diagnostic availability preserves both normal verification and original failed-policy refusal', () => {
+  for (const leak of [false, true]) {
+    const f = fixture(); if (leak) f.script("process.stdout.write(bytes.toString('hex'))");
+    const result = f.invoke(); expect(result.error).toBeUndefined();
+    expect(result.status === 0).toBe(!leak);
+    expect(f.receipt()['result']).toMatchObject({ exitCode: 0, complete: true, leakFree: !leak, policySatisfied: !leak });
+    const before = f.invoke(true); expect(before.status === 0).toBe(!leak);
+    expect(safeMetadata(f)).toEqual({ status: 0, available: true });
+    expect(f.invoke(true).status === 0, 'diagnostic availability never converts a rejected capture into accepted validation').toBe(!leak);
+  }
+});
+
+it('CP-044/CI-SAFE-METADATA absent unclosed mismatched linked and source-incomplete receipts never become available', () => {
+  for (const mode of ['missing', 'unclosed', 'mismatched', 'linked', 'source-incomplete']) {
+    const f = fixture();
+    if (mode !== 'missing') {
+      expect(f.invoke().status, 'each integrity fault starts with an actual closed clean capture').toBe(0);
+      if (mode === 'unclosed') changeMetadataReceipt(f, receipt => { asRecord(receipt['result'], 'closed result')['complete'] = false; });
+      if (mode === 'mismatched') appendFileSync(join(f.capture, 'receipt.json'), '\n');
+      if (mode === 'linked') {
+        const aliasRoot = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ci-linked-metadata-'));
+        linkSync(join(f.capture, 'receipt.json'), join(aliasRoot, 'receipt-alias.json'));
+      }
+      if (mode === 'source-incomplete') rmSync(join(f.capture, 'private/sources', digest(f.runtime)));
+    }
+    const metadata = safeMetadata(f);
+    expect(metadata.available, 'integrity refusal cannot authorize diagnostic upload').toBe(false);
+    expect(metadata.status !== 0, 'unavailable metadata fails closed with an actual process exit').toBe(true);
+  }
+});
+
+it('CP-044/CI-SAFE-METADATA a runtime source literal in a rehashed safe-claim receipt cannot hide behind a declaration', () => {
+  const f = fixture(), receiptPath = join(f.capture, 'receipt.json');
+  // This exact deliberate poisoned metadata is outer fixture INPUT only. The
+  // independent metadata attestor receives no authority to exempt its literal.
+  declareFixturePaths([receiptPath]);
+  writeFileSync(join(f.scratch, 'declared-out.txt'), `${receiptPath}\n`, { mode: 0o600 });
+  expect(f.invoke().status).toBe(0);
+  expect(f.receipt()['result']).toMatchObject({ complete: true, leakFree: true, policySatisfied: true });
+  changeMetadataReceipt(f, receipt => { receipt['diagnosticLiteral'] = f.runtime.toString('hex'); });
+  const metadata = safeMetadata(f);
+  expect(metadata.available, 'no testTmp or declaration exemption applies to receipt metadata').toBe(false);
+  expect(metadata.status !== 0).toBe(true);
+});
+
+it('CP-044/CI-SAFE-METADATA unchanged physical source bytes cannot conceal changed Git text normalization', () => {
+  const f = fixture(), candidate = join(f.root, 'candidate.txt');
+  const git = (args: string[]): string => {
+    const result = spawnSync('git', args, { cwd: f.root, env: f.env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    expect(result.status, 'the independent Git normalization witness completes').toBe(0);
+    return result.stdout.trim();
+  };
+  git(['config', 'core.autocrlf', 'false']);
+  writeFileSync(candidate, 'frozen synthetic CRLF candidate\r\n');
+  git(['add', '--', 'candidate.txt']);
+  git(['-c', 'user.name=CI normalization fixture', '-c', 'user.email=fixture@invalid', '-c', 'commit.gpgsign=false',
+    'commit', '--quiet', '-m', 'tracked original CRLF source']);
+  const physicalSha256 = digest(readFileSync(candidate));
+  const originalNormalized = git(['hash-object', '--path=candidate.txt', 'candidate.txt']);
+  expect(f.invoke().status, 'the genuine CRLF capture is clean before interpretation changes').toBe(0);
+  writeFileSync(join(f.root, '.git/info/attributes'), 'candidate.txt text eol=lf\n');
+  expect(digest(readFileSync(candidate)), 'the original physical source bytes remain untouched').toBe(physicalSha256);
+  expect(git(['hash-object', '--path=candidate.txt', 'candidate.txt']), 'Git now interprets the same source under a different normalized identity')
+    .not.toBe(originalNormalized);
+  const metadata = safeMetadata(f);
+  expect(metadata.available, 'physical read-set equality cannot replace original Git interpretation parity').toBe(false);
+  expect(metadata.status !== 0).toBe(true);
+});
 
 it('CP-044/CI-SENTINELS concurrent fixture registration preserves every immutable source and strict capture provenance', () => {
   const f = fixture();
@@ -497,27 +606,167 @@ it('CP-044/CI-CAPTURE live positive control retains its originally registered so
   expect(retained.every(path => readFileSync(path).length > 0), 'retained positive-control sources are readable and nonempty').toBe(true);
 });
 
-it('CP-044/CI-CAPTURE every current hosted job captures commands before a final always-run verification and safe upload', () => {
+// Owner-routed D29 interface correction, frozen 593a6be: platform suites now
+// enter through ci-platform.mjs. The dispatcher must prove the same public
+// captured command plan and failure propagation; its filename alone is no proof.
+function hostedCapture(name: string, steps: Record<string, unknown>[]): boolean {
+  const condition = (step: Record<string, unknown>): string => String(step['if'] ?? 'success()').trim().replace(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/, '$1').trim();
+  const guardedBy = (step: Record<string, unknown>, id: string): boolean => condition(step).split(/\s*&&\s*/)
+    .some(term => term === `steps.${id}.outcome == 'success'` || term === `steps.${id}.outcome == "success"`);
+  const ordinaryArgument = '(?:"[^"\\r\\n]+"|\'[^\'\\r\\n]+\'|[^\\s;&|]+)';
+  const verifyCommand = new RegExp(`^node scripts/ci-capture\\.mjs verify(?: --root ${ordinaryArgument})?(?: --capture-dir ${ordinaryArgument})?$`);
+  const npmCommand = /\bnpm (?:test\b|run test:(?:harness|lab|chaos)\b)/;
+  const dispatcher = /\bnode scripts\/ci-platform\.mjs\b/;
+  const commandSteps = steps.filter(step => typeof step['run'] === 'string' && (npmCommand.test(step['run']) || dispatcher.test(step['run'])));
+  expect(commandSteps.length, `${name}: current real test commands remain selected`).toBeGreaterThan(0);
+  let dispatches = false;
+  for (const step of commandSteps) {
+    const command = String(step['run']);
+    if (dispatcher.test(command)) {
+      expect(name, 'only the approved platform job delegates its capture boundary').toBe('test');
+      const flags = [...command.matchAll(/--(os|node|shard)\s+["']?\$\{\{\s*matrix\.\1\s*\}\}["']?/g)];
+      expect(flags.map(match => match[1]).sort()).toEqual(['node', 'os', 'shard']);
+      expect(command.replace(/--(os|node|shard)\s+["']?\$\{\{\s*matrix\.\1\s*\}\}["']?/g, '').trim(), 'dispatcher invocation contains no uncaptured trailing command').toBe('node scripts/ci-platform.mjs');
+      expect(npmCommand.test(command), 'real suite execution belongs inside the dispatcher capture').toBe(false);
+      dispatches = true;
+    } else {
+      const capture = command.search(/scripts\/ci-capture\.mjs\b/);
+      expect(capture, `${name}: each real command enters the finite capture boundary`).toBeGreaterThanOrEqual(0);
+      expect(capture, `${name}: capture opens before test execution`).toBeLessThan(command.search(npmCommand));
+    }
+  }
+  const lastCommand = Math.max(...commandSteps.map(step => steps.indexOf(step)));
+  const standalone = steps.filter(step => /ci-capture\.mjs\s+verify\b/.test(String(step['run'] ?? '')));
+  expect(standalone.length, 'one standalone census verifier suffices when present').toBeLessThanOrEqual(1);
+  for (const step of standalone) {
+    expect(String(step['run']).trim(), 'verification must be an actual unmasked command').toMatch(verifyCommand);
+    expect(steps.indexOf(step)).toBeGreaterThan(lastCommand);
+    expect(condition(step), 'standalone verification always runs').toBe('always()');
+    expect(step['continue-on-error'] ?? false).toBe(false);
+  }
+  const seals = steps.filter(step => /release-ci\.mjs[\s\S]*\bseal\b/.test(String(step['run'] ?? '')));
+  expect(seals.length, 'a report has one actual verification/seal phase').toBeLessThanOrEqual(1);
+  for (const step of seals) {
+    const key = name === 'test' ? 'platform/${{ matrix.os }}/${{ matrix.node }}/${{ matrix.shard }}' : `live/${name}`;
+    expect(['test', 'lab', 'chaos'], 'unsealed producer and inventory jobs retain standalone verification').toContain(name);
+    const command = String(step['run']).trim();
+    expect([`node scripts/release-ci.mjs seal --key "${key}"`, `node scripts/release-ci.mjs seal --key '${key}'`,
+      ...(name === 'test' ? [] : [`node scripts/release-ci.mjs seal --key ${key}`])], 'only the exact public seal command and original row key qualify').toContain(command);
+    expect(step['continue-on-error'] ?? false).toBe(false);
+    const previous = standalone[0];
+    if (previous && condition(step) !== 'always()') {
+      expect(steps.indexOf(step)).toBeGreaterThan(steps.indexOf(previous));
+      expect(condition(step).split(/\s*&&\s*/)).toHaveLength(2);
+      expect(condition(step).startsWith('always() && ')).toBe(true);
+      expect(guardedBy(step, String(previous['id']))).toBe(true);
+    } else expect(condition(step), 'composed verification has no stale or disabled prerequisite').toBe('always()');
+  }
+  const verifier = seals[0] ?? standalone[0], verification = verifier ? steps.indexOf(verifier) : -1;
+  expect(verification, `${name}: final invocation census verification follows generated outputs`).toBeGreaterThan(lastCommand);
+  expect(typeof verifier?.['id'], 'the verification step has a real explicit id').toBe('string');
+  expect(String(verifier?.['id']), 'upload credit identifies the actual verification phase').toMatch(/^[A-Za-z_][A-Za-z0-9_-]*$/);
+  const uploads = steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
+  expect(uploads.length, `${name}: safe receipt is retained`).toBeGreaterThan(0);
+  let releaseUploads = 0;
+  for (const step of uploads) {
+    expect(steps.indexOf(step), 'safe upload follows final verification').toBeGreaterThan(verification);
+    const options = asRecord(step['with'], 'upload options');
+    expect(options['if-no-files-found']).toBe('error');
+    expect(String(options['path']), 'raw source roots are never upload paths').not.toMatch(/SENTINEL|sentinel|sources|inputs/i);
+    const guard = condition(step);
+    expect(guard, 'upload guards cannot bypass verification with an alternative or disabled expression').not.toMatch(/\|\||\bfalse\b/);
+    expect(guard).toMatch(/^(?:always|success)\(\)\s*&&/);
+    for (const match of guard.matchAll(/\bsteps\.([\w-]+)\.outcome\b/g)) expect(steps.some(candidate => candidate['id'] === match[1]), 'outcome guards reference real retained steps').toBe(true);
+    const metadata = steps.find(candidate => candidate['id'] && guardedBy(step, String(candidate['id']))
+      && String(candidate['run'] ?? '').trim() === 'node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"');
+    if (metadata && String(options['path']) === '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json') {
+      expect(steps.indexOf(step)).toBeGreaterThan(steps.indexOf(metadata));
+      expect(condition(metadata)).toBe('always()'); expect(metadata['continue-on-error'] ?? false).toBe(false);
+      expect(guard.split(/\s*&&\s*/)).toContain(`steps.${String(metadata['id'])}.outputs.available == 'true'`);
+    } else if (String(options['path']) === '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json'
+      && standalone[0] && guardedBy(step, String(standalone[0]['id']))) {
+      // Legacy receipt-only retention still has full independent verification;
+      // it cannot stand in for a sealed release report upload.
+      if (!seals.length) releaseUploads++;
+    } else {
+      expect(guardedBy(step, String(verifier?.['id'])), 'release uploads require success of the actual standalone or composed verifier').toBe(true);
+      releaseUploads++;
+    }
+  }
+  expect(releaseUploads, 'diagnostic confidentiality eligibility cannot replace validation upload credit').toBeGreaterThan(0);
+  return dispatches;
+}
+
+it('CP-044/CI-CAPTURE every current hosted job captures commands before a final always-run verification and safe upload', async () => {
   const jobs = asRecord(asRecord(parseYaml(readText('.github/workflows/ci.yml')), 'workflow')['jobs'], 'jobs');
+  let dispatches = false;
   for (const name of ['test', 'lab', 'chaos']) {
     const stepsValue = asRecord(jobs[name], name)['steps'];
     const steps = records(stepsValue, `${name} steps`);
-    const commandSteps = steps.filter(step => typeof step['run'] === 'string' && /\bnpm (?:test\b|run test:(?:harness|lab|chaos)\b)/.test(step['run']));
-    expect(commandSteps.length, 'current real test commands remain selected').toBeGreaterThan(0);
-    for (const step of commandSteps) expect(String(step['run']), `${name}: each real command enters the finite capture boundary`).toMatch(/scripts\/ci-capture\.mjs\b/);
-    const lastCommand = Math.max(...commandSteps.map(step => steps.indexOf(step)));
-    const verification = steps.findIndex((step, index) => index > lastCommand && typeof step['run'] === 'string' && /ci-capture\.mjs\s+verify\b/.test(step['run']));
-    expect(verification, `${name}: final invocation census verification follows generated outputs`).toBeGreaterThan(lastCommand);
-    expect(String(steps[verification]?.['if']), `${name}: failures still receive final verification`).toMatch(/always\(\)/);
-    const uploads = steps.filter(step => typeof step['uses'] === 'string' && step['uses'].startsWith('actions/upload-artifact@'));
-    expect(uploads.length, `${name}: safe receipt is retained`).toBeGreaterThan(0);
-    for (const step of uploads) {
-      expect(steps.indexOf(step), 'safe upload follows final verification').toBeGreaterThan(verification);
-      const options = asRecord(step['with'], 'upload options');
-      expect(options['if-no-files-found']).toBe('error');
-      expect(String(options['path']), 'raw source roots are never upload paths').not.toMatch(/SENTINEL|sentinel|sources|inputs/i);
-      expect(String(step['if']), 'upload is conditional on successful final verification').toMatch(/success/);
-    }
+    if (hostedCapture(name, steps)) dispatches = true;
+  }
+  if (dispatches) {
+    await provePlatformPlans();
+    await proveDispatcherExit();
+  }
+});
+
+it('CP-044/CI-CAPTURE dispatcher selection still refuses unwrapped suites late capture missing final verification and unsafe uploads', () => {
+  const run = { run: 'node scripts/ci-platform.mjs --os "${{ matrix.os }}" --node "${{ matrix.node }}" --shard "${{ matrix.shard }}"' };
+  const verify = { id: 'capture-verify', run: 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"', if: 'always()' };
+  const upload = { uses: `actions/upload-artifact@${'a'.repeat(40)}`, if: "always() && steps.capture-verify.outcome == 'success'",
+    with: { path: '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json', 'if-no-files-found': 'error' } };
+  expect(hostedCapture('test', [run, verify, upload])).toBe(true);
+  for (const steps of [
+    [{ run: 'npm test' }, verify, upload],
+    [{ run: 'npm test\nnode scripts/ci-capture.mjs --root "$PWD"' }, verify, upload],
+    [{ run: `${run.run}\nnpm test` }, verify, upload],
+    [{ run: `${run.run}; node unrelated.mjs` }, verify, upload],
+    [run, upload], [run, { ...verify, if: 'success()' }, upload],
+    [run, { ...verify, if: 'always() && false' }, upload], [run, { ...verify, 'continue-on-error': true }, upload],
+    [run, { ...verify, run: `echo ${verify.run}` }, upload],
+    [run, upload, verify], [run, verify, { ...upload, if: 'always()' }],
+    [run, verify, { ...upload, with: { ...upload.with, path: '${{ env.FLUXWARDEN_SENTINEL_DIR }}' } }],
+  ]) expect(() => hostedCapture('test', steps)).toThrow();
+  expect(() => hostedCapture('lab', [run, verify, upload]), 'live jobs cannot use the platform delegation exception').toThrow();
+});
+
+it('CP-044/CI-CAPTURE exact always-run composed verification seals preserve legacy checks and cannot borrow diagnostic credit', () => {
+  const verify = { id: 'capture-verify', if: 'always()', run: 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"' };
+  const upload = { uses: `actions/upload-artifact@${'a'.repeat(40)}`, if: "always() && steps.report-seal.outcome == 'success'",
+    with: { path: '${{ env.FLUXWARDEN_RELEASE_OUTPUT }}/report.json', 'if-no-files-found': 'error' } };
+  for (const name of ['test', 'lab', 'chaos']) {
+    const run = { run: name === 'test' ? 'node scripts/ci-platform.mjs --os "${{ matrix.os }}" --node "${{ matrix.node }}" --shard "${{ matrix.shard }}"'
+      : `node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- npm run test:${name}` };
+    const key = name === 'test' ? 'platform/${{ matrix.os }}/${{ matrix.node }}/${{ matrix.shard }}' : `live/${name}`;
+    const seal = { id: 'report-seal', if: 'always()', run: `node scripts/release-ci.mjs seal --key "${key}"` };
+    expect(hostedCapture(name, [run, seal, upload])).toBe(name === 'test');
+    expect(hostedCapture(name, [run, verify, { ...seal, if: "always() && steps.capture-verify.outcome == 'success'" },
+      { ...upload, if: "always() && steps.capture-verify.outcome == 'success' && steps.report-seal.outcome == 'success'" }])).toBe(name === 'test');
+    for (const steps of [
+      [run, upload], [run, { ...seal, run: `echo ${seal.run}` }, upload],
+      [run, { ...seal, run: 'node scripts/release-ci.mjs seal --key live/unrelated' }, upload],
+      [run, { ...seal, run: `${seal.run} || true` }, upload],
+      [run, { ...seal, if: 'success()' }, upload], [run, { ...seal, if: 'always() && false' }, upload],
+      [run, { ...seal, if: "always() && steps.capture-verify.outcome == 'success'" }, upload],
+      [run, { ...seal, 'continue-on-error': true }, upload], [seal, run, upload], [run, upload, seal],
+      [run, seal, { ...upload, if: "always() && steps.capture-verify.outcome == 'success'" }],
+      [run, seal, { ...upload, if: "always() || steps.report-seal.outcome == 'success'" }],
+    ]) expect(() => hostedCapture(name, steps)).toThrow();
+    const metadata = { id: 'capture-metadata', if: 'always()', run: 'node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"' };
+    const diagnostic = { ...upload, if: "always() && steps.capture-metadata.outcome == 'success' && steps.capture-metadata.outputs.available == 'true'",
+      with: { ...upload.with, path: '${{ env.FLUXWARDEN_CI_CAPTURE_DIR }}/receipt.json' } };
+    expect(hostedCapture(name, [run, seal, upload, metadata, diagnostic])).toBe(name === 'test');
+    expect(() => hostedCapture(name, [run, seal, metadata, diagnostic]), 'diagnostics alone provide no release credit').toThrow();
+    expect(() => hostedCapture(name, [run, seal, metadata, { ...upload, if: diagnostic.if }]), 'diagnostic eligibility cannot publish release reports').toThrow();
+    expect(() => hostedCapture(name, [run, seal, upload, metadata, { ...diagnostic, if: "always() && steps.capture-metadata.outcome == 'success'" }]),
+      'diagnostic upload also requires independent confidentiality availability').toThrow();
+  }
+  const unsealed = { run: 'node scripts/ci-capture.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR" -- npm test' };
+  const unsealedUpload = { ...upload, if: "success() && steps.capture-verify.outcome == 'success'" };
+  for (const name of ['inventory', 'demo']) {
+    expect(hostedCapture(name, [unsealed, verify, unsealedUpload])).toBe(false);
+    expect(() => hostedCapture(name, [unsealed, unsealedUpload]), 'unsealed producers retain actual standalone verification').toThrow();
   }
 });
 
@@ -691,12 +940,13 @@ function failureDetails(result: { stdout: string; stderr: string }): Record<stri
   expect(Array.isArray(details['reports']) && Array.isArray(details['errors']), 'diagnostics use fixed report and error arrays').toBe(true);
   return details;
 }
-function failureReport(details: Record<string, unknown>): Record<string, unknown> {
-  const reports = records(details['reports'], 'safe report metadata').filter(row => row['report'] === 'vitest-harness.json');
+const diagnosticReports = ['vitest-harness.json', 'vitest-lab.json', 'vitest-chaos.json'] as const;
+function failureReport(details: Record<string, unknown>, reportName = 'vitest-harness.json'): Record<string, unknown> {
+  const reports = records(details['reports'], 'safe report metadata').filter(row => row['report'] === reportName);
   expect(reports.length, 'the report is identified by its fixed basename').toBe(1);
   return reports[0] ?? {};
 }
-function diagnosticFixture() {
+function diagnosticFixture(reportName = 'vitest-harness.json') {
   const f = fixture(), relativeFile = 'test/diagnostic.test.mjs';
   const vitest = pathToFileURL(join(repoRoot, 'node_modules/vitest/dist/index.js')).href;
   writeFileSync(join(f.root, relativeFile), `import { expect, it } from ${JSON.stringify(vitest)};
@@ -712,11 +962,12 @@ allowOnly: false, passWithNoTests: false, maxWorkers: 1, fileParallelism: false 
     const result = spawnSync('git', args, { cwd: f.root, env: f.env, encoding: 'utf8', windowsHide: true, timeout: 10_000 });
     expect(result.status, 'diagnostic source provenance uses explicit tracked fixture inputs').toBe(0);
   }
-  return Object.assign(f, { relativeFile, reportPath: join(f.evidence, 'vitest-harness.json') });
+  return Object.assign(f, { relativeFile, reportPath: join(f.evidence, reportName) });
 }
 
-it('CP-044/CI-DIAGNOSTIC actual failed Vitest report exposes counts and hashes with a tracked source frame', () => {
-  const f = diagnosticFixture();
+for (const reportName of diagnosticReports) {
+it(`CP-044/CI-DIAGNOSTIC actual failed Vitest report exposes counts and hashes with a tracked source frame${reportName === 'vitest-harness.json' ? '' : ` (${reportName})`}`, () => {
+  const f = diagnosticFixture(reportName);
   f.script(`const { spawnSync } = await import('node:child_process');
 const run = spawnSync(process.execPath, ${JSON.stringify([join(repoRoot, 'scripts/ci-test-driver.mjs'), 'run',
     '--config', join(f.root, 'vitest.config.mjs'), '--root', f.root, '--maxWorkers=1', '--fileParallelism=false',
@@ -740,7 +991,7 @@ writeFileSync(join(scratch, 'owned.db'), bytes);`, 1);
   expect(f.receipt()['result']).toMatchObject({ exitCode: 1, leakFree: false, policySatisfied: false });
   const verification = f.invoke(true);
   expect(verification.status !== null && verification.status !== 0, 'actual failed-report diagnostics cannot excuse the deliberate source disclosure').toBe(true);
-  const metadata = failureReport(failureDetails(result));
+  const metadata = failureReport(failureDetails(result), reportName);
   expect(metadata).toMatchObject({ status: 'OK', passed: 1, failed: 1, pending: 0, sha256: digest(reportBytes) });
   const rows = records(metadata['failures'], 'failed case metadata');
   expect(rows).toHaveLength(1);
@@ -751,8 +1002,8 @@ writeFileSync(join(scratch, 'owned.db'), bytes);`, 1);
     || JSON.stringify(metadata).includes(f.root), 'raw title, exception and absolute frame path remain private').toBe(false);
 }, 15_000);
 
-it('CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames cannot become public source paths', () => {
-  const f = diagnosticFixture(), marker = 'REPLACE_FIXTURE_SECRET';
+it(`CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames cannot become public source paths${reportName === 'vitest-harness.json' ? '' : ` (${reportName})`}`, () => {
+  const f = diagnosticFixture(reportName), marker = 'REPLACE_FIXTURE_SECRET';
   const suites = Array.from({ length: 17 }, (_, index) => {
     const path = index === 0 ? `${f.root}/../${marker}/escape.test.mjs` : `${f.root}/test/${marker}-${String(index)}.test.mjs`;
     return { name: path, status: 'failed', assertionResults: [{ fullName: `${marker} title ${String(index)}`, title: `${marker} title ${String(index)}`,
@@ -764,7 +1015,7 @@ it('CP-044/CI-DIAGNOSTIC poisoned report fields stay hashed and untracked frames
   // and retained copies belong to the outer fixture's prospective INPUT setup.
   declareFixtureCapture(f.capture, [], [{ path: f.reportPath, bytes: reportBytes }]);
   f.script(`const report = JSON.parse(${JSON.stringify(JSON.stringify(template))}.replaceAll(${JSON.stringify(marker)}, bytes.toString('hex')));
-writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 7);
+writeFileSync(join(evidence, ${JSON.stringify(reportName)}), JSON.stringify(report));`, 7);
   const result = f.invoke(), receipt = f.receipt(), verify = f.invoke(true);
   expect(result.error).toBeUndefined();
   expect(result.status, 'diagnostics preserve the original child failure').toBe(7);
@@ -774,7 +1025,7 @@ writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 
   const published = Buffer.from(result.stdout + result.stderr + verify.stdout + verify.stderr + JSON.stringify(receipt));
   expect([f.seed, Buffer.from(f.seed.toString('hex')), Buffer.from(f.seed.toString('base64'))].every(bytes => !published.includes(bytes)),
     'synthetic registered secrets in title, message and path never appear in public channels').toBe(true);
-  const metadata = failureReport(failureDetails(result));
+  const metadata = failureReport(failureDetails(result), reportName);
   expect(metadata).toMatchObject({ status: 'OK', passed: 0, failed: 17, pending: 0, sha256: digest(reportBytes) });
   const rows = records(metadata['failures'], 'bounded poisoned case metadata');
   expect(rows, 'failure diagnostics have the original fixed sixteen-case bound').toHaveLength(16);
@@ -785,19 +1036,20 @@ writeFileSync(join(evidence, 'vitest-harness.json'), JSON.stringify(report));`, 
   expect(rows[0]).toMatchObject({ titleSha256: digest(String(first?.fullName).replaceAll(marker, f.seed.toString('hex'))),
     messageSha256: digest((first?.failureMessages ?? []).join('\n').replaceAll(marker, f.seed.toString('hex'))) });
 }, 15_000);
+}
 
-for (const status of ['INVALID', 'OVERSIZE', 'MISSING'] as const) {
-  it(`CP-044/CI-DIAGNOSTIC ${status} report cannot change original failure receipt or verification`, () => {
+for (const reportName of diagnosticReports) for (const status of reportName === 'vitest-harness.json' ? ['INVALID', 'OVERSIZE', 'MISSING'] : ['INVALID']) {
+  it(`CP-044/CI-DIAGNOSTIC ${status} report cannot change original failure receipt or verification${reportName === 'vitest-harness.json' ? '' : ` (${reportName})`}`, () => {
     const f = fixture();
-    const body = status === 'MISSING' ? '' : status === 'INVALID' ? "writeFileSync(join(evidence, 'vitest-harness.json'), '{');"
-      : "writeFileSync(join(evidence, 'vitest-harness.json'), ' '.repeat(16 * 1024 * 1024 + 1));";
+    const body = status === 'MISSING' ? '' : status === 'INVALID' ? `writeFileSync(join(evidence, ${JSON.stringify(reportName)}), '{');`
+      : `writeFileSync(join(evidence, ${JSON.stringify(reportName)}), ' '.repeat(16 * 1024 * 1024 + 1));`;
     f.script(body, 7);
     const result = f.invoke();
     expect(result.error, 'diagnostic parsing retains the ordinary capture deadline').toBeUndefined();
     expect(result.status, 'diagnostic-only refusal does not replace the original child failure').toBe(7);
     expect(f.receipt()['result']).toMatchObject({ exitCode: 7, complete: true, leakFree: true, policySatisfied: true });
     expect(f.invoke(true).status, 'report diagnostic status cannot alter independent evidence verification').toBe(0);
-    const metadata = failureReport(failureDetails(result));
+    const metadata = failureReport(failureDetails(result), reportName);
     expect(metadata['status']).toBe(status);
     expect(['passed', 'failed', 'pending'].every(key => metadata[key] === undefined || metadata[key] === null),
       'unvalidated reports cannot publish invented numeric counts').toBe(true);

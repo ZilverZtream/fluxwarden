@@ -233,6 +233,11 @@ export function createOwnerOnlyDirectory(path: string): boolean {
   return createPrivateObjects([path], 'directory', false)[0] === true;
 }
 
+/** Sibling directories share startup, with every created native DACL still read back and verified. */
+export function createOwnerOnlyDirectories(paths: readonly string[]): boolean[] {
+  return createPrivateObjects(paths, 'directory', true);
+}
+
 // This operation opens only an existing file. The held handle admits its identity, owner and full
 // DACL before changing permissions, then reads them back from that same handle. ReadWrite sharing
 // and desired rights without DELETE keep an existing SQLite WAL/SHM connection usable.

@@ -10,6 +10,8 @@ Execution pins node identity and network, rechecks fresh snapshots and validates
 
 Journal and status changes share a transaction, debits equal credits, and append-only records reject modification. Replays cannot duplicate journal events or consume an approval twice. Corrections use reversing journals.
 
+State backups preserve the original alert signing key, exact retained run records and signed alerts alongside a consistent SQLite snapshot. These private bundles are credential material, distinct from sanitized public evidence exports. Restore verifies their integrity and refuses occupied or unsafe destinations. Its persistent admission barrier blocks approval and execution until successful full reconciliation against every restored original node. Explicit node recovery cannot rebind identity or reconstruct unprovable legacy provenance. Follow the [recovery procedure](runbooks/backup-restore.md) without SQL edits or financial-history deletion.
+
 ## Private files and environment
 
 State directories are owner-only and new files use mode 0600 on POSIX or protected owner-only DACLs on Windows. Existing owners, modes, DACLs, link counts and trusted ancestry are verified. An existing unsafe object is refused without permission changes. Ancestors must prevent foreign replacement of the path. The operator approval key is read only by the signing command; node credentials and TLS trust anchors are read by path. TLS hostname verification and certificate pinning have no insecure override.

@@ -206,7 +206,9 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       const now = db.now();
       return [route.sourceChannelKey, route.targetChannelKey].some(key => {
         const channel = baseline?.find(entry => entry.channelKey === key);
-        return channel === undefined || Math.abs(now - channel.observedAt) > input.policy.maxSnapshotAgeMs;
+        if (channel === undefined) return true;
+        const age = now - channel.observedAt;
+        return !Number.isSafeInteger(age) || age < 0 || age > input.policy.maxSnapshotAgeMs;
       });
     };
     if (stale()) {
@@ -319,6 +321,7 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
   // INV-15 and route validation: only a route approveRoute returned, under a RegtestProof, is ever dispatched.
   if (!isApprovedRoute(route)) return outcome(ExitCode.SAFETY_REFUSAL, 'network-lock');
   try {
+    db.state.assertAdmitted();
     if (!db.executions.holds(executionId, epoch)) return outcome(ExitCode.SAFETY_REFUSAL, LEASE_LOST);
     const stored = db.executions.view(executionId)?.paymentHash ?? null;
     if (stored !== null) {
@@ -332,6 +335,7 @@ export async function dispatchExecution(deps: DispatchDeps, input: DispatchInput
       prepared = intent;
     }
   } catch (error) {
+    if (error instanceof PersistenceError && error.code === 'RESTORE_PENDING') return outcome(ExitCode.SAFETY_REFUSAL, 'restore');
     if (error instanceof LeaseLost) return outcome(ExitCode.SAFETY_REFUSAL, LEASE_LOST);
     throw error;
   }

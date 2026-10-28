@@ -7,7 +7,7 @@ import { failed } from '../fakes/execution-node.js';
 import { loadSource } from '../helpers/adapter-interfaces.js';
 import { force } from '../helpers/cp028-executor.js';
 import { prepare } from '../helpers/cp030-dispatch.js';
-import { exec, loadReconciler, reservationState, rowOf, type PaymentObservation } from '../helpers/cp030-execution.js';
+import { loadReconciler, reservationState, rowOf, type PaymentObservation } from '../helpers/cp030-execution.js';
 import { loadLedger, scratchDb, seededLedger, type LedgerDatabase } from '../helpers/cp037-ledger.js';
 
 for (const evidence of ['confirmed-failed', 'in-flight', 'ambiguous'] as const) {
@@ -15,13 +15,13 @@ for (const evidence of ['confirmed-failed', 'in-flight', 'ambiguous'] as const) 
     const payer: PaymentObservation = evidence === 'confirmed-failed' ? failed('SENDPAY_FAILED') : evidence === 'in-flight'
       ? { kind: 'IN_FLIGHT' } : { kind: 'AMBIGUOUS', cause: 'ordinary observation unavailable' };
     const r = await prepare(`external-deleted-invoice-${evidence}`, {
+      node: { implementation: 'cln' },
       script: () => ({
         send: context => { context.onDispatched?.(); return Promise.resolve({ kind: 'AMBIGUOUS', cause: 'ordinary lost acknowledgement' }); },
         observe: () => Promise.resolve(payer), invoiceState: () => Promise.resolve('NOT_FOUND'), cancel: () => Promise.resolve('NOT_FOUND'),
       }),
     });
     expect((await r.run()).exit).toBe(7);
-    exec(r.path, "UPDATE nodes SET implementation = 'cln' WHERE id = ?", r.base.nodeId);
     const { reconcile } = await loadReconciler();
     const db = r.p.openDatabase(r.path, { readOnly: false });
     try {

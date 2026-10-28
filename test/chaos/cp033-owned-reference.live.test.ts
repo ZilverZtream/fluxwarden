@@ -37,7 +37,7 @@ it('CP-033/B1 T-05 CLN response cut preserves one hash and reconciles exactly on
     const plan = cli(['liquidity','plan','--refresh'],'t05-cln-plan');
     expect(plan.exit).toBe(0);
     const proposal = plan.body.result;
-    expect(proposal, 'fresh eligible intent from public planner').toMatchObject({ action:'CIRCULAR_REBALANCE', principal_msat:'100000000', policy_sha256:'baaae43179d69c79ee0fe9a16410463ec403eed1aa78f4d740481c6b25184287' });
+    expect(proposal, 'fresh eligible intent from public planner').toMatchObject({ action:'CIRCULAR_REBALANCE', principal_msat:'100000000', policy_sha256:input().policySha256 });
     const p = input();
     expect(cli(['liquidity','approve',String(proposal['proposal_id']),'--key',p.key], 't05-cln-approve').exit).toBe(0);
     const chaos = cli(['lab','chaos','--case','T-05'],'t05-cln-chaos');

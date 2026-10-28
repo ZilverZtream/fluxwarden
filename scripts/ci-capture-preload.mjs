@@ -9,7 +9,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname, basename } from 'node:path';
 import { files, inside, retain, hash, binding, ancestry } from './ci-capture-files.mjs';
-import { secretProducer, producerEnvironment } from './ci-secret-output.mjs';
+import { secretProducer, producerEnvironment, stateCopyProducer, verifyStateCopy } from './ci-secret-output.mjs';
 
 const capture = process.env.FLUXWARDEN_CI_CAPTURE;
 let authorizeOutput;
@@ -38,13 +38,22 @@ if (capture) {
     try { originals.lstatSync(path); throw new Error('secret output already exists'); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   };
-  authorizeOutput = ({ path, command, args }) => {
+  const producerFor = row => row.kind === 'state-outbox-copy' ? stateCopyProducer(config, row.command, row.args, row.path, row.sourcePath) : secretProducer(config, row.command, row.args, row.path);
+  authorizeOutput = ({ path, command, args, kind, sourcePath, env }) => {
     try {
+      if (kind !== undefined && kind !== 'state-outbox-copy') throw new Error('secret output kind');
       if (typeof path !== 'string' || path !== resolve(path) || intents.has(path)
         || ![...config.roots, ...config.outputs].some(root => inside(root, path))
         || inside(config.evidenceDir, path) || inside(config.sentinelDir, path) || config.registered.includes(path)) throw new Error('secret output destination');
       absent(path);
-      const row = { purpose: 'SECRET_OUTPUT', prospective: true, path, command, args: [...args], producer: secretProducer(config, command, args, path), parents: ancestry(dirname(path)), state: 'authorized' };
+      const row = { purpose: 'SECRET_OUTPUT', prospective: true, path, command, args: [...args], ...(kind ? { kind, sourcePath } : {}), state: 'authorized' };
+      row.producer = producerFor(row);
+      if (kind) {
+        if (!env || typeof env !== 'object') throw new Error('state output explicit environment');
+        absent(row.producer.root);
+        row.intendedEnvironment = producerEnvironment({ env }).identity;
+        row.parents = ancestry(dirname(row.producer.root));
+      } else row.parents = ancestry(dirname(path));
       const ledger = join(capture, 'private', 'authorizations', 'secret-output-' + hash(path) + '.json');
       absent(ledger);
       saveIntent(row);
@@ -72,9 +81,11 @@ if (capture) {
     try {
       if (row.state !== 'authorized' || options?.shell || options?.windowsVerbatimArguments || options?.input != null) throw new Error('secret output execution');
       absent(row.path);
-      if (JSON.stringify(row.producer) !== JSON.stringify(secretProducer(config, command, args, row.path))
-        || row.prospective && JSON.stringify(row.parents) !== JSON.stringify(ancestry(dirname(row.path)))) throw new Error('secret output producer changed');
+      if (row.kind) absent(row.producer.root);
+      if (JSON.stringify(row.producer) !== JSON.stringify(producerFor(row))
+        || row.prospective && JSON.stringify(row.parents) !== JSON.stringify(ancestry(dirname(row.kind ? row.producer.root : row.path)))) throw new Error('secret output producer changed');
       environment ??= producerEnvironment(options);
+      if (row.kind && JSON.stringify(row.intendedEnvironment) !== JSON.stringify(environment.identity)) throw new Error('state output environment changed');
       row.environment = environment.identity;
       row.state = 'started'; saveIntent(row);
       return { row, env: environment.env };
@@ -95,10 +106,20 @@ if (capture) {
       if (!row.prospective && result.status !== 0 && !fs.existsSync(row.path)) {
         row.state = 'not-produced'; saveIntent(row); return;
       }
-      if (!row.prospective) row.parents = ancestry(dirname(row.path));
+      if (!row.prospective || row.kind) row.parents = ancestry(dirname(row.path));
       row.file = binding(row.path); row.state = 'closed';
       if (result.status === 0 && !result.signal && !result.error) {
         if (fs.statSync(row.path).size > 65_536) throw new Error('secret output source bound');
+        if (row.kind) {
+          row.closedNamespace = verifyStateCopy(config, row).contents;
+          if (row.producer.operation === 'restore') {
+            // Preserve the actual independently validated result before the
+            // caller can reconcile it. Later database evolution is ordinary;
+            // the original signing-key output remains immutable.
+            const snapshot = retain(capture, row.producer.database, 'EGRESS');
+            row.restoreSnapshot = binding(join(capture, 'private', 'bytes', snapshot.sha256));
+          }
+        }
         // Observe the original before returning control to the caller: it is a
         // SOURCE identity without changing its original SECRET_OUTPUT purpose.
         retain(capture, row.path, 'SECRET_OUTPUT');

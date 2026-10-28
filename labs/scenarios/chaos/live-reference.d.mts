@@ -2,7 +2,7 @@ import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from 'node:
 export type Row = Record<string, unknown>;
 export interface Result { exit:number|null; body:{ result:Row; error:Row|null }; signal:string|null; stderr:string }
 export function setRunner(value:(file:string,args:string[],options:SpawnSyncOptionsWithStringEncoding)=>SpawnSyncReturns<string>):void;
-export function input(): { key:string; tmp:string; evidence:string; config:string; database:string; policy:string; sentinels:string; ownerPath:string; owner:{ project:string;ports:{toxiproxy:number} }; manifest:Row };
+export function input(): { key:string; tmp:string; evidence:string; config:string; database:string; policy:string; policySha256:string; sentinels:string; ownerPath:string; owner:{ project:string;ports:{toxiproxy:number} }; manifest:Row };
 export function initializeRegistry():void;
 export function preflight(name:string):Promise<Row>;
 export function history():Record<string,Row[]>;

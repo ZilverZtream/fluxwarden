@@ -39,10 +39,13 @@ fluxwarden actions status <execution-id> --watch
 fluxwarden ledger verify
 fluxwarden reconcile --node cln-m --since 1h
 fluxwarden evidence export --run-id <run-id> --out bundle
+fluxwarden state backup --out state-bundle
+fluxwarden state restore --from state-bundle --config new-state.yaml
+fluxwarden nodes recover cln-m
 fluxwarden daemon
 ```
 
---config selects configuration and --json prints one JSON envelope. Top-level --help and --version need no configuration. --collect selects collection alone for the daemon. Connection overrides use --url, --tls-cert-path and --macaroon-path or --rune-path; provide the whole connection from one source and select one node. Credentials are never literal flag values. Reconciliation also accepts --until; --watch follows status until a terminal result or interruption.
+--config selects configuration and --json prints one JSON envelope. Top-level --help and --version need no configuration. --collect selects collection alone for the daemon. Connection overrides use --url, --tls-cert-path and --macaroon-path or --rune-path; provide the whole connection from one source and select one node. Credentials are never literal flag values. Reconciliation also accepts --until; --watch follows status until a terminal result or interruption. State backup uses --out for a new private bundle; state restore uses --from for that bundle and a configuration whose state root does not yet exist.
 
 The lab interface uses the following source-checkout commands. Set FLUXWARDEN_LAB_PLAN to the absolute owner declaration used for lab setup. Workload alternates fixed checkout payments; --seed is accepted as a reproducibility label. Chaos supports --case T-05; --all selects that supported case. It requires a separate approved, unsubmitted CLN-M proposal. Live demonstration observations remain pending. Lab assets do not ship in the npm package.
 
@@ -60,6 +63,8 @@ To use the command name with source lab assets, run `npm link` in this built che
 The [demo walkthrough](docs/demo-transcript.md) uses `scripts/reproduce-demo.sh --config <path> --key <path> --out <directory>`. Explicitly select a disposable demo policy with `FLUXWARDEN_DEMO_POLICY`, establish its documented caps and `cooldown_after_success: 1s` before planning, and keep the owner declaration in `FLUXWARDEN_LAB_PLAN`. The script prepares measured channel 2 starvation before both demonstrations and creates and signs a fresh chaos intent with the operator key. Live observations and the verifying evidence bundle remain pending.
 
 Read [the runbooks](docs/runbooks/README.md) before approving and executing a proposal.
+
+Use [`state backup` and `state restore`](docs/runbooks/backup-restore.md) to preserve SQLite state, signing identity and retained recovery evidence. Restored approval and execution remain blocked until full reconciliation succeeds against every restored original node. [`nodes recover`](docs/runbooks/quarantine.md) verifies the original connection and reconciles existing hashes before lifting quarantine.
 
 ## Exit codes
 
@@ -81,6 +86,8 @@ Exit 7 retains the attempt and budget reservation. Use reconciliation and node e
 ## Documentation and development
 
 Read the [specification](docs/spec.md), [architecture](docs/architecture.md), [security model](docs/security-model.md), [references](docs/references.md), [runbooks](docs/runbooks/README.md) and [design rationale](docs/decisions/README.md). [CONTRIBUTING.md](CONTRIBUTING.md) describes local checks. Report vulnerabilities through [SECURITY.md](SECURITY.md).
+
+[Operational support and capacity observations](docs/operations.md) records bounded synthetic workloads, measured resource use, exact source bindings and retention limits.
 
 Windows and Linux validation is configured in CI. Hosted validation and npm publication remain unrun for this preparation build. Local checks do not imply a published release.
 

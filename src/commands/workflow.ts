@@ -20,7 +20,7 @@ import { openClnController } from '../node-cln/controller.js';
 import { openLndController } from '../node-lnd/controller.js';
 import { LND_FINAL_CLTV_DELTA } from '../node-lnd/execute.js';
 import { envelope, registerOutputSecret, renderEnvelope, terminalText } from '../output/index.js';
-import type { Database, StoredProposal } from '../persistence/index.js';
+import { PersistenceError, type Database, type StoredProposal } from '../persistence/index.js';
 import type { PlanningPolicy } from '../planner/diagnose.js';
 import { renderProposal } from '../planner/proposal.js';
 import { canonicalPolicyJson, policySha256 } from '../policy/canonical.js';
@@ -173,6 +173,7 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
     }
     const policy = activePolicy(config, 'policy' in command ? command.policy : null);
     if (command.kind === 'liquidity approve' || command.kind === 'actions execute') {
+      db.state.assertAdmitted();
       const id = proposalId(command.proposalId);
       const proposal = db.proposals.find(id);
       if (proposal === null) throw new StageFailure(2, null, 'no proposal has this id');
@@ -234,6 +235,9 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
     }
     if (command.kind === 'liquidity plan' || command.kind === 'liquidity diagnose') {
       const nodes = selectNodes(config, command.node);
+      if (command.node === null && nodes.length > 1) {
+        throw new StageFailure(2, 'arguments', '--node is required for diagnosis or planning when multiple nodes are configured');
+      }
       for (const node of nodes) {
         let stored = db.nodes.list().find(row => row.name === node.name);
         let channels = stored === undefined ? [] : db.commandData.snapshots(stored.id);
@@ -269,6 +273,7 @@ export async function workflow(command: Command, io: Io, env: Environment, signa
     }
     throw new StageFailure(2, null, 'the command is unavailable');
   } catch (error) {
+    if (error instanceof PersistenceError && error.code === 'RESTORE_PENDING') return refuse(io, command.kind, 5, 'restore', error.message);
     if (command.kind === 'actions execute' && error instanceof CredentialFileError) return refuse(io, command.kind, 5, 'credentials', error.message);
     if (error instanceof ApprovalError) return refuse(io, command.kind, error.exitCode, error.reason, error.reason);
     if (error instanceof PolicyError) return refuse(io, command.kind, error.exitCode, 'policy', error.message);

@@ -37,7 +37,16 @@ for (const mismatch of [false, true]) {
     const path = scratchDb('identity-state');
     const base = seedBase(p, path, emptyDatabase);
     const approval = seedProposal(base);
-    const fake = new FakePreflightNode(base.sourceKey, base.targetKey, mismatch ? { pubkey: `03${'ee'.repeat(32)}` } : {});
+    const fake = new FakePreflightNode(base.sourceKey, base.targetKey, {
+      ...(mismatch ? { pubkey: `03${'ee'.repeat(32)}` } : {}),
+      // The production controller stamps observations with its database clock
+      // (workflow.ts listChannels). Date.now and SQLite can differ by 1ms on
+      // Windows; a valid-identity fixture must not accidentally be future-dated.
+      channels: () => {
+        const observedAt = dbNow(path);
+        return [fakeChannel(base.sourceKey, OUT_PEER, { observedAt }), fakeChannel(base.targetKey, IN_PEER, { observedAt })];
+      },
+    });
     const db = p.openDatabase(path, { readOnly: false });
     try {
       const { prepareExecution } = await loadPreflight();

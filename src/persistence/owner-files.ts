@@ -30,18 +30,32 @@ export function safeAncestorAccessMany(paths: readonly string[], creationParent:
 
 /** Reads ancestors and existing private objects together, with no permission results retained across calls. */
 export function pathAccessMany(ancestors: readonly string[], creationParent: string | undefined, stateDir: string, objects: readonly string[]): { ancestors: boolean[]; objects: boolean[] } {
-  const paths = [...new Set([...ancestors, ...objects])];
+  const result = pathGroupsAccessMany([{ ancestors, creationParent, stateDir }], objects)[0];
+  if (result === undefined) throw new Error('owner-only: missing path access result');
+  return result;
+}
+
+export interface PrivatePathGroup {
+  readonly ancestors: readonly string[];
+  readonly creationParent: string | undefined;
+  readonly stateDir: string;
+}
+
+/** Each ancestry retains its own immediate-parent policy; shared descriptors are read once per query. */
+export function pathGroupsAccessMany(groups: readonly PrivatePathGroup[], objects: readonly string[]): { ancestors: boolean[]; objects: boolean[] }[] {
+  const paths = [...new Set([...groups.flatMap(group => group.ancestors), ...objects])];
   const descriptors = new Map(paths.map((path, index) => [path, index]));
-  const read = readSecurityDescriptors(paths);
+  const read: OwnerSecurityDescriptor[] = [];
+  for (let offset = 0; offset < paths.length; offset += 128) read.push(...readSecurityDescriptors(paths.slice(offset, offset + 128)));
   const descriptorFor = (path: string): OwnerSecurityDescriptor => {
     const descriptor = read[descriptors.get(path) ?? -1];
     if (descriptor === undefined) throw new Error('owner-only: missing security descriptor');
     return descriptor;
   };
-  return {
-    ancestors: ancestors.map(path => ancestorAccess(descriptorFor(path), path, creationParent, stateDir)),
-    objects: objects.map(path => ownerAccess(descriptorFor(path))),
-  };
+  const admittedObjects = objects.map(path => ownerAccess(descriptorFor(path)));
+  return groups.map(({ ancestors, creationParent, stateDir }) => ({
+    ancestors: ancestors.map(path => ancestorAccess(descriptorFor(path), path, creationParent, stateDir)), objects: admittedObjects,
+  }));
 }
 
 function ancestorAccess(descriptor: OwnerSecurityDescriptor, path: string | undefined, creationParent: string | undefined, stateDir: string): boolean {

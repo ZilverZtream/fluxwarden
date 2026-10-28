@@ -111,8 +111,7 @@ async function nativeLayers() {
 
 async function fixture() {
   const p = await loadPersistence(), path = scratchDb('routing-layer-lifecycle');
-  const seeded = seedBase(p, path);
-  exec(path, "UPDATE nodes SET implementation='cln', name='cln-m' WHERE id=?", seeded.nodeId);
+  const seeded = seedBase(p, path, undefined, { implementation: 'cln', name: 'cln-m' });
   exec(path, 'UPDATE channels SET channel_key=?, scid=? WHERE id=?', S, S, seeded.sourceChannelId);
   exec(path, 'UPDATE channels SET channel_key=?, scid=? WHERE id=?', T, T, seeded.targetChannelId);
   const base = { ...seeded, sourceKey: S, targetKey: T };

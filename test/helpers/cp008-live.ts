@@ -5,8 +5,12 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { request } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import Ajv2020 from 'ajv/dist/2020.js';
 import { expect } from 'vitest';
-import { asRecord, repoRoot } from './cli.js';
+import { asRecord, readJson, repoRoot } from './cli.js';
+import type { BindingProducer, BindingRequest, BoundOwner, Endpoint } from '../../labs/scenarios/credentials/producer-contract.d.mts';
+import { afterBothFreshStarts, verifyFreshBinding } from './cp008-fresh-binding.js';
+import { verifySourceManifest } from './cp008-source-contract.js';
 import { allServices, docker, dockerText, identity, oracle, rows, LabInvalidError, type OracleOwner } from './cp006-oracle.js';
 import type { Owner } from './cp006-lab.js';
 import { nodes, readMethods, executeMethods, forbiddenCln, type Node, type Role, type Policy, type Params } from './cp008-credentials.js';
@@ -21,17 +25,19 @@ export const titles = [
   'CP-008/Rleak fresh complete retained artifacts reject every planted encoding and missing sentinel registration',
 ] as const;
 
-interface Endpoint { hostname: string; servername: string; port: number; certificate: string }
 export interface LiveOwner {
   declaration: string;
   owner: Owner & { credentialPolicy: Policy };
   oracle: OracleOwner;
-  endpoints: Record<Node, Endpoint>;
+  endpointRefs: BindingRequest['endpointRefs'];
+  changePassword: BindingRequest['changePassword'];
+  endpoints?: Record<Node, Endpoint>;
   // Named request parameters, never expected responses. Password bytes remain file-only.
-  changePasswordFile: string;
+  changePasswordFile?: string;
 }
 export interface Plan {
-  version: 1;
+  version: 2;
+  staticRoot: string;
   sourceManifest: string;
   bindingSourceManifest: string;
   owners: LiveOwner[];
@@ -44,6 +50,7 @@ interface PrivateIO {
 interface Response { status: number; body: Record<string, unknown> }
 const roles: Role[] = ['read', 'execute'];
 const maxDuration = 180_000;
+const validatePlan = new Ajv2020.default({ strict: true }).compile(readJson('labs/fixtures/credential-plan.schema.json') as object);
 function string(value: unknown): string { if (typeof value !== 'string' || !value) throw new LabInvalidError('explicit nonempty declaration value required'); return value; }
 function absolute(value: unknown): string { const path = string(value); if (!isAbsolute(path)) throw new LabInvalidError('absolute declaration path required'); return resolve(path); }
 function json(path: string): Record<string, unknown> { try { return asRecord(JSON.parse(readFileSync(path, 'utf8')) as unknown, 'declaration'); } catch { throw new LabInvalidError('declaration is absent unreadable or malformed'); } }
@@ -69,7 +76,8 @@ function checkedFile(path: string): Buffer {
 export function credentialPlan(input = process.env['FLUXWARDEN_LAB_CREDENTIAL_PLAN']): Plan {
   if (!input || !isAbsolute(input)) throw new LabInvalidError('absolute explicit owned-regtest credential plan required before Docker');
   const plan = json(input);
-  if (plan['version'] !== 1 || plan['authorized'] !== true || plan['disposable'] !== true || plan['network'] !== 'regtest') throw new LabInvalidError('version 1 explicit disposable regtest authorization required');
+  if (!validatePlan(plan)) throw new LabInvalidError('version2 fresh-reference disposable regtest credential plan required');
+  const staticRoot = absolute(plan['staticRoot']);
   const budget = asRecord(plan['budget'], 'aggregate allocation');
   const selected = rows(plan['owners'], 'two explicit owners');
   if (selected.length !== 2) throw new LabInvalidError('exactly two explicit owners required');
@@ -90,24 +98,28 @@ export function credentialPlan(input = process.env['FLUXWARDEN_LAB_CREDENTIAL_PL
     }
     const pins = asRecord(raw['imagePins'], 'independently supplied image pins');
     for (const service of allServices) if (!/^\S+@sha256:[a-f0-9]{64}$/.test(string(pins[service]))) throw new LabInvalidError('all pinned image digests required');
-    const endpoints = asRecord(raw['endpoints'], 'owned pinned HTTPS endpoints');
+    const endpointRefs = asRecord(raw['endpointRefs'], 'declared late-bound HTTPS references');
     for (const node of nodes) {
-      const endpoint = asRecord(endpoints[node], 'node endpoint'); string(endpoint['hostname']); string(endpoint['servername']);
-      const port = positive(endpoint['port'], 65535); if (!Number.isInteger(port)) throw new LabInvalidError('integer endpoint port required');
-      if (!within(string(owner['runtimeRoot']), absolute(endpoint['certificate']))) throw new LabInvalidError('TLS certificate must be inside owned runtime');
+      const ref = asRecord(endpointRefs[node], 'node reference');
+      if (ref['node'] !== node || asRecord(ref['certificate'], 'certificate reference')['node'] !== node) throw new LabInvalidError('node and certificate references must match their declared owner node');
     }
-    const changePasswordFile = absolute(raw['changePasswordFile']);
-    if (!within(string(owner['tmpRoot']), changePasswordFile)) throw new LabInvalidError('disposable named password request must be under owned temporary root');
-    return { declaration, owner: owner as unknown as LiveOwner['owner'], endpoints: endpoints as unknown as LiveOwner['endpoints'], changePasswordFile,
-      oracle: { project: string(owner['project']), composeFile: absolute(raw['composeFile']), imagePins: pins as Record<string, string>, pubkeys: {} } };
+    return { declaration, owner: owner as unknown as LiveOwner['owner'], endpointRefs: endpointRefs as unknown as BindingRequest['endpointRefs'],
+      changePassword: { kind: 'fresh-denial-control' }, oracle: { project: string(owner['project']),
+        composeFile: join(absolute(owner['runtimeRoot']), 'compose-owner.json'), imagePins: pins as Record<string, string>, pubkeys: {} } };
   });
-  const roots = owners.flatMap(({ owner }) => [owner.runtimeRoot, owner.tmpRoot, owner.sentinelRoot, owner.evidenceRoot].map(path => resolve(path).toLowerCase()));
+  const roots = owners.flatMap(({ owner }) => [owner.runtimeRoot, owner.tmpRoot, owner.sentinelRoot, owner.evidenceRoot].map(path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path)));
   if (new Set(owners.map(({ owner }) => owner.project)).size !== 2 || new Set(owners.map(({ owner }) => owner.id)).size !== 2 || new Set(owners.flatMap(({ owner }) => Object.values(owner.ports))).size !== 6) throw new LabInvalidError('owner identities projects and ports must be disjoint');
   for (const [index, root] of roots.entries()) for (const other of roots.slice(index + 1)) if (root === other || within(root, other) || within(other, root)) throw new LabInvalidError('owner roots must be disjoint and unnested');
+  for (const root of roots) if (relative(root, staticRoot) === '' || within(root, staticRoot) || within(staticRoot, root)) throw new LabInvalidError('immutable source and policy root must survive all owned runtime cleanup');
+  const sourceManifest = absolute(plan['sourceManifest']), bindingSourceManifest = absolute(plan['bindingSourceManifest']);
+  if (![sourceManifest, bindingSourceManifest].every(path => within(staticRoot, path))) throw new LabInvalidError('source manifests require the immutable static root');
+  for (const item of owners) for (const root of owners.flatMap(value => [value.owner.runtimeRoot, value.owner.tmpRoot])) {
+    if (item.declaration === root || within(root, item.declaration) || resolve(input) === root || within(root, resolve(input))) throw new LabInvalidError('plan and owner declarations must survive ordinary cleanup');
+  }
   const allocation = { cpus: positive(budget['cpus'], 8), memoryBytes: positive(budget['memoryBytes'], 8589934592), pids: positive(budget['pids'], 2048), workers: positive(budget['workers'], 2) };
   if (allocation.workers !== 2) throw new LabInvalidError('two actual owner workers required within declared budget');
   for (const key of ['cpus', 'memoryBytes', 'pids'] as const) if (owners.reduce((sum, value) => sum + value.owner.resources[key], 0) > allocation[key]) throw new LabInvalidError('aggregate declared owners exceed budget');
-  return { version: 1, sourceManifest: absolute(plan['sourceManifest']), bindingSourceManifest: absolute(plan['bindingSourceManifest']), owners, budget: allocation };
+  return { version: 2, staticRoot, sourceManifest, bindingSourceManifest, owners, budget: allocation };
 }
 export function rolePath(item: LiveOwner, node: Node, role: Role): string { return join(item.owner.runtimeRoot, 'credentials', node, `${role}.${node.startsWith('lnd-') ? 'macaroon' : 'rune'}`); }
 export function fingerprint(bytes: Uint8Array): string { return `fp:${createHash('sha256').update(bytes).digest('hex').slice(0, 16)}`; }
@@ -141,24 +153,28 @@ export class Cohort {
     if (process.platform === 'win32') throw new LabInvalidError('native owner-file and ordinary all-node HTTPS live proof requires the declared POSIX lab host');
     this.privateIO = await import(pathToFileURL(join(repoRoot, 'scripts/private-scratch.mjs')).href) as PrivateIO;
     checkedFile(absolute(process.env['FLUXWARDEN_LAB_CREDENTIAL_PLAN']));
-    const sources = rows(json(this.plan.sourceManifest)['sources'], 'pinned primary sources');
-    if (sources.length !== 13) throw new LabInvalidError('all thirteen pinned primary sources required');
-    const bindings = rows(json(this.plan.bindingSourceManifest)['sources'], 'pinned wire sources');
-    if (bindings.length !== 21) throw new LabInvalidError('all twenty-one pinned wire sources required');
-    for (const source of [...sources, ...bindings]) if (createHash('sha256').update(readFileSync(absolute(source['file']))).digest('hex') !== source['sha256']) throw new LabInvalidError('pinned primary source hash mismatch');
+    await this.privateIO.assertPrivateDirectory(this.plan.staticRoot);
+    verifySourceManifest(this.plan.sourceManifest, 'credential-primary-v1', this.plan.staticRoot);
+    verifySourceManifest(this.plan.bindingSourceManifest, 'credential-wire-v1', this.plan.staticRoot);
     for (const item of this.plan.owners) {
-      checkedFile(item.declaration); checkedFile(item.changePasswordFile);
+      checkedFile(item.declaration);
       if (!within(item.owner.runtimeRoot, item.oracle.composeFile)) throw new LabInvalidError('explicit compose file must be under the owned runtime root');
       for (const root of [item.owner.runtimeRoot, item.owner.tmpRoot, item.owner.sentinelRoot, item.owner.evidenceRoot]) await this.privateIO.assertPrivateDirectory(root);
       this.retain(item, 'inventory', { runId: this.runId, file: 'test/lab/cp008-credentials.live.test.ts', titles, sourceManifestHash: createHash('sha256').update(readFileSync(this.plan.sourceManifest)).digest('hex'), bindingSourceManifestHash: createHash('sha256').update(readFileSync(this.plan.bindingSourceManifest)).digest('hex'), planHash: createHash('sha256').update(readFileSync(absolute(process.env['FLUXWARDEN_LAB_CREDENTIAL_PLAN']))).digest('hex') });
     }
     this.before = unrelated(this.plan.owners.map(item => item.owner.project));
     for (const item of this.plan.owners) if (Object.values(inventory(item.owner.project)).some(values => values.length)) throw new LabInvalidError('fresh explicit owners already have resources');
+    const binder = await import(pathToFileURL(join(repoRoot, 'scripts/live-credential-binding.mjs')).href) as BindingProducer;
     const setup = performance.now();
     // Simultaneous ordinary CLI processes; no verifier/proof hooks or injected transports.
-    const results = await Promise.allSettled(this.plan.owners.map(async item => { this.started.push(item); return this.command(item, 'up'); }));
+    await afterBothFreshStarts(this.plan.owners.map(async item => { this.started.push(item); return this.command(item, 'up'); }), async () => {
+      for (const item of this.plan.owners) {
+        const receipt = await binder.bindFreshCredentialOwner({ declaration: item.declaration, imagePins: item.oracle.imagePins,
+          endpointRefs: item.endpointRefs, changePassword: item.changePassword, signal: this.cancellation.signal });
+        await this.acceptFreshBinding(item, receipt);
+      }
+    });
     this.phases['setup'] = performance.now() - setup;
-    for (const result of results) { if (result.status === 'rejected') throw result.reason instanceof Error ? result.reason : new LabInvalidError('ordinary bring-up failed'); expect(result.value).toBe(0); }
     for (const item of this.plan.owners) {
       this.observe(item);
       try {
@@ -169,6 +185,33 @@ export class Cohort {
       } catch { throw new LabInvalidError('owned Toxiproxy is unavailable disabled or dirty before permission controls'); }
       for (const node of nodes) for (const role of roles) await this.register(item, rolePath(item, node, role), node.startsWith('lnd-') ? 'macaroon' : 'rune');
     }
+  }
+  async acceptFreshBinding(item: LiveOwner, receipt: BoundOwner): Promise<void> {
+    const declaration = checkedFile(item.declaration), manifestBytes = checkedFile(join(item.owner.runtimeRoot, 'lab.json'));
+    const observed = rows(docker(['inspect', ...containerIds(item.owner.project)]), 'independent fresh binding observations');
+    verifyFreshBinding({ declaration: item.declaration, imagePins: item.oracle.imagePins, endpointRefs: item.endpointRefs,
+      changePassword: item.changePassword }, item.owner, receipt, declaration, manifestBytes, observed);
+    const manifest = asRecord(JSON.parse(manifestBytes.toString('utf8')) as unknown, 'fresh current manifest');
+    for (const node of nodes) {
+      const endpoint = receipt.endpoints[node], entry = asRecord(asRecord(manifest['nodes'], 'nodes')[node], 'node');
+      item.oracle.pubkeys[node] = string(entry['pubkey']);
+      const cert = asRecord(entry['certificate'], 'current certificate'), bytes = await this.bytes(endpoint.certificate);
+      if (createHash('sha256').update(bytes).digest('hex') !== cert['sha256']) throw new LabInvalidError('current pinned certificate bytes mismatch');
+      for (const role of roles) {
+        const record = receipt.credentials[node][role], roleBytes = await this.bytes(record.path);
+        if (record.path !== rolePath(item, node, role) || fingerprint(roleBytes) !== record.fingerprint) throw new LabInvalidError('current canonical role bytes or fingerprint mismatch');
+      }
+    }
+    const requestBytes = await this.bytes(receipt.changePasswordFile);
+    const params = asRecord(JSON.parse(requestBytes.toString('utf8')) as unknown, 'fresh disposable denial request');
+    if (Object.keys(params).sort().join(',') !== 'current_password,new_password') throw new LabInvalidError('fresh denial request fields mismatch');
+    const current = bytes32(params['current_password']), next = bytes32(params['new_password']);
+    if (current.equals(next) || params['current_password'] !== current.toString('base64') || params['new_password'] !== next.toString('base64')) throw new LabInvalidError('distinct fresh canonical base64 denial controls required');
+    // Register actual source bytes, without echoing a password request or its fields.
+    for (const bytes of [current, next]) writeFileSync(join(item.owner.sentinelRoot, `password-control-${randomUUID()}.bin`), bytes, { mode: 0o600, flag: 'wx' });
+    await this.register(item, receipt.changePasswordFile, 'password-request');
+    item.endpoints = receipt.endpoints; item.changePasswordFile = receipt.changePasswordFile;
+    this.retain(item, 'fresh-binding', receipt);
   }
   retain(item: LiveOwner, name: string, value: unknown): void { writeFileSync(join(item.owner.evidenceRoot, `cp008-${this.runId}-${name}.json`), JSON.stringify(value), { mode: 0o600, flag: 'w' }); }
   async command(item: LiveOwner, operation: 'up' | 'down'): Promise<number | null> {
@@ -209,12 +252,14 @@ export class Cohort {
       const bindings = Object.values(asRecord(settings['Ports'], 'actual publications')).flatMap(value => value === null ? [] : rows(value, 'actual loopback bindings'));
       for (const binding of bindings) { expect(binding['HostIp']).toBe('127.0.0.1'); published.push(Number(binding['HostPort'])); }
       if (nodes.includes(service as Node)) {
+        if (!item.endpoints) throw new LabInvalidError('fresh binding required before node observation');
         const node = service as Node, endpoint = item.endpoints[node];
         const networks = Object.values(asRecord(settings['Networks'], 'actual owned networks')).map(network => asRecord(network, 'owned network'));
         const direct = networks.some(network => network['IPAddress'] === endpoint.hostname) && endpoint.port === (node.startsWith('lnd-') ? 8080 : 3010);
         const loopback = endpoint.hostname === '127.0.0.1' && bindings.some(binding => Number(binding['HostPort']) === endpoint.port);
         if (!direct && !loopback) throw new LabInvalidError('endpoint is not an observed owned node HTTPS address');
         const info = oracle(item.oracle, node, 'getinfo');
+        if (info[node.startsWith('lnd-') ? 'identity_pubkey' : 'id'] !== item.oracle.pubkeys[node]) throw new LabInvalidError('fresh native node differs from current manifest identity');
         item.oracle.pubkeys[node] = string(info[node.startsWith('lnd-') ? 'identity_pubkey' : 'id']); identity(item.oracle, node);
         this.retain(item, `identity-${node}`, { node, publicKey: item.oracle.pubkeys[node], version: info['version'], network: node.startsWith('lnd-') ? rows(info['chains'], 'observed identity chains')[0]?.['network'] : info['network'] });
         const channels = rows(oracle(item.oracle, node, node.startsWith('lnd-') ? 'listchannels' : 'listpeerchannels')['channels'], 'fresh channel state');
@@ -269,6 +314,7 @@ export class Cohort {
     this.bootstrap.set(key, path); this.bootstrapIds.set(key, { item, node, id: string(result['unique_id']) }); await this.register(item, path, 'rune'); return path;
   }
   async http(item: LiveOwner, node: Node, path: string, method: string, params: Params, credential: string): Promise<Response> {
+    if (!item.endpoints) throw new LabInvalidError('fresh binding required before any HTTPS use');
     const endpoint = item.endpoints[node], ca = await this.bytes(endpoint.certificate), bytes = await this.bytes(credential);
     const body = method === 'GET' ? undefined : JSON.stringify(params);
     return await new Promise((done, reject) => {
@@ -372,7 +418,7 @@ export async function proveR1(cohort: Cohort): Promise<void> {
     expect(result['status'], 'valid route must result in actual payment success').toBe('SUCCEEDED');
     for (const role of roles) {
       await cohort.lnd(item, node, role, '/v1/stop', 'POST', {}, false);
-      await cohort.lnd(item, node, role, '/v1/changepassword', 'POST', json(item.changePasswordFile), false);
+      await cohort.lnd(item, node, role, '/v1/changepassword', 'POST', json(string(item.changePasswordFile)), false);
       await cohort.lnd(item, node, role, '/v1/channels', 'GET', {}, true);
     }
   }

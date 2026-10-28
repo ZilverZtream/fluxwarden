@@ -10,16 +10,16 @@ export interface ReconcileDeps {
   readonly adapters: ReadonlyMap<string, ExecutionAdapter>;
   readonly workerId: string;
   readonly leaseMs: number;
-  /** A NOT_FOUND payment counts as never sent only this long after its submission (SPEC §8.5). */
+  /** A NOT_FOUND payment counts as never sent only this long after its submission (SPEC Â§8.5). */
   readonly notFoundWindowMs: number;
-  /** An execution unresolved this long after its submission raises stuck-in-flight (SPEC §8.6). */
+  /** An execution unresolved this long after its submission raises stuck-in-flight (SPEC Â§8.6). */
   readonly escalateAfterMs: number;
   /**
-   * On a CLN node a FAILED payer record counts only when a FAILED read at least this long before agrees (SPEC §5.4:
+   * On a CLN node a FAILED payer record counts only when a FAILED read at least this long before agrees (SPEC Â§5.4:
    * listsendpays can swing between failed and pending or lag).
    */
   readonly confirmIntervalMs: number;
-  /** Delta verification tolerance (SPEC §8.7 step 5); absent means zero tolerance, never a skipped check. */
+  /** Delta verification tolerance (SPEC Â§8.7 step 5); absent means zero tolerance, never a skipped check. */
   readonly deltaToleranceMsat?: bigint;
   readonly alert: (alert: Alert) => void;
   readonly nodeIds?: ReadonlySet<string>;
@@ -44,6 +44,10 @@ const BY_INVOICE: Decision = { kind: 'success', feeMsat: null, htlcCount: null, 
 
 class LeaseLost extends Error {}
 
+function leaseLost(error: unknown): boolean {
+  return error instanceof LeaseLost || error instanceof PersistenceError && error.code === 'LEASE_LOST';
+}
+
 async function read<T>(work: () => Promise<T>): Promise<T | null> {
   try {
     return await work();
@@ -59,7 +63,7 @@ function fromRecord(observation: Extract<PaymentObservation, { kind: 'SUCCEEDED'
 }
 
 /**
- * Decides one execution from node evidence only (SPEC §8.4, §8.5). Only reads and the receiver-side closure of our own
+ * Decides one execution from node evidence only (SPEC Â§8.4, Â§8.5). Only reads and the receiver-side closure of our own
  * invoice are used: the reconciler never creates an invoice and never sends.
  */
 interface Judge {
@@ -121,20 +125,31 @@ function absolute(value: bigint): bigint {
  * expired; a live lease belongs to a worker that may still be waiting for its payment and is never taken over. The
  * startup sweep reads the payer side from the node's payment list instead of a live stream. Each candidate is taken
  * under the reconciler's own fenced lease, moved to UNKNOWN if a worker left it SUBMITTING or IN_FLIGHT, and resolved
- * only on evidence. A resolved success gets the result checks of SPEC §8.7.
+ * only on evidence. A resolved success gets the result checks of SPEC Â§8.7.
  */
 export async function reconcile(deps: ReconcileDeps, options: { startup: boolean }): Promise<ReconcileReport> {
   const { db } = deps;
   const mode = options.startup ? 'sweep' : 'track';
   const unresolved: string[] = [];
-  let breach = false;
-  let mismatch = false;
+  const findings = { breach: false, mismatch: false };
 
   let pendingAttribution = 0;
-  const candidates = db.executions.unresolved().filter(row => (deps.nodeIds === undefined || deps.nodeIds.has(row.nodeId)) &&
-    (row.status === 'VERIFIED_SUCCESS' ? pendingAttribution++ < 100 : row.status === 'UNKNOWN' || row.leaseExpired));
+  const scoped = db.executions.unresolved().filter(row => deps.nodeIds === undefined || deps.nodeIds.has(row.nodeId));
+  const candidates = scoped.filter(row => row.status === 'VERIFIED_SUCCESS' ? pendingAttribution++ < 100 : row.status === 'UNKNOWN' || row.leaseExpired);
+  try {
+    for (const nodeId of new Set([...deps.adapters.keys(), ...candidates.map(row => row.nodeId)])) db.nodes.assertIdentity(nodeId);
+  } catch (error) {
+    if (!(error instanceof PersistenceError && error.code === 'NODE_IDENTITY_UNVERIFIED')) throw error;
+    return { exit: ExitCode.SAFETY_REFUSAL, unresolved: scoped.filter(row => UNRESOLVED.has(row.status)).map(row => row.executionId) };
+  }
   for (const row of candidates) {
-    const held = db.executions.takeUnresolved(row.executionId, row.fenceEpoch, deps.workerId, deps.leaseMs);
+    let held: ReturnType<Database['executions']['takeUnresolved']>;
+    try {
+      held = db.executions.takeUnresolved(row.executionId, row.fenceEpoch, deps.workerId, deps.leaseMs);
+    } catch (error) {
+      if (leaseLost(error)) continue;
+      throw error;
+    }
     if (held === null) continue;
     let epoch = held.fenceEpoch;
     let status = held.status;
@@ -157,31 +172,31 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
       }
     };
 
-    try {
+    const recover = async (): Promise<void> => {
       if (status === 'VERIFIED_SUCCESS') {
         const adapter = deps.adapters.get(row.nodeId);
         const observed = adapter === undefined || row.paymentHash === null ? null : await read(() => adapter.observePayment(row.paymentHash ?? '', mode));
         if (observed?.kind !== 'SUCCEEDED' || !observed.preimageMatchesHash) {
-          mismatch = true;
-          if (!breach) raise('delta-mismatch', 'DELTA_UNVERIFIED');
-          continue;
+          findings.mismatch = true;
+          if (!findings.breach) raise('delta-mismatch', 'DELTA_UNVERIFIED');
+          return;
         }
-        if (observed.htlcCount !== 1) { breach = true; raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE'); }
-        if (reportedFeeBreach(observed.feeMsat, row)) { breach = true; raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP'); }
+        if (observed.htlcCount !== 1) { findings.breach = true; raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE'); }
+        if (reportedFeeBreach(observed.feeMsat, row)) { findings.breach = true; raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP'); }
         else if (row.plannedFeeMsat !== null && observed.feeMsat !== row.plannedFeeMsat) {
-          mismatch = true;
+          findings.mismatch = true;
           raise('fee-mismatch', 'FEE_MISMATCH');
         }
         epoch = db.executions.recoverSettlement(row.executionId, epoch, observed.settledChannelKey, observed.feeMsat);
         if (observed.settledChannelKey === null || adapter === undefined) {
-          mismatch = true;
-          if (!breach) raise('delta-mismatch', 'DELTA_UNVERIFIED');
+          findings.mismatch = true;
+          if (!findings.breach) raise('delta-mismatch', 'DELTA_UNVERIFIED');
         } else {
           const delta = await verifyDelta(deps, adapter, row.executionId, observed.settledChannelKey, observed.feeMsat);
           if (delta !== null) epoch = db.executions.recordDelta(row.executionId, epoch, delta);
-          if (delta !== 'MATCH') { mismatch = true; if (!breach) raise('delta-mismatch', delta === 'MISMATCH' ? 'DELTA_MISMATCH' : 'DELTA_UNVERIFIED'); }
+          if (delta !== 'MATCH') { findings.mismatch = true; if (!findings.breach) raise('delta-mismatch', delta === 'MISMATCH' ? 'DELTA_MISMATCH' : 'DELTA_UNVERIFIED'); }
         }
-        continue;
+        return;
       }
       if (status !== 'UNKNOWN') write('UNKNOWN');
       const adapter = deps.adapters.get(row.nodeId);
@@ -206,15 +221,15 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
         write('VERIFIED_SUCCESS', decision.feeMsat === null
           ? { feeUnreported: true, deltaStatus: 'PENDING' }
           : { actualFeeMsat: decision.feeMsat, deltaStatus: 'PENDING', settledChannelKey: decision.settledChannelKey });
-        if (decision.htlcCount !== null && decision.htlcCount !== 1) { breach = true; raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE'); }
+        if (decision.htlcCount !== null && decision.htlcCount !== 1) { findings.breach = true; raise('INVARIANT_BREACH', 'SINGLE_PATH_UNAVAILABLE'); }
         if (decision.feeMsat !== null && reportedFeeBreach(decision.feeMsat, row)) {
-          breach = true;
+          findings.breach = true;
           raise('INVARIANT_BREACH', 'FEE_ABOVE_CAP');
         } else if (decision.feeMsat !== null && row.plannedFeeMsat !== null && decision.feeMsat !== row.plannedFeeMsat) {
-          mismatch = true;
+          findings.mismatch = true;
           raise('fee-mismatch', 'FEE_MISMATCH');
         }
-        if (decision.settledChannelKey === null) { mismatch = true; if (!breach) raise('delta-mismatch', 'DELTA_UNVERIFIED'); }
+        if (decision.settledChannelKey === null) { findings.mismatch = true; if (!findings.breach) raise('delta-mismatch', 'DELTA_UNVERIFIED'); }
         if (adapter !== undefined && decision.feeMsat !== null && decision.settledChannelKey !== null) {
           const delta = await verifyDelta(deps, adapter, row.executionId, decision.settledChannelKey, decision.feeMsat);
           if (delta !== null) {
@@ -225,18 +240,25 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
               throw error;
             }
           }
-          if (delta !== 'MATCH') { mismatch = true; raise('delta-mismatch', delta === 'MISMATCH' ? 'DELTA_MISMATCH' : 'DELTA_UNVERIFIED'); }
+          if (delta !== 'MATCH') { findings.mismatch = true; raise('delta-mismatch', delta === 'MISMATCH' ? 'DELTA_MISMATCH' : 'DELTA_UNVERIFIED'); }
         }
       } else if (decision.kind === 'failure') {
         write('VERIFIED_FAILURE', { errorCode: decision.errorCode });
       } else if (decision.breach) {
-        breach = true;
+        findings.breach = true;
         raise('INVARIANT_BREACH', 'PREIMAGE_MISMATCH');
       }
-    } catch (error) {
-      if (!(error instanceof LeaseLost)) throw error;
+    };
+    let failure: Error | null = null;
+    try { await recover(); } catch (error) { failure = error instanceof Error ? error : new Error('reconciliation failed'); }
+    if (!leaseLost(failure)) {
+      try { epoch = db.executions.releaseRecovery(row.executionId, epoch, deps.workerId); }
+      catch (error) { failure ??= error instanceof Error ? error : new Error('reconciliation lease release failed'); }
+    }
+    if (failure !== null) {
       // Another reconciler or worker holds the row now; it is theirs to resolve.
-      continue;
+      if (leaseLost(failure)) continue;
+      throw failure;
     }
 
     if (UNRESOLVED.has(status)) {
@@ -246,14 +268,19 @@ export async function reconcile(deps: ReconcileDeps, options: { startup: boolean
   }
 
   await cleanupRoutingLayers(deps);
-  const exit = breach ? ExitCode.INVARIANT_BREACH
+  // A row skipped for live ownership or a lost fence is still unresolved. Re-read after awaits;
+  // neither an empty candidate list nor a competing worker supplies terminal evidence.
+  unresolved.length = 0;
+  unresolved.push(...db.executions.unresolved().filter(row => UNRESOLVED.has(row.status)
+    && (deps.nodeIds === undefined || deps.nodeIds.has(row.nodeId))).map(row => row.executionId));
+  const exit = findings.breach ? ExitCode.INVARIANT_BREACH
     : unresolved.length > 0 ? ExitCode.OUTCOME_UNKNOWN
-      : mismatch ? ExitCode.RECONCILIATION_ALERT : ExitCode.SUCCESS;
+      : findings.mismatch ? ExitCode.RECONCILIATION_ALERT : ExitCode.SUCCESS;
   return { exit, unresolved };
 }
 
 /**
- * SPEC §8.7 step 5 against the balances recorded before the send, with zero tolerance unless one is configured; null
+ * SPEC Â§8.7 step 5 against the balances recorded before the send, with zero tolerance unless one is configured; null
  * when there is no recorded baseline or no fresh channel list to compare with.
  */
 async function verifyDelta(deps: ReconcileDeps, adapter: ExecutionAdapter, executionId: string, settledChannelKey: string, feeMsat: bigint): Promise<DeltaStatus | null> {

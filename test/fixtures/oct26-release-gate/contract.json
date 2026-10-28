@@ -1,0 +1,204 @@
+{
+  "authority": "Owner D29 public release gate decision, 2026-10-26; audit F03/F04; concrete independent TE contract before implementation",
+  "schemaVersion": 1,
+  "cli": "node scripts/release-gate.mjs --source COMMIT --tarball PATH --evidence MANIFEST",
+  "exitCodes": {
+    "accept": 0,
+    "refuse": 1
+  },
+  "sideEffects": "Verifier never publishes. No npm publish, git push, tag push, or vendor payment calls.",
+  "export": "verifyRelease(input, dependencies): Promise<number>",
+  "input": {
+    "sourceCommit": "40 lowercase hexadecimal source commit",
+    "tarballPath": "actual local final compressed npm tarball",
+    "manifest": {
+      "schemaVersion": 1,
+      "repository": "ZilverZtream/fluxwarden",
+      "sourceCommit": "same exact source commit",
+      "ci": {
+        "runId": "positive integer",
+        "runAttempt": "positive integer",
+        "workflowPath": ".github/workflows/ci.yml",
+        "artifactId": "positive integer"
+      },
+      "tarball": {
+        "sha256": "actual SHA256 of compressed bytes",
+        "bytes": "actual byte length"
+      }
+    }
+  },
+  "dependencies": {
+    "inventory": "Trusted independent frozen-source inventory: platformJobs [{key,os,node,shard,suite}], casesByTarget[os+\"/\"+node] mandatory for every supported target, each {product,harness} complete arrays of {file,name}; cases contains shared lab/chaos only; requiredLiveRows. Never substitute a global or another target case set, and never accept caller-declared scope. Unit source-cases.json explicitly distinguishes actual Windows collection from Linux source-registration modeling and synthetic runtime reuse. Production derives final candidate expected cases by actual collection on each OS/runtime, binding source/toolchain/collector identity; missing target inventory refuses.",
+    "github": {
+      "getRun(runId)": "Official workflow run response (id,run_attempt,path,head_sha,status,conclusion,repository.full_name)",
+      "listJobs(runId,runAttempt)": "Complete paginated official job array (id,run_id,head_sha,name,status,conclusion,steps); not first page only",
+      "getArtifact(artifactId)": "Official artifact metadata (id,name,size_in_bytes,digest,expired,workflow_run.id/head_sha)",
+      "downloadArtifact(artifactId)": "Actual ZIP Buffer, authenticated against official sha256 digest and size before interpreting any member",
+      "getEnvironment(name)": "Official npm-release response: can_admins_bypass:false; exactly one required_reviewers rule with sole User197366966/loginZilverZtream; boolean prevent_self_review (false permitted for this single-owner repository); deployment_branch_policy protected_branches:false/custom_branch_policies:true.",
+      "getDeploymentBranchPolicies(name)": "Complete paginated official deployment-policy array; exactly one {name:v1.*,type:tag}. Missing, broad, extra or branch policy refuses. protected_branches:true is insufficient when no branches are protected."
+    },
+    "productionBoundary": "Only the exported verifier accepts injected dependencies. CLI uses fixed official GitHub endpoints and canonical repository, authenticates run/jobs/artifact identity and digest, and independently derives source inventory. Caller PASS booleans and endpoint/inventory overrides cannot authorize publication."
+  },
+  "artifact": {
+    "name": "fluxwarden-release-evidence",
+    "format": "ZIP of regular files; release-evidence.json and all referenced members. Missing, duplicate, traversal, checksum-mismatched or unbound members refuse.",
+    "release-evidence.json": {
+      "schemaVersion": 1,
+      "sourceCommit": "exact candidate",
+      "compiledCommit": "exact candidate, also inspect dist/evidence/build-info.json in actual tarball",
+      "tarball": {
+        "sha256": "actual compressed SHA256",
+        "bytes": "actual byte length"
+      },
+      "platform": "One row per independently required platform job: {jobId,key,os,node,shard,suite,report:{path,sha256},receipt:{path,sha256}}. Every exact source job actually concludes success, with no unsuccessful/skipped steps. For each OS/runtime, report union is exactly its own independent casesByTarget[os+\"/\"+node] product and harness inventories; no global fallback, cross-target substitution, duplicate or omitted case. Eligibility may differ between OS and runtime. Every row is nonempty.",
+      "live": "{ownerPlan:{path,sha256},lab:{jobId,key,report,receipt,ownerPlan:{path,sha256}},chaos:{jobId,key,report,receipt},rows:[{id,status,evidence:{path,sha256}}]}. Shared ownerPlan binds chaos/native observations; lab.ownerPlan is separately mandatory for the distinct lab owner. Both validate exact source, exclusive:true, network:regtest and owner identity; a synthetic fixture may reuse one valid plan for both. Both complete independent lab/chaos inventories and every requiredLiveRows id must pass; GAP/PARTIAL/skips cannot become PASS.",
+      "demo": "{jobId,key,evidence:{path,sha256}}. Bound JSON contains sourceCommit,compiledCommit,tarballSha256,scenarioRecord:{path,sha256},sameHashRecovery:true,sendCount:1,ledgerVerified:true,checksumsVerified:true,completeLeakScan:true. Scenario record is separately retained and bound.",
+      "leakScan": "{jobId,key,evidence:{path,sha256}}; bound JSON exact source/compiled/tarball, complete:true,exitCode:0",
+      "installedSmoke": "{jobId,key,evidence:{path,sha256}}; bound JSON exact source/compiled/tarball, complete:true,exitCode:0",
+      "publisher": "{jobId,key,evidence:{path,sha256}}; bound JSON exact source/compiled/tarball,environment:npm-release,repository:ZilverZtream/fluxwarden,workflow:release.yml,package:fluxwarden,oidc:true,trustedPublisherVerified:true. Environment must also be verified via official API."
+    },
+    "report": "Vitest JSON: success:true, exact numTotalTests/numPassedTests, zero numFailedTests/numPendingTests/numTodoTests; nonempty testResults each with name and nonempty assertionResults with fullName,status:passed. Source case identity is normalized repo-relative file + fullName; every required case occurs exactly once in its appropriate union.",
+    "receipt": "{sourceCommit,compiledCommit,tarballSha256,jobId,complete:true,exitCode:0,reportSha256}; binds actual retained report to actual job and final source/artifact. Authenticated artifact and actual successful official job are required in addition to these fields.",
+    "boundEvidence": "Every referenced JSON evidence object has exact sourceCommit,compiledCommit,tarballSha256; its declared sha256 authenticates actual member bytes."
+  },
+  "requiredPlatform": {
+    "operatingSystems": [
+      "ubuntu-latest",
+      "windows-latest"
+    ],
+    "nodeTargets": [
+      "22.23.2",
+      "22.x",
+      "24.18.1",
+      "24.x",
+      "26.5.1",
+      "26.x"
+    ],
+    "linuxShards": [
+      "product-1",
+      "product-2",
+      "harness-1",
+      "harness-2"
+    ],
+    "windowsShards": [
+      "core-1",
+      "core-2",
+      "core-3",
+      "harness-1",
+      "harness-2",
+      "harness-3",
+      "harness-4",
+      "harness-5",
+      "harness-6",
+      "harness-7",
+      "harness-8",
+      "native-1",
+      "native-2"
+    ],
+    "jobName": "platform/{os}/{node}/{shard}",
+    "additionalJobs": [
+      "live/lab",
+      "live/chaos",
+      "release/demo",
+      "release/leak-scan",
+      "release/installed-smoke",
+      "release/publisher"
+    ],
+    "requiredLiveRows": [
+      "T-01",
+      "T-03",
+      "T-05",
+      "T-06",
+      "T-07",
+      "T-16",
+      "T-18",
+      "T-25"
+    ]
+  },
+  "requiredLiveSelection": {
+    "flag": "FLUXWARDEN_REQUIRE_LIVE",
+    "value": "1",
+    "ownerPlan": "FLUXWARDEN_LAB_PLAN",
+    "absentOrEmpty": "exit 1 before live execution; offline selection remains supported without flag"
+  },
+  "workflowBinding": "release.yml must invoke this gate successfully for GITHUB_SHA and the very same final tarball before npm publish. Gate failure cannot be continued, ignored, or guarded away. Retain final tarball SHA256 and authenticated evidence reference as publication evidence.",
+  "graph": {
+    "packageArtifact": "fluxwarden-final-package",
+    "packageContents": "sole fluxwarden-VERSION.tgz",
+    "aggregateArtifact": "fluxwarden-release-evidence",
+    "requiredJobs": 108,
+    "helperJobIds": "not fixed",
+    "dependencyPaths": "Every platform/live/final-artifact producer consumes the same package producer by an actual needs dependency path and authenticated download; aggregate depends on every required producer and packages their actual artifacts/source+tarball SHA bindings. Extra package/producer/aggregate helper jobs are permitted; no fixed total104 dispatch jobs."
+  },
+  "dispatcher": {
+    "cli": "node scripts/ci-platform.mjs --os OS --node TARGET --shard SHARD",
+    "export": "platformCommands(target,environment) -> {suite,commands}; target={os,node,shard}; commands ordered string[][] argv",
+    "execution": "CLI runs these stages inside unchanged ci-capture.mjs/ci-job.mjs, retains installer verification, lint, build, database check, optional Windows core config, original suite argv, worker and shard limits, JSON report, no-pending and failure propagation. A single unconditional dispatcher replaces skipped conditional suite steps. No test-only production hook."
+  },
+  "targetInventoryAuthentication": {
+    "export": "scripts/release-ci.mjs authenticateTargetInventories({github,sourceCommit,runId,runAttempt,tarballSha256}) -> Promise<casesByTarget>; rejection throws",
+    "transport": "github.listArtifacts/listJobs/getArtifact/downloadArtifact; production fixed canonical official endpoint",
+    "requiredJobs": "inventory/{os}/{node} for all12targets, current source/run/attempt successful jobs with no skipped required collection steps",
+    "artifact": "fluxwarden-inventory-{os}-{node}; actual authenticated ZIP digest/bytes and workflow-run/source association, inventory.json member",
+    "payload": {
+      "schemaVersion": 1,
+      "sourceCommit": "exact source",
+      "compiledCommit": "exact source",
+      "tarballSha256": "exact compressed package SHA256",
+      "key": "os/node",
+      "jobId": "actual official inventory job ID",
+      "os": "ubuntu-latest or windows-latest",
+      "node": "supported matrix target",
+      "platform": "linux or win32 respectively",
+      "runtime": "vMAJOR.MINOR.PATCH; exact minimum for pinned minima, supported matching major/minimum for moving target",
+      "cases": "{product,harness}: complete nonempty unique independently collected cases for this actual target"
+    },
+    "authority": "CLI always authenticates actual frozen-source target collection; no caller inventory/endpoint override and no global/cross-target fallback. Unit Linux registration transform and synthetic runtime maps are never native execution proof."
+  },
+  "publisherProtection": {
+    "authority": "Owner D29 verified actual repository/environment policy; reviewer is public account identity, not a credential",
+    "reviewer": {
+      "type": "User",
+      "id": 197366966,
+      "login": "ZilverZtream"
+    },
+    "can_admins_bypass": false,
+    "deployment_branch_policy": {
+      "protected_branches": false,
+      "custom_branch_policies": true
+    },
+    "soleDeploymentPolicy": {
+      "name": "v1.*",
+      "type": "tag"
+    },
+    "prevent_self_review": "must be boolean; false allowed",
+    "workflow": "actual release.yml retains npm-release environment; read-only CI publisher preflight does not request deployment environment and never publishes",
+    "approval": "Actual owner deployment approval is mandatory; YAML or a fixture is no evidence it occurred."
+  },
+  "reportSealing": {
+    "publicCLI": "node scripts/release-ci.mjs seal --key live/chaos",
+    "publicExport": "sealReport(github,key)",
+    "transport": "github.listJobs(runId,runAttempt) returns actual current job identity/source/run",
+    "inputs": [
+      "GITHUB_SHA/RUN_ID/RUN_ATTEMPT",
+      "FLUXWARDEN_FINAL_TARBALL actual compressed package; metadata and complete dist bytes match frozen source dist",
+      "FLUXWARDEN_EVIDENCE_DIR/vitest-chaos.json original bytes",
+      "FLUXWARDEN_CI_CAPTURE_DIR original independently verifiable receipt/private/custody",
+      "FLUXWARDEN_RELEASE_OUTPUT existing private directory",
+      "FLUXWARDEN_SENTINEL_DIR/TEST_TMP existing owned roots",
+      "FLUXWARDEN_LAB_PLAN {sourceCommit,exclusive:true,network:regtest,ownerId,owner:{evidenceRoot:absolute}}"
+    ],
+    "output": "bounded JSON report.json/receipt.json/row.json/capture.json/owner-plan.json/T-*.json; original report bytes preserved; receipt binds source/compiled/tarball/job/report SHA256 and ACTUAL capture exit",
+    "pass": "Every required TID has passed .live.test.ts assertion and complete retained native observations; explicit GAP/PARTIAL/INVALID raw evidence cannot become complete scenario PASS from assertion names. Unit fixtures of these formats are never native outcome evidence",
+    "failure": "Completed failed capture retains original failed report and actual nonzero receipt; no scenario PASS authorization",
+    "integrity": "Independently reverify unchanged original capture before producing authorized row; final entire bounded output scanned before successful return/upload. A fault injected output credential must be rejected or removed before authorization.",
+    "t18ObservationCompleteness": {
+      "authority": "Owner D29 LN-044-001 minimal raw binding: SPEC requires LAST_HOP_RECEIVABLE and FIRST_HOP_SPENDABLE; RESERVE_FLOOR is not a substitute",
+      "requiredVariants": ["LAST_HOP_RECEIVABLE", "FIRST_HOP_SPENDABLE"],
+      "summary": "T-18 evidence JSON observations:[{path,sha256}]; normalized relative authenticated artifact-member paths, no caller-narrowed variant requirement",
+      "raw": "Each referenced JSON retains existing source/owner binding and raw facts, with scenario:T-18, variant:<required variant>, status:PASS|GAP|PARTIAL|INVALID",
+      "completeness": "Both distinct required variants PASS. Missing raw data/reference, contradictory/incomplete retained observations, or legacy GAP without variant labels refuses completeness even when wrappers say complete:true/PASS. Do not omit contradictory retained files from the references to obtain PASS.",
+      "boundaries": "Sealing, aggregation and final verification preserve incompleteness. This unit contract does not establish actual native execution."
+    }
+  }
+}
