@@ -2,7 +2,7 @@
 // and native-observation-shaped files are UNIT INPUTS, never lab/CI PASS proof.
 // The separate public-chaos regression executes real failed Vitest assertions.
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -96,6 +96,9 @@ fsp.copyFile=async function(from,to,...args){const result=await asyncCopy.call(t
   });
   expect(packed.error).toBeUndefined(); expect(packed.status, 'actual synthetic package pack completes').toBe(0);
   const tarball = join(packages, 'fluxwarden-1.0.0.tgz'); env['FLUXWARDEN_FINAL_TARBALL'] = tarball;
+  // This nested source owns a distinct package from any outer CI package.
+  // Bind the fixture's expected identity to its independently packed bytes.
+  env['FLUXWARDEN_EXPECTED_TARBALL_SHA256'] = createHash('sha256').update(readFileSync(tarball)).digest('hex');
   // Inventory collection is a fixture producer too. Complete it before the
   // capture closes TEMP and retains every file in that independently scanned scope.
   beforeCapture?.({ source, env, sourceCommit });

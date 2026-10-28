@@ -55,9 +55,15 @@ it('CP-044/PROFILE-DERIVE clean-source public derivation preserves every origina
   const product = derived.cases['product']; if (!product) throw new Error('actual product source collection absent');
   const ids = product.map(row => `${row.file}\n${row.name}`);
   expect(product.length).toBeGreaterThan(0); expect(new Set(ids).size, 'source case IDs occur exactly once').toBe(ids.length);
-  const frozen = independentInventory().casesByTarget['windows-latest/24.x'];
+  // The original independent collection records platform-conditional declarations.
+  // Compare the exact original eligible set on this host; later additions cannot
+  // mask a missing original or make a Windows-only original eligible on Linux.
+  const original = independentInventory(), os = process.platform === 'win32' ? 'windows-latest' : 'ubuntu-latest';
+  const frozen = original.casesByTarget[`${os}/24.x`];
   if (!frozen) throw new Error('independent original source collection absent');
-  for (const row of frozen.product) expect(ids, 'every independently recorded original product assertion remains eligible').toContain(`${row.file}\n${row.name}`);
+  const originalIds = new Set(Object.values(original.casesByTarget).flatMap(target => target.product.map(row => `${row.file}\n${row.name}`)));
+  expect(ids.filter(id => originalIds.has(id)).sort(), 'exact independently recorded original platform eligibility').toEqual(
+    frozen.product.map(row => `${row.file}\n${row.name}`).sort());
   expect(derived.platformJobs).toHaveLength(168);
   expect(ordered(derived.platformJobs)).toEqual(ordered(expectedTargets()));
 });

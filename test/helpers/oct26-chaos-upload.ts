@@ -1,5 +1,6 @@
 // Public workflow semantics: retain unconditional full captured-evidence scan,
-// then independently verify capture and seal/scan bounded JSON before upload.
+// full verification before sealing, and independently safe bounded uploads.
+// D29 permits the always-run seal to own its full verification exactly once.
 import { expect } from 'vitest';
 import { asRecord } from './cli.js';
 
@@ -19,17 +20,29 @@ export function proveChaosUpload(workflow: Record<string, unknown>, chaos: Recor
   const final = command.indexOf('--finally node scripts/leak-check.mjs');
   expect(final, 'original full scanner remains an unconditional failure finalizer').toBeGreaterThan(command.indexOf('npm run test:chaos'));
   expect(command.slice(final)).toMatch(/^--finally node scripts\/leak-check\.mjs --sentinels test\/sentinels\.json --sentinel-dir "\$FLUXWARDEN_SENTINEL_DIR" "\$FLUXWARDEN_EVIDENCE_DIR"$/);
-  const verify = steps.findIndex(step => String(step['run'] ?? '').trim() === 'node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"');
-  expect(verify).toBeGreaterThan(run); expect(steps[verify]?.['if']).toBe('always()');
-  expect(steps[verify]?.['id']).toBe('capture-verify');
-  const seal = steps.findIndex(step => /\bnode scripts\/release-ci\.mjs seal --key ["']?live\/chaos["']?(?:\s|$)/.test(String(step['run'] ?? '')));
-  expect(seal, 'actual proof producer follows independent capture verification').toBeGreaterThan(verify);
-  expect(steps[seal]?.['id']).toBe('report-seal');
-  expect(String(steps[seal]?.['if']).replace(/\s+/g, ''), 'unsafe/unverified capture cannot be sealed').toBe("always()&&steps.capture-verify.outcome=='success'");
+  const verify = steps.findIndex(step => step['id'] === 'capture-verify');
+  const seal = steps.findIndex(step => step['id'] === 'report-seal');
+  expect(seal, 'actual proof producer follows the captured workload').toBeGreaterThan(run);
+  expect(String(steps[seal]?.['run']).trim(), 'only the exact live/chaos proof producer earns verification credit').toMatch(/^node scripts\/release-ci\.mjs seal --key (?:live\/chaos|"live\/chaos"|'live\/chaos')$/);
+  const condition = (value: unknown): string => String(value).replace(/\s+/g, '');
+  const requireCondition = (step: Record<string, unknown> | undefined, terms: string[]): void => {
+    expect(condition(step?.['if']).split('&&').sort(), 'every required success guard remains conjunctive').toEqual([...terms].sort());
+    expect(step?.['continue-on-error'] ?? false).toBe(false);
+  };
+  if (verify >= 0) {
+    expect(verify).toBeGreaterThan(run); expect(seal).toBeGreaterThan(verify);
+    expect(steps[verify]?.['run']).toBe('node scripts/ci-capture.mjs verify --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"');
+    requireCondition(steps[verify], ['always()']);
+    requireCondition(steps[seal], ['always()', "steps.capture-verify.outcome=='success'"]);
+  } else {
+    // The real sealing entry point performs full original verification before
+    // any output. Its unconditional invocation owns the existing single epoch.
+    requireCondition(steps[seal], ['always()']);
+  }
   const uploads = steps.map((step, index) => ({ step, index })).filter(({ step }) => String(step['uses'] ?? '').startsWith('actions/upload-artifact@'));
   const named = (name: string) => uploads.filter(({ step }) => asRecord(step['with'], 'upload')['name'] === name);
   const receipt = named('chaos-capture'), bounded = named('fluxwarden-live-chaos');
-  expect(receipt).toHaveLength(1); expect(bounded).toHaveLength(1);
+  expect(receipt).toHaveLength(1); expect(bounded).toHaveLength(1); expect(uploads).toHaveLength(2);
   const normalize = (value: unknown): string => String(value).trim().replace(/\$\{\{\s*env\.(FLUXWARDEN_[A-Z_]+)\s*\}\}/g, (_match, name: string) => `$${name}`);
   for (const { step, index } of uploads) {
     expect(String(step['uses'])).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
@@ -37,14 +50,23 @@ export function proveChaosUpload(workflow: Record<string, unknown>, chaos: Recor
     expect(path).not.toMatch(/\.runtime|labs\/?$|\bsentinels?\b/);
     expect(options['if-no-files-found']).toBe('error');
     if (options['name'] === 'chaos-capture') {
-      expect(index).toBeGreaterThan(verify); expect(path).toBe('$FLUXWARDEN_CI_CAPTURE_DIR/receipt.json');
-      expect(String(step['if']).replace(/\s+/g, '')).toBe("always()&&steps.capture-verify.outcome=='success'");
+      expect(path).toBe('$FLUXWARDEN_CI_CAPTURE_DIR/receipt.json');
+      if (verify >= 0 && condition(step['if']) === "always()&&steps.capture-verify.outcome=='success'") {
+        expect(index).toBeGreaterThan(verify);
+        requireCondition(step, ['always()', "steps.capture-verify.outcome=='success'"]);
+      } else {
+        // D29 diagnostic confidentiality alone never authorizes release output.
+        const metadata = steps.findIndex(value => value['id'] === 'capture-metadata');
+        expect(metadata).toBeGreaterThan(run); expect(index).toBeGreaterThan(metadata);
+        expect(steps[metadata]?.['run']).toBe('node scripts/ci-safe-capture-metadata.mjs --root "$PWD" --capture-dir "$FLUXWARDEN_CI_CAPTURE_DIR"');
+        requireCondition(steps[metadata], ['always()']);
+        requireCondition(step, ['always()', "steps.capture-metadata.outcome=='success'", "steps.capture-metadata.outputs.available=='true'"]);
+      }
     } else {
       expect(index).toBeGreaterThan(seal);
       expect(path, 'only final scanned bounded JSON is uploaded').toBe('$FLUXWARDEN_RELEASE_OUTPUT/*.json');
-      expect(String(step['if']).replace(/\s+/g, '').split('&&').sort()).toEqual([
-        'always()', "steps.capture-verify.outcome=='success'", "steps.report-seal.outcome=='success'",
-      ].sort());
+      requireCondition(step, verify >= 0 ? ['always()', "steps.capture-verify.outcome=='success'", "steps.report-seal.outcome=='success'"]
+        : ['always()', "steps.report-seal.outcome=='success'"]);
     }
   }
 }

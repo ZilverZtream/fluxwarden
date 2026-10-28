@@ -4,7 +4,7 @@ FluxWarden moves funds between Lightning channels and reads node credentials (LN
 
 ## Supported versions
 
-FluxWarden has not had a release yet. Until 1.0.0, only the latest commit on `main` is supported.
+Before 1.0.0, only the latest commit on `main` is supported. From 1.0.0 onward, only the latest release is supported; upgrade to that release to receive security fixes.
 
 ## Report a vulnerability
 

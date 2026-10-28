@@ -14,12 +14,25 @@ function hasPass(value: unknown): boolean {
   return Object.entries(value).some(([key, row]) => key === 'status' && row === 'PASS' || hasPass(row));
 }
 
+// Public platform jobs export their outer package's expected hash. A synthetic
+// nested package must establish its own complete binding without borrowing it.
+function fixtureWithOuterPackageBinding(): ReturnType<typeof capturedSealFixture> {
+  const name = 'FLUXWARDEN_EXPECTED_TARBALL_SHA256', previous = process.env[name];
+  process.env[name] = 'f'.repeat(64);
+  try { return capturedSealFixture(0); }
+  finally {
+    if (previous === undefined) Reflect.deleteProperty(process.env, name);
+    else process.env[name] = previous;
+  }
+}
+
 it('CP-044/SEAL real unchanged capture fixtures preserve actual success and failure and pass independent custody verification', () => {
   for (const code of [0, 7] as const) capturedSealFixture(code);
 }, 120_000);
 
 it('CP-044/SEAL bounded successful proof preserves original report bytes and source artifact and actual exit bindings', async () => {
-  await loadPublicSeal(); const fixture = capturedSealFixture(0);
+  await loadPublicSeal(); const fixture = fixtureWithOuterPackageBinding();
+  expect(fixture.env['FLUXWARDEN_EXPECTED_TARBALL_SHA256'], 'nested package has its own actual hash binding').toBe(sha256(readFileSync(fixture.tarball)));
   expect(runPublicSeal(fixture)).toBe(0);
   expect(readFileSync(join(fixture.output, 'report.json')).equals(fixture.originalReport)).toBe(true);
   const receipt = asRecord(JSON.parse(readFileSync(join(fixture.output, 'receipt.json'), 'utf8')), 'bounded receipt');

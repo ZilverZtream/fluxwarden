@@ -23,17 +23,30 @@ export function runProcess(argv, { cwd, env, timeoutMs, signal, stdin } = {}) {
   return new Promise((resolve, reject) => {
     if (!Array.isArray(argv) || !argv.length || argv.some(arg => typeof arg !== 'string') || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || signal?.aborted) { reject(new Error('process: invalid request')); return; }
     let child;
-    try { child = spawn(argv[0], [...argv.slice(1)], { cwd, env, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    const grouped = process.platform !== 'win32';
+    try { child = spawn(argv[0], [...argv.slice(1)], { cwd, env, shell: false, windowsHide: true, detached: grouped, stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch { reject(new Error('process: start failed')); return; }
     let stdout = [], stderr = [], captured = 0, failed = false;
-    const stop = () => { failed = true; child.kill('SIGKILL'); };
+    // Docker's Compose plugin cancels ongoing work on SIGTERM (docker/compose,
+    // cmd/compose/compose.go AdaptCmd). Killing only its docker parent can leave
+    // startup creating resources while the owner's down command removes them.
+    // Own a separate POSIX process group so cancellation reaches the plugin too.
+    const terminate = signal => {
+      failed = true;
+      if (grouped && child.pid) { try { process.kill(-child.pid, signal); } catch { /* The owned group may already have exited. */ } }
+      else child.kill(signal);
+    };
+    const stop = () => terminate('SIGKILL');
+    // Graceful cancellation followed by forced termination, as in
+    // sindresorhus/execa lib/terminate/kill.js; keep the original child deadline.
+    const abort = () => terminate(grouped ? 'SIGTERM' : 'SIGKILL');
     const timer = setTimeout(stop, timeoutMs);
-    signal?.addEventListener('abort', stop, { once: true });
+    signal?.addEventListener('abort', abort, { once: true });
     const capture = target => bytes => { captured += bytes.length; if (captured > 16 * 1024 * 1024) stop(); else target.push(bytes); };
     child.stdout.on('data', capture(stdout)); child.stderr.on('data', capture(stderr));
     child.on('error', stop); child.stdin.on('error', stop);
     child.on('close', code => {
-      clearTimeout(timer); signal?.removeEventListener('abort', stop);
+      clearTimeout(timer); signal?.removeEventListener('abort', abort);
       if (failed || !Number.isInteger(code)) reject(new Error('process: interrupted'));
       else resolve({ exitCode: code, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') });
       stdout = []; stderr = [];
