@@ -6,7 +6,6 @@
 // back on the open descriptor. Windows: the staging directory and file are created with protected
 // owner-only native DACLs and verified before writing. The completed file is linked to the target
 // path, which fails if that exists.
-import { randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, openSync, rmdirSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join, parse, resolve } from 'node:path';
 import { createOwnerOnlyDirectory, createOwnerOnlyEmptyFile, restrictToOwner, type OwnerOnlyTarget } from '../platform/owner-only.js';
@@ -99,7 +98,10 @@ function createPrivate(path: string, bytes: Uint8Array, flags: number, scratch?:
 
 function writeWindows(path: string, bytes: Uint8Array): OwnerOnlyWrite {
   if (lstatSync(path, { throwIfNoEntry: false }) !== undefined) return 'exists';
-  const dir = join(dirname(path), `.fluxwarden-${randomBytes(16).toString('hex')}`);
+  // This name reserves no authority: native creation and the owner/DACL
+  // readback below admit the directory. Avoid OpenSSL entropy for a public name;
+  // its Windows initialization can depend on the caller's SystemRoot setting.
+  const dir = join(dirname(path), `.fluxwarden-${String(process.pid)}-${process.hrtime.bigint().toString(16)}`);
   try {
     // Reuse the persistence native CreateNew/DACL readback (microsoft/referencesource
     // mscorlib/system/io/{directory,filestream}.cs), rather than restrict an inherited object.

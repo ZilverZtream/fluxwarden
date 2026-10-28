@@ -289,6 +289,10 @@ it('CP-028/B3 preflight renews the lease with its fenced writes: after a slow no
     const approval = seedProposal(base);
     const { prepareExecution } = await loadPreflight();
     const fake = new FakePreflightNode(base.sourceKey, base.targetKey, { during: { findCircularRoute: () => sleep(500) } });
+    const channels = fake.script.channels;
+    // Match the real controller's observation clock without changing the delay,
+    // lease, policy or the assertions about its final fenced write.
+    fake.script.channels = () => { const observedAt = dbNow(path); return channels().map(channel => ({ ...channel, observedAt })); };
     const before = dbNow(path);
     const outcome = await prepareExecution({ db, adapter: fake, workerId: 'worker-a', leaseMs: LEASE }, { approval, policy, approvalKeyIds: APPROVAL_KEYS });
     expect(outcome.kind).toBe('READY');

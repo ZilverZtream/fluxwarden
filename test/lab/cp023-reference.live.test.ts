@@ -3,7 +3,7 @@
 // a whole number of sat and the reverse-edge pairs leave one possible last hop.
 import { spawnSync } from 'node:child_process';
 import { expect, it } from 'vitest';
-import { adapterLabPlan, expectNoSentinelLeak, lncli, rows, type AdapterLabPlan } from '../helpers/adapter-lab.js';
+import { adapterLabPlan, expectNoSentinelLeak, lncli, lncliShortChannelId, rows, type AdapterLabPlan } from '../helpers/adapter-lab.js';
 import { loadLndRest, type LndRest } from '../helpers/adapter-interfaces.js';
 import { isCandidate, loadLndRoutes, type RouteConstraints } from '../helpers/route-interfaces.js';
 
@@ -19,7 +19,7 @@ interface LabChannels { self: string; height: number; one: { chanId: string; pee
 /** Channel 2 leads to CLN-M; channel 1 to LND-P, a node with one channel; channel 3 to CLN-R. */
 function labChannels(plan: AdapterLabPlan): LabChannels {
   const info = lncli(plan, ['getinfo']);
-  const channels = rows(lncli(plan, ['listchannels'])['channels'], 'listchannels').map(item => ({ chanId: String(item['chan_id']), peer: String(item['remote_pubkey']) }));
+  const channels = rows(lncli(plan, ['listchannels'])['channels'], 'listchannels').map(item => ({ chanId: lncliShortChannelId(item), peer: String(item['remote_pubkey']) }));
   const two = channels.find(item => item.peer === plan.cln.pubkey);
   const others = channels.filter(item => item.peer !== plan.cln.pubkey);
   const degree = (peer: string): number => Number(lncli(plan, ['getnodeinfo', '--pub_key', peer])['num_channels']);

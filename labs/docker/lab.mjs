@@ -43,7 +43,10 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
   const execute = async (stage, argv, cleanup = false, limit = stageTimeout) => {
     if ((!cleanup && signal?.aborted) || clock() >= deadline) throw fail(`${stage} timeout`);
     let result;
-    try { result = await run(argv, { cwd: owner.runtimeRoot, env, timeoutMs: Math.max(1, Math.min(limit, deadline - clock())), signal: cleanup ? undefined : signal }); }
+    // Finish the bounded Compose startup before rolling it back. Interrupting its
+    // frontend can leave container creation overlapping down's resource inventory.
+    // The checks around this call still reject cancellation before any node setup.
+    try { result = await run(argv, { cwd: owner.runtimeRoot, env, timeoutMs: Math.max(1, Math.min(limit, deadline - clock())), signal: cleanup || stage === 'up' ? undefined : signal }); }
     catch { throw fail(`${stage} subprocess`); }
     if (!result || !Number.isInteger(result.exitCode) || typeof result.stdout !== 'string' || typeof result.stderr !== 'string') throw fail(stage);
     await journal(stage, result);

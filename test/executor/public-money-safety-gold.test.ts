@@ -140,10 +140,19 @@ for (const pathKind of ['dispatch', 'unknown-track', 'unknown-startup', 'late-at
       if (proof === null) throw new Error('regtest proof refused');
       const approved = approveRoute(route, route, seeded.approval, policy, proof);
       if (!('route' in approved)) throw new Error(`within-cap route refused: ${approved.refusal}`);
+      // Real controller readers stamp observations with the authoritative DB
+      // clock. Host Date.now can be 1ms ahead on Windows and invent a future read.
       const node = new ScriptedExecutionNode({
-        before: () => [fakeChannel(base.sourceKey, OUT_PEER, { localBalanceMsat: S_BEFORE }), fakeChannel(base.targetKey, IN_PEER, { localBalanceMsat: T_BEFORE })],
-        after: () => [fakeChannel(base.sourceKey, OUT_PEER, { localBalanceMsat: S_BEFORE - PRINCIPAL - actualFee }),
-          fakeChannel(base.targetKey, IN_PEER, { localBalanceMsat: T_BEFORE + PRINCIPAL })],
+        before: () => {
+          const observedAt = dbNow(path);
+          return [fakeChannel(base.sourceKey, OUT_PEER, { localBalanceMsat: S_BEFORE, observedAt }),
+            fakeChannel(base.targetKey, IN_PEER, { localBalanceMsat: T_BEFORE, observedAt })];
+        },
+        after: () => {
+          const observedAt = dbNow(path);
+          return [fakeChannel(base.sourceKey, OUT_PEER, { localBalanceMsat: S_BEFORE - PRINCIPAL - actualFee, observedAt }),
+            fakeChannel(base.targetKey, IN_PEER, { localBalanceMsat: T_BEFORE + PRINCIPAL, observedAt })];
+        },
         send: context => { context.onDispatched?.(); return Promise.resolve(pathKind === 'dispatch'
           ? succeeded(actualFee, 1, true, base.targetKey) : { kind: 'IN_FLIGHT' }); },
         observe: () => Promise.resolve(succeeded(actualFee, 1, true, base.targetKey)),

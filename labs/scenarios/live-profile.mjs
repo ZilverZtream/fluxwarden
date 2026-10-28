@@ -116,7 +116,8 @@ export function capturePlanner({ ownerPath, sourceCommit, evidenceRoot, native }
   }
   const probes = [];
   for (const channel of captures['lnd-r'].channels) {
-    const chanId = String(channel.chan_id ?? channel.scid), pubkey = channel.remote_pubkey;
+    // Pinned lncli exposes the decimal short ID as scid and the 32-byte ID as chan_id.
+    const chanId = String(channel.scid ?? channel.chan_id), pubkey = channel.remote_pubkey;
     requireFact(/^[0-9]+$/.test(chanId) && Object.values(manifest.nodes).some(n => n.pubkey === pubkey), 'owned native first hop required');
     const probe = amount => {
       deadline();

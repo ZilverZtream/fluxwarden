@@ -29,12 +29,12 @@ it('CP-044/LP-B startup-bound captures reject prior manifest and changed artifac
 
 it('CP-044/LP-B measured boundary admits conservative gaps and retains unsafe declarations as REFERENCE_CONFLICT', () => {
   const f = fixture();
-  let nativeAccepted = 990005n;
+  let nativeAccepted = 990005n, pinnedCliShape = true;
   const native: Native = (service, args) => {
     let answer: unknown;
     if (service === 'bitcoind') answer = 150;
     else if (args[0] === 'getinfo') answer = service === 'lnd-r' ? { block_height: 150, identity_pubkey: f.manifest.nodes['lnd-r']?.pubkey } : { blockheight: 150, id: f.manifest.nodes['cln-m']?.pubkey };
-    else if (args[0] === 'listchannels') answer = { channels: [{ chan_id: '123', remote_pubkey: f.manifest.nodes['cln-m']?.pubkey, local_balance: '1000', local_constraints: { chan_reserve_sat: '10' }, initiator: false, pending_htlcs: [] }] };
+    else if (args[0] === 'listchannels') answer = { channels: [{ chan_id: pinnedCliShape ? 'a'.repeat(64) : '123', ...(pinnedCliShape ? { scid: '123' } : {}), remote_pubkey: f.manifest.nodes['cln-m']?.pubkey, local_balance: '1000', local_constraints: { chan_reserve_sat: '10' }, initiator: false, pending_htlcs: [] }] };
     else if (args[0] === 'listpeerchannels') answer = { channels: [{ short_channel_id: '1x2x3', spendable_msat: 1000, receivable_msat: 2000, htlcs: [] }] };
     else {
       const envelope = JSON.parse(args[args.indexOf('--routes') + 1] ?? '{}') as { route: { hops: { mpp_record: unknown }[]; total_amt_msat: string } };
@@ -53,6 +53,10 @@ it('CP-044/LP-B measured boundary admits conservative gaps and retains unsafe de
   expect(() => assertPlannerCapture(observed.captureDir, f.ownerPath, sourceCommit)).not.toThrow();
   writeFileSync(join(observed.captureDir, 'lnd-r/listchannels.json'), '{}');
   expect(() => assertPlannerCapture(observed.captureDir, f.ownerPath, sourceCommit)).toThrow(/hash mismatch/);
+  // Keep the original decimal-only fixture as a separate legacy control.
+  pinnedCliShape = false;
+  const legacy = capturePlanner({ ownerPath: f.ownerPath, sourceCommit, native });
+  expect(JSON.parse(readFileSync(join(legacy.captureDir, 'lnd-r/spendable-probe.json'), 'utf8')) as unknown).toEqual([{ chan_id: '123', accepted_msat: '990005', refused_msat: '990006' }]);
   nativeAccepted = 989999n;
   expect(() => capturePlanner({ ownerPath: f.ownerPath, sourceCommit, native })).toThrow(/REFERENCE_CONFLICT.*declared conservative spendable refused/);
 });

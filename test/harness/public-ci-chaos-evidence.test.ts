@@ -11,6 +11,7 @@ import { asRecord, childEnv, readText, repoRoot } from '../helpers/cli.js';
 import { testRoot } from '../helpers/env.js';
 import { declareFixtureCapture, declareFixturePaths, ownedCaptureToolArgs } from '../helpers/capture-fixture.js';
 import { parseYaml } from '../helpers/yaml.js';
+import { proveChaosUpload } from '../helpers/oct26-chaos-upload.js';
 
 function files(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -102,20 +103,20 @@ it('CP-033/034 selecting live references retains the ordinary fake-node matrix a
 it('CP-036/B5 the actual chaos workflow command retains truthful failed assertion outcomes in its full scanned evidence directory', () => {
   const workflow = asRecord(parseYaml(readText('.github/workflows/ci.yml')), 'workflow');
   const chaos = asRecord(asRecord(workflow['jobs'], 'jobs')['chaos'], 'chaos');
+  // The approved full combined seal and diagnostic receipt guards share the
+  // independently negative-controlled release oracle.
+  proveChaosUpload(workflow, chaos);
   const stepsValue = chaos['steps'];
   if (!Array.isArray(stepsValue)) throw new Error('chaos steps required');
   const steps = stepsValue.map(step => asRecord(step, 'step'));
   const run = steps.findIndex(step => typeof step['run'] === 'string' && /\bnpm run test:chaos\b/.test(step['run']));
   const install = steps.findIndex(step => typeof step['run'] === 'string' && /^node scripts\/ci-install\.mjs --root "\$PWD"$/.test(step['run'].trim()));
   const scan = steps.findIndex(step => typeof step['run'] === 'string' && /scripts\/leak-check\.mjs/.test(step['run']));
-  const verify = steps.findIndex(step => typeof step['run'] === 'string' && /scripts\/ci-capture\.mjs verify\b/.test(step['run']));
   expect(run, 'actual chaos command exists').toBeGreaterThanOrEqual(0);
   expect(install, 'trusted frozen-lock setup precedes candidate validation').toBeGreaterThanOrEqual(0);
   expect(run).toBeGreaterThan(install);
   expect(steps[run]?.['if'], 'original installer failure still enters evidence capture').toBe('always()');
-  expect(verify, 'complete invocation verification follows generation').toBeGreaterThan(run);
   expect(scan, 'full evidence scan belongs to the same complete captured command').toBe(run);
-  expect(steps[verify]?.['if'], 'capture is finalized on command failure').toBe('always()');
   // D29: raw private evidence need not be uploaded. The separate release B5
   // oracle proves bounded JSON sealing/scanning and upload authorization.
   const scratch = mkdtempSync(join(testRoot('FLUXWARDEN_TEST_TMP'), 'ce-'));
