@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { request } from 'node:https';
@@ -8,6 +8,8 @@ import { pathToFileURL } from 'node:url';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { expect } from 'vitest';
 import { asRecord, readJson, repoRoot } from './cli.js';
+import { productInventory } from './leak-scan.js';
+import { declareFixturePaths } from './capture-fixture.js';
 import type { BindingProducer, BindingRequest, BoundOwner, Endpoint } from '../../labs/scenarios/credentials/producer-contract.d.mts';
 import { afterBothFreshStarts, verifyFreshBinding } from './cp008-fresh-binding.js';
 import { verifySourceManifest } from './cp008-source-contract.js';
@@ -123,12 +125,44 @@ export function credentialPlan(input = process.env['FLUXWARDEN_LAB_CREDENTIAL_PL
 }
 export function rolePath(item: LiveOwner, node: Node, role: Role): string { return join(item.owner.runtimeRoot, 'credentials', node, `${role}.${node.startsWith('lnd-') ? 'macaroon' : 'rune'}`); }
 export function fingerprint(bytes: Uint8Array): string { return `fp:${createHash('sha256').update(bytes).digest('hex').slice(0, 16)}`; }
+/** Docker RepoDigests uses repository@digest even when Config.Image retained
+ * repository:tag@digest. A registry port belongs to the repository, not a tag.
+ */
+export function hasPinnedRepoDigest(observed: unknown, requested: string): boolean {
+  const match = /^([^@\s]+)@(sha256:[a-f0-9]{64})$/.exec(requested);
+  if (!match?.[1] || !match[2]) return false;
+  const tagged = match[1], colon = tagged.lastIndexOf(':'), slash = tagged.lastIndexOf('/');
+  if (colon > slash && colon === tagged.length - 1) return false;
+  const repository = colon > slash ? tagged.slice(0, colon) : tagged;
+  return repository !== '' && Array.isArray(observed) && observed.includes(`${repository}@${match[2]}`);
+}
 function containerIds(project: string): string[] { return dockerText(['ps', '-aq', '--filter', `label=com.docker.compose.project=${project}`]).split(/\s+/).filter(Boolean); }
 function inventory(project: string): { containers: string[]; volumes: string[]; networks: string[] } {
   return { containers: containerIds(project), volumes: dockerText(['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`]).split(/\s+/).filter(Boolean), networks: dockerText(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`]).split(/\s+/).filter(Boolean) };
 }
 function unrelated(projects: string[]): string[] {
   return ['ps', 'volume', 'network'].flatMap(kind => dockerText(kind === 'ps' ? ['ps', '-a', '--no-trunc', '--format', '{{.ID}} {{.State}} {{.Labels}}'] : [kind, 'ls', '--format', '{{.Name}} {{.Labels}}']).split('\n').filter(line => line && !projects.some(project => line.includes(`com.docker.compose.project=${project}`)))).sort();
+}
+/** CP008 Rleak requires fresh independent format sentinels (needsLab:false).
+ * These genuine private keys are SOURCE-only controls, never node or approval
+ * authority, and are created directly in the already validated owned pool. */
+export async function prepareCp008LeakSources(sentinelRoot: string, permissions: Pick<PrivateIO, 'assertPrivateDirectory'>): Promise<string[]> {
+  await permissions.assertPrivateDirectory(sentinelRoot);
+  const global = absolute(process.env['FLUXWARDEN_SENTINEL_DIR']);
+  await permissions.assertPrivateDirectory(global);
+  if (!within(global, sentinelRoot)) throw new LabInvalidError('owned format sources require the actual global source namespace before creation');
+  const tls = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+  const approval = generateKeyPairSync('ed25519').privateKey;
+  const paths = ([['tls-key', tls], ['approval-key', approval]] as const).map(([kind, key]) => {
+    const path = join(sentinelRoot, `${kind}-${randomUUID()}.pem`);
+    writeFileSync(path, key.export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600, flag: 'wx' });
+    return path;
+  });
+  const { protectCreated } = await import(pathToFileURL(join(repoRoot, 'labs/docker/owner.mjs')).href) as {
+    protectCreated: (paths: readonly string[], options: { privateDirectories: readonly string[] }) => Promise<void>;
+  };
+  await protectCreated(paths, { privateDirectories: [sentinelRoot] });
+  return paths;
 }
 export class Cohort {
   readonly cancellation = new AbortController();
@@ -160,6 +194,7 @@ export class Cohort {
       checkedFile(item.declaration);
       if (!within(item.owner.runtimeRoot, item.oracle.composeFile)) throw new LabInvalidError('explicit compose file must be under the owned runtime root');
       for (const root of [item.owner.runtimeRoot, item.owner.tmpRoot, item.owner.sentinelRoot, item.owner.evidenceRoot]) await this.privateIO.assertPrivateDirectory(root);
+      await prepareCp008LeakSources(item.owner.sentinelRoot, this.privateIO);
       this.retain(item, 'inventory', { runId: this.runId, file: 'test/lab/cp008-credentials.live.test.ts', titles, sourceManifestHash: createHash('sha256').update(readFileSync(this.plan.sourceManifest)).digest('hex'), bindingSourceManifestHash: createHash('sha256').update(readFileSync(this.plan.bindingSourceManifest)).digest('hex'), planHash: createHash('sha256').update(readFileSync(absolute(process.env['FLUXWARDEN_LAB_CREDENTIAL_PLAN']))).digest('hex') });
     }
     this.before = unrelated(this.plan.owners.map(item => item.owner.project));
@@ -245,7 +280,7 @@ export class Cohort {
       const service = string(labels['com.docker.compose.service']); expect(labels['com.docker.compose.project']).toBe(item.owner.project);
       expect(config['Image']).toBe(item.oracle.imagePins[service]); expect(asRecord(container['State'], 'actual state')['Running']).toBe(true);
       const image = rows(docker(['image', 'inspect', string(container['Image'])]), 'actual image')[0];
-      expect(Array.isArray(image?.['RepoDigests']) && image['RepoDigests'].includes(item.oracle.imagePins[service]), 'actual repository digest').toBe(true);
+      expect(hasPinnedRepoDigest(image?.['RepoDigests'], item.oracle.imagePins[service] ?? ''), 'actual repository digest').toBe(true);
       const limits = asRecord(container['HostConfig'], 'actual limits');
       total.cpus += positive(limits['NanoCpus'], 4e9) / 1e9; total.memoryBytes += positive(limits['Memory'], 4294967296); total.pids += positive(limits['PidsLimit'], 1024);
       const settings = asRecord(container['NetworkSettings'], 'actual network settings');
@@ -576,18 +611,26 @@ export async function proveRowner(cohort: Cohort): Promise<void> {
 }
 
 interface Scanner { findLeaks(options: { root: string; sentinels: string; sentinelDir: string; testTmp: string; evidenceDir: string; paths: string[] }): { path: string; encoding: string } | null }
-export async function proveRleak(cohort: Cohort): Promise<void> {
-  const start = performance.now();
+interface LeakFixture {
+  privateIO: PrivateIO;
+  plan: { owners: { owner: Pick<Owner, 'runtimeRoot' | 'tmpRoot' | 'sentinelRoot' | 'evidenceRoot'> }[] };
+}
+export async function proveCp008ArtifactLeaks(cohort: LeakFixture): Promise<void> {
   const scanner = await import(pathToFileURL(join(repoRoot, 'scripts/leak-check.mjs')).href) as Scanner;
-  const tracked = spawnSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: repoRoot, shell: false, windowsHide: true, encoding: 'utf8', timeout: 15000 }); expect(tracked.status).toBe(0);
-  const artifacts = tracked.stdout.split('\0').filter(Boolean).map(path => join(repoRoot, path)); expect(artifacts.length).toBeGreaterThan(0);
+  const { paths: artifacts, excluded } = productInventory(); expect(artifacts.length).toBeGreaterThan(0);
+  const staticSources = excluded.map(path => ({ path, bytes: readFileSync(path), info: lstatSync(path, { bigint: true }) }));
+  for (const source of staticSources) if (!source.info.isFile() || source.info.isSymbolicLink()) throw new LabInvalidError('original registered static source required');
+  const global = absolute(process.env['FLUXWARDEN_SENTINEL_DIR']);
+  await cohort.privateIO.assertPrivateDirectory(global);
+  for (const item of cohort.plan.owners) if (!within(global, item.owner.sentinelRoot)) throw new LabInvalidError('owned original sources must belong to the complete global source population');
   for (const item of cohort.plan.owners) {
     const { tmpRoot, sentinelRoot, evidenceRoot } = item.owner;
     const samples = readdirSync(sentinelRoot, { withFileTypes: true }).filter(entry => entry.isFile() && readFileSync(join(sentinelRoot, entry.name)).length > 0);
     for (const kind of ['preimage', 'macaroon', 'rune', 'tls-key', 'approval-key']) expect(samples.some(entry => entry.name.includes(kind)), 'independent required nonempty sentinel kind').toBe(true);
-    const options = { root: repoRoot, sentinels: join(tmpRoot, 'sentinels.json'), sentinelDir: sentinelRoot, testTmp: tmpRoot, evidenceDir: evidenceRoot, paths: [...artifacts, ...cohort.plan.owners.flatMap(value => [value.owner.runtimeRoot, value.owner.tmpRoot, value.owner.evidenceRoot])] };
+    const options = { root: repoRoot, sentinels: join(repoRoot, 'test/sentinels.json'), sentinelDir: global, testTmp: tmpRoot, evidenceDir: evidenceRoot, paths: [...artifacts, ...cohort.plan.owners.flatMap(value => [value.owner.runtimeRoot, value.owner.tmpRoot, value.owner.evidenceRoot])] };
     expect(scanner.findLeaks(options) === null, 'fresh original complete artifact scan').toBe(true);
     const control = await cohort.privateIO.createPrivateDirectory(tmpRoot, 'cp008-leak-'), planted = join(control, 'unexpected-recording.bin'), empty = await cohort.privateIO.createPrivateDirectory(control, 'empty-');
+    declareFixturePaths([planted]);
     writeFileSync(join(control, 'sentinels.json'), '[]', { mode: 0o600 });
     try {
       for (const sample of samples) {
@@ -599,6 +642,14 @@ export async function proveRleak(cohort: Cohort): Promise<void> {
       for (const absent of [empty, join(control, 'absent')]) expect(() => scanner.findLeaks({ ...options, sentinelDir: absent, sentinels: join(control, 'sentinels.json'), paths: [planted] })).toThrow();
     } finally { rmSync(planted, { force: true }); }
   }
+  for (const source of staticSources) {
+    const now = lstatSync(source.path, { bigint: true });
+    expect(now.dev === source.info.dev && now.ino === source.info.ino && readFileSync(source.path).equals(source.bytes), 'original static source remains unchanged').toBe(true);
+  }
+}
+export async function proveRleak(cohort: Cohort): Promise<void> {
+  const start = performance.now();
+  await proveCp008ArtifactLeaks(cohort);
   cohort.phases['leak'] = performance.now() - start;
   cohort.phases['total'] = performance.now() - cohort.begin;
   const inventory = [...cohort.completed, titles[6]];

@@ -3,9 +3,9 @@
 // database-clock preparation authority cannot renew itself across an await.
 import { expect, it } from 'vitest';
 import { PAYMENT_SECRET, succeeded } from '../fakes/execution-node.js';
-import { FakePreflightNode } from '../fakes/preflight-node.js';
+import { fakeChannel, FakePreflightNode } from '../fakes/preflight-node.js';
 import {
-  APPROVAL_KEYS, APPROVED_MAX_FEE, claimed, codeOf, dbNow, eventsOf, execById, execByProposal, force,
+  APPROVAL_KEYS, APPROVED_MAX_FEE, claimed, codeOf, dbNow, eventsOf, execById, execByProposal, force, IN_PEER, OUT_PEER,
   loadClaim, loadPersistence, loadPreflight, policyFor, reservationsOf, scratchDb, seedBase, seedProposal, seedReservation,
 } from '../helpers/cp028-executor.js';
 import { balances, prepare, ROUTE_FEE, S_BEFORE, T_BEFORE } from '../helpers/cp030-dispatch.js';
@@ -73,13 +73,21 @@ it('CP-029/REG-EXEC008 preflight cannot revive its expired lease after the ordin
     return row.id;
   };
   let expiry = 0n;
-  const node = new FakePreflightNode(base.sourceKey, base.targetKey, { during: { findCircularRoute: () => {
-    // Public record query used by the ordinary test helpers; no epoch change
-    // and no competing worker: expiration itself must end this authority.
-    const executionId = claimId();
-    force(path, executionId, { leaseAgoMs: 1_000 });
-    expiry = execById(path, executionId).lease_expires_at ?? 0n;
-  } } });
+  const node = new FakePreflightNode(base.sourceKey, base.targetKey, {
+    // The real adapter stamps observations with its database clock. Keep this
+    // lease-boundary fixture in that domain so freshness cannot preempt it.
+    channels: () => {
+      const observedAt = dbNow(path);
+      return [fakeChannel(base.sourceKey, OUT_PEER, { observedAt }), fakeChannel(base.targetKey, IN_PEER, { observedAt })];
+    },
+    during: { findCircularRoute: () => {
+      // Public record query used by the ordinary test helpers; no epoch change
+      // and no competing worker: expiration itself must end this authority.
+      const executionId = claimId();
+      force(path, executionId, { leaseAgoMs: 1_000 });
+      expiry = execById(path, executionId).lease_expires_at ?? 0n;
+    } },
+  });
   const db = p.openDatabase(path, { readOnly: false });
   try {
     const result = await prepareExecution({ db, adapter: node, workerId: 'worker-a', leaseMs: 60_000 },

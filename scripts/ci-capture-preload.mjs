@@ -2,6 +2,7 @@
 // never injected via NODE_OPTIONS into product CLI subprocesses.
 // Node.js/node doc/api/module.md: syncBuiltinESMExports updates named fs imports.
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import promises from 'node:fs/promises';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -10,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname, basename } from 'node:path';
 import { files, inside, retain, hash, binding, ancestry } from './ci-capture-files.mjs';
 import { secretProducer, producerEnvironment, stateCopyProducer, verifyStateCopy } from './ci-secret-output.mjs';
+import { beginSecretRemovals, finishSecretRemovals, secretOutputMutation } from './ci-secret-removal.mjs';
 
 const capture = process.env.FLUXWARDEN_CI_CAPTURE;
 let authorizeOutput;
@@ -18,8 +20,18 @@ export async function authorizeOwnedSecretOutput(options) {
 }
 if (capture) {
   const config = JSON.parse(fs.readFileSync(join(capture, 'private', 'config.json'), 'utf8'));
-  const originals = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, readdirSync: fs.readdirSync, lstatSync: fs.lstatSync, realpathSync: fs.realpathSync };
+  const originals = { readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync, readdirSync: fs.readdirSync, lstatSync: fs.lstatSync, fstatSync: fs.fstatSync, realpathSync: fs.realpathSync };
   const descriptors = new Map();
+  // Node.js/node doc/api/async_context.md: scope native recursive cleanup,
+  // retaining independent mutation observation across overlapping async calls.
+  const removalContext = new AsyncLocalStorage();
+  const nestedRemoval = (path, operation) => {
+    const current = removalContext.getStore();
+    return current?.active && current.capture === capture && current.root === config.root &&
+      current.proofs.length > 0 && current.proofs.every(proof => proof.state === 'pending') &&
+      ['unlink', 'rm', 'rmdir'].includes(current.operation) && ['unlink', 'rm', 'rmdir'].includes(operation) && inside(current.target, path);
+  };
+  const closedDescriptor = Symbol('closed descriptor');
   let busy = false;
   const incomplete = () => {
     const previous = busy;
@@ -208,19 +220,39 @@ if (capture) {
     const fd = typeof value === 'number' ? value : value?.fd;
     return descriptors.get(fd)?.path;
   };
-  const observe = (value, mutation = false) => {
+  const observe = (value, mutation = false, operation = 'write', removalCompletion = false) => {
     if (busy) return;
     const fd = typeof value === 'number' ? value : value?.fd;
     if (mutation && typeof fd === 'number') {
       if (descriptors.has(fd)) descriptors.get(fd).writing = true;
-      else if (fd > 2) incomplete(); // An inherited/unmapped write cannot establish source lifetime.
+      else if (fd > 2) {
+        // Reject a definitely closed descriptor before any write is attempted.
+        // A valid inherited/unmapped descriptor still cannot prove source lifetime.
+        try { originals.fstatSync(fd); }
+        catch (error) {
+          if (error.code === 'EBADF') {
+            // Preserve the public operation's native error fields. The fstat
+            // only establishes that no write can safely be attempted.
+            error.syscall = operation;
+            error.message = error.message.replace(/, fstat$/, ', ' + operation);
+            Object.defineProperty(error, closedDescriptor, { value: true });
+            throw error;
+          }
+        }
+        incomplete();
+      }
     }
     const path = pathOf(value);
     if (!path) return;
     if (mutation) {
       guardMutation(path);
       busy = true;
-      try { authorizeWrite(path); } catch { incomplete(); }
+      try { if (!nestedRemoval(path, operation)) secretOutputMutation(capture, path, operation); authorizeWrite(path); } catch { incomplete(); }
+      finally { busy = false; }
+    }
+    if (!mutation && !removalCompletion) {
+      busy = true;
+      try { secretOutputMutation(capture, path, operation); } catch { incomplete(); }
       finally { busy = false; }
     }
     if (!inside(config.sentinelDir, path) && !inside(path, config.sentinelDir) && !config.registered.some(source => source === path || inside(path, source))) return;
@@ -243,6 +275,32 @@ if (capture) {
       incomplete();
     } finally { busy = false; }
   };
+  const removalOperations = new Set(['unlink', 'rm', 'rmdir']);
+  const prepareRemoval = (value, operation) => {
+    if (busy || !removalOperations.has(operation)) return [];
+    const path = pathOf(value);
+    if (!path || nestedRemoval(path, operation)) return [];
+    busy = true;
+    try { return beginSecretRemovals(capture, config, path, operation, [...descriptors.values()].filter(row => row.writing).map(row => row.path)); }
+    catch { incomplete(); return []; }
+    finally { busy = false; }
+  };
+  const completeRemoval = (prepared, error) => {
+    if (!prepared.length) return;
+    busy = true;
+    try { if (!finishSecretRemovals(capture, prepared, error)) incomplete(); }
+    catch { incomplete(); }
+    finally { busy = false; }
+  };
+  const syscall = name => ['writeFile', 'appendFile', 'write', 'writev'].includes(name) ? 'write' : name === 'futimes' ? 'futime' : name;
+  const callbackFailure = (error, name, args) => {
+    if (!error[closedDescriptor] || typeof args.at(-1) !== 'function') throw error;
+    const callback = args.at(-1);
+    // Node's callback APIs return before delivering descriptor errors. No
+    // actual write is issued for the descriptor rejected by the native stat.
+    const rest = ['write', 'writev'].includes(name) ? [0, args[1]] : [];
+    process.nextTick(() => callback(error, ...rest));
+  };
   // A hard link publishes existing bytes at its destination, including the
   // Windows owner-only writer's staged file. Observe it before publication.
   const operations = ['writeFile', 'appendFile', 'copyFile', 'link', 'rename', 'unlink', 'rm', 'rmdir', 'truncate', 'mkdir'];
@@ -250,26 +308,45 @@ if (capture) {
     const target = name === 'copyFile' || name === 'link' || name === 'rename' ? 1 : 0;
     const originalSync = fs[name + 'Sync'];
     if (originalSync) fs[name + 'Sync'] = function (...args) {
-      observe(args[0], true); if (target) observe(args[target], true);
-      const result = originalSync.apply(this, args);
-      observe(args[target]);
+      observe(args[0], true, syscall(name)); if (target) observe(args[target], true);
+      const prepared = prepareRemoval(args[0], name), scope = prepared.length ? { capture, root: config.root, operation: name, target: pathOf(args[0]), proofs: prepared, active: true } : null;
+      let result;
+      try { result = scope ? removalContext.run(scope, () => originalSync.apply(this, args)) : originalSync.apply(this, args); }
+      catch (error) { if (scope) scope.active = false; completeRemoval(prepared, error); observe(args[target], false, name, removalOperations.has(name)); throw error; }
+      if (scope) scope.active = false;
+      completeRemoval(prepared);
+      observe(args[target], false, name, removalOperations.has(name));
+      if (target) observe(args[0]);
       return result;
     };
     const original = fs[name];
     if (original) fs[name] = function (...args) {
-      observe(args[0], true); if (target) observe(args[target], true);
+      if (typeof args.at(-1) !== 'function') return original.apply(this, args);
+      try { observe(args[0], true, syscall(name)); if (target) observe(args[target], true); }
+      catch (error) { return callbackFailure(error, name, args); }
+      const prepared = prepareRemoval(args[0], name), scope = prepared.length ? { capture, root: config.root, operation: name, target: pathOf(args[0]), proofs: prepared, active: true } : null;
       const callback = args.at(-1);
       if (typeof callback === 'function') args[args.length - 1] = function (...result) {
-        if (!result[0]) observe(args[target]);
+        if (scope) scope.active = false;
+        completeRemoval(prepared, result[0]);
+        observe(args[target], false, name, removalOperations.has(name));
+        if (target) observe(args[0]);
         return callback.apply(this, result);
       };
-      return original.apply(this, args);
+      try { return scope ? removalContext.run(scope, () => original.apply(this, args)) : original.apply(this, args); }
+      catch (error) { if (scope) scope.active = false; completeRemoval(prepared, error); throw error; }
     };
     const originalPromise = promises[name];
     if (originalPromise) promises[name] = async function (...args) {
-      observe(args[0], true); if (target) observe(args[target], true);
-      const result = await originalPromise.apply(this, args);
-      observe(args[target]);
+      observe(args[0], true, syscall(name)); if (target) observe(args[target], true);
+      const prepared = prepareRemoval(args[0], name), scope = prepared.length ? { capture, root: config.root, operation: name, target: pathOf(args[0]), proofs: prepared, active: true } : null;
+      let result;
+      try { result = await (scope ? removalContext.run(scope, () => originalPromise.apply(this, args)) : originalPromise.apply(this, args)); }
+      catch (error) { if (scope) scope.active = false; completeRemoval(prepared, error); observe(args[target], false, name, removalOperations.has(name)); throw error; }
+      if (scope) scope.active = false;
+      completeRemoval(prepared);
+      observe(args[target], false, name, removalOperations.has(name));
+      if (target) observe(args[0]);
       return result;
     };
   }
@@ -280,15 +357,23 @@ if (capture) {
       if (busy) return;
       for (const value of args.slice(0, ['symlink', 'cp'].includes(name) ? 2 : 1)) {
         const path = pathOf(value);
-        if (path) guardMutation(path);
+        if (path) { guardMutation(path); observe(path, true, name); }
       }
     };
     const originalSync = fs[name + 'Sync'];
-    if (originalSync) fs[name + 'Sync'] = function (...args) { guarded(args); return originalSync.apply(this, args); };
+    if (originalSync) fs[name + 'Sync'] = function (...args) { guarded(args); try { return originalSync.apply(this, args); } finally { for (const value of args.slice(0, ['symlink', 'cp'].includes(name) ? 2 : 1)) observe(value); } };
     const original = fs[name];
-    if (original) fs[name] = function (...args) { guarded(args); return original.apply(this, args); };
+    if (original) fs[name] = function (...args) {
+      guarded(args);
+      const callback = args.at(-1);
+      if (typeof callback === 'function') args[args.length - 1] = function (...result) {
+        for (const value of args.slice(0, ['symlink', 'cp'].includes(name) ? 2 : 1)) observe(value);
+        return callback.apply(this, result);
+      };
+      return original.apply(this, args);
+    };
     const originalPromise = promises[name];
-    if (originalPromise) promises[name] = async function (...args) { guarded(args); return originalPromise.apply(this, args); };
+    if (originalPromise) promises[name] = async function (...args) { guarded(args); try { return await originalPromise.apply(this, args); } finally { for (const value of args.slice(0, ['symlink', 'cp'].includes(name) ? 2 : 1)) observe(value); } };
   }
   const writable = flags => typeof flags === 'number'
     ? (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0
@@ -300,9 +385,11 @@ if (capture) {
   const openSync = fs.openSync;
   fs.openSync = function (path, flags, ...args) {
     if (writable(flags)) observe(path, true);
-    const fd = openSync.call(this, path, flags, ...args);
-    remember(fd, path, flags);
-    return fd;
+    try {
+      const fd = openSync.call(this, path, flags, ...args);
+      remember(fd, path, flags);
+      return fd;
+    } finally { if (writable(flags)) observe(path); }
   };
   const open = fs.open;
   fs.open = function (...args) {
@@ -311,6 +398,7 @@ if (capture) {
     if (typeof callback !== 'function') return open.apply(this, args);
     args[args.length - 1] = function (error, fd) {
       if (!error) remember(fd, args[0], args[1]);
+      if (writable(args[1])) observe(args[0]);
       return callback.call(this, error, fd);
     };
     return open.apply(this, args);
@@ -318,18 +406,27 @@ if (capture) {
   for (const name of ['write', 'writev', 'ftruncate', 'fchmod', 'fchown', 'futimes']) {
     const originalSync = fs[name + 'Sync'];
     fs[name + 'Sync'] = function (...args) {
-      observe(args[0], true);
+      try { observe(args[0], true, syscall(name)); }
+      catch (error) {
+        // Windows implements chown as a native no-op, including closed FDs.
+        if (!(error[closedDescriptor] && name === 'fchown' && process.platform === 'win32')) throw error;
+      }
       const result = originalSync.apply(this, args);
       observe(args[0]);
       return result;
     };
     const original = fs[name];
     fs[name] = function (...args) {
-      observe(args[0], true);
+      if (typeof args.at(-1) !== 'function') return original.apply(this, args);
+      const mutationPath = pathOf(args[0]);
+      try { observe(args[0], true, syscall(name)); }
+      catch (error) {
+        if (!(error[closedDescriptor] && name === 'fchown' && process.platform === 'win32')) return callbackFailure(error, name, args);
+      }
       const callback = args.at(-1);
       if (typeof callback !== 'function') return original.apply(this, args);
       args[args.length - 1] = function (...result) {
-        if (!result[0]) observe(args[0]);
+        observe(mutationPath ?? args[0]);
         return callback.apply(this, result);
       };
       return original.apply(this, args);
@@ -337,8 +434,10 @@ if (capture) {
   }
   const closeSync = fs.closeSync;
   fs.closeSync = function (fd) {
-    if (descriptors.get(fd)?.writing) observe(fd);
+    const descriptor = descriptors.get(fd);
+    if (descriptor?.writing) observe(fd);
     const result = closeSync.call(this, fd);
+    if (descriptor?.writing) observe(descriptor.path);
     descriptors.delete(fd);
     return result;
   };
@@ -348,6 +447,7 @@ if (capture) {
     const descriptor = descriptors.get(fd);
     if (descriptors.get(fd)?.writing) observe(fd);
     return close.call(this, fd, function (error) {
+      if (descriptor?.writing) observe(descriptor.path);
       if (!error && descriptors.get(fd) === descriptor) descriptors.delete(fd);
       return callback.call(this, error);
     });
@@ -355,7 +455,13 @@ if (capture) {
   const watchStream = (stream, path, existingFd) => {
     let openedFd = existingFd;
     let descriptor = descriptors.get(existingFd);
-    if (typeof existingFd === 'number') observe(existingFd, true);
+    if (typeof existingFd === 'number') {
+      try { observe(existingFd, true); }
+      catch (error) {
+        if (!error[closedDescriptor]) throw error;
+        process.nextTick(() => stream.destroy(error));
+      }
+    }
     stream.on('open', fd => { openedFd = fd; remember(fd, path, 'w'); descriptor = descriptors.get(fd); });
     stream.on('finish', () => observe(path));
     stream.on('close', () => { observe(path); if (typeof openedFd === 'number' && descriptors.get(openedFd) === descriptor) descriptors.delete(openedFd); });
@@ -371,16 +477,20 @@ if (capture) {
   const openPromise = promises.open;
   promises.open = async function (path, flags, ...args) {
     if (writable(flags)) observe(path, true);
-    const handle = await openPromise.call(this, path, flags, ...args);
+    let handle;
+    try { handle = await openPromise.call(this, path, flags, ...args); }
+    finally { if (writable(flags)) observe(path); }
     const fd = handle.fd;
     remember(fd, path, flags);
     for (const name of ['write', 'writev', 'writeFile', 'appendFile', 'truncate', 'chmod', 'chown', 'utimes']) {
       const original = handle[name];
       handle[name] = async function (...args) {
+        // FileHandle performs its own closed-state rejection, with method-
+        // specific fields, before any native write. Keep that rejection intact.
+        if (handle.fd === -1) return original.apply(this, args);
         observe(fd, true);
-        const result = await original.apply(this, args);
-        observe(fd);
-        return result;
+        try { return await original.apply(this, args); }
+        finally { observe(path); }
       };
     }
     const close = handle.close;
@@ -388,11 +498,13 @@ if (capture) {
       const descriptor = descriptors.get(fd);
       if (descriptors.get(fd)?.writing) observe(fd);
       const result = await close.apply(this, args);
+      if (descriptor?.writing) observe(descriptor.path);
       if (descriptors.get(fd) === descriptor) descriptors.delete(fd);
       return result;
     };
     const stream = handle.createWriteStream;
     handle.createWriteStream = function (...args) {
+      if (handle.fd === -1) return stream.apply(this, args);
       observe(fd, true);
       return watchStream(stream.apply(this, args), path, fd);
     };

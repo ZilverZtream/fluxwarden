@@ -9,6 +9,8 @@ import { expect, it } from 'vitest';
 import { loadCore } from '../helpers/cp004-reference.js';
 import { loadPersistence, scratch, type SnapshotInput } from '../helpers/cp015-persistence.js';
 import { currentPlannerCapture } from '../helpers/live-profile.js';
+import { lncliShortChannelId } from '../helpers/adapter-lab.js';
+import { asRecord } from '../helpers/cli.js';
 
 interface Ctx { nodeId: string; observedAt: number; blockHeight: number }
 interface Normalize {
@@ -41,7 +43,11 @@ it('CP-015/R1 db-state snapshots of LND-R and CLN-M match the live channel figur
       expect(channels.length).toBeGreaterThan(0);
       for (const raw of channels) {
         const ctx = { nodeId: node.id, observedAt: Date.now(), blockHeight: height };
-        const n = node.implementation === 'lnd' ? normalize.normalizeLndChannel(raw, ctx) : normalize.normalizeClnChannel(raw, ctx);
+        // lncli exposes the decimal short ID as scid and a 32-byte chan_id;
+        // normalization consumes the REST ListChannels wire shape instead.
+        const lnd = node.implementation === 'lnd' ? asRecord(raw, 'lncli channel') : null;
+        const n = lnd === null ? normalize.normalizeClnChannel(raw, ctx)
+          : normalize.normalizeLndChannel({ ...lnd, chan_id: lncliShortChannelId(lnd) }, ctx);
         const channelId = db.channels.upsert(n);
         db.snapshots.record(channelId, n);
         const row = db.snapshots.latest(channelId);

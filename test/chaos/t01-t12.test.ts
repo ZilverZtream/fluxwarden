@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { failed, succeeded } from '../fakes/execution-node.js';
 import { fakeChannel, circularRoute, FakePreflightNode } from '../fakes/preflight-node.js';
-import { APPROVAL_KEYS, codeOf, execById, execByProposal, loadClaim, loadPersistence, loadPreflight, policyFor, scratchDb, seedBase, seedProposal, type ExecDatabase } from '../helpers/cp028-executor.js';
+import { APPROVAL_KEYS, codeOf, dbNow, IN_PEER, OUT_PEER, execById, execByProposal, loadClaim, loadPersistence, loadPreflight, policyFor, scratchDb, seedBase, seedProposal, type ExecDatabase } from '../helpers/cp028-executor.js';
 import { prepare } from '../helpers/cp030-dispatch.js';
 import { exec, loadReconciler, rowOf } from '../helpers/cp030-execution.js';
 import { cancelled, journalTypes, preflight, reconciliation, routeWorld } from '../helpers/chaos-matrix.js';
@@ -65,7 +65,15 @@ describe('absolute fee ceiling', () => {
 });
 
 it('CP-033/B1 T-04 excessive CLTV cancels without invoice or send', async () => {
-  cancelled(await preflight('t04', b => ({ route: () => circularRoute(b.sourceKey, b.targetKey, 150_000n, 101) })), 'CLTV_DELTA_UNSAFE');
+  const r = await preflight('t04', b => ({
+    channels: () => {
+      const observedAt = dbNow(b.path);
+      return [fakeChannel(b.sourceKey, OUT_PEER, { observedAt }), fakeChannel(b.targetKey, IN_PEER, { observedAt })];
+    },
+    route: () => circularRoute(b.sourceKey, b.targetKey, 150_000n, 101),
+  }));
+  expect(r.node.routeRequests).toHaveLength(1);
+  cancelled(r, 'CLTV_DELTA_UNSAFE');
 });
 
 it('CP-033/B1 T-05 a reset after write is UNKNOWN then resolved by hash with one send and one journal pair', async () => {

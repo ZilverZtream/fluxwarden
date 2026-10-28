@@ -114,7 +114,8 @@ function canonicalCredential(kind: 'lnd' | 'cln', bytes: Buffer): Buffer | null 
 }
 function bindActiveAdapter(kind: 'lnd' | 'cln', active: LabNode, ownerRuntime: string, manifest: Record<string, unknown>, registrations: SourceObject[]): SourceObject[] {
   const service = kind === 'lnd' ? 'lnd-r' : 'cln-m', ports = asRecord(manifest['ports'], 'current ports');
-  if (active.service !== service || active.host !== '127.0.0.1' || active.port !== ports[kind === 'lnd' ? 'lndRest' : 'clnRest']) throw new Error('LabInvalidError: active adapter endpoint or service differs from current manifest');
+  const host = kind === 'lnd' ? '127.0.0.1' : 'localhost';
+  if (active.service !== service || active.host !== host || active.port !== ports[kind === 'lnd' ? 'lndRest' : 'clnRest']) throw new Error('LabInvalidError: active adapter endpoint or service differs from current manifest');
   const currentNode = asRecord(asRecord(manifest['nodes'], 'current nodes')[service], 'active current node');
   if (currentNode['kind'] !== kind || currentNode['pubkey'] !== active.pubkey) throw new Error('LabInvalidError: active adapter identity differs from current manifest');
   const certificate = asRecord(currentNode['certificate'], 'current certificate'), expectedCertificate = absolute(certificate['path'], 'current certificate path');

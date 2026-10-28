@@ -170,6 +170,14 @@ export async function secretOutputs(capture, config) {
     try {
       const row = JSON.parse(fs.readFileSync(path, 'utf8'));
       if (row.purpose === 'SECRET_OUTPUT' && row.prospective === false && row.state === 'not-produced' && row.result.exitCode !== 0) continue;
+      let removed;
+      try { fs.lstatSync(row.path); }
+      catch (error) {
+        if (error.code !== 'ENOENT' || row.kind !== undefined) throw error;
+        const { removedSecretOutput } = await import('./ci-secret-removal.mjs');
+        removed = removedSecretOutput(capture, config, path, row);
+      }
+      const payloadPath = removed?.path ?? row.path;
       if (row.purpose !== 'SECRET_OUTPUT' || row.prospective !== true || row.state !== 'closed' || row.path !== resolve(row.path)
         || path !== join(capture, 'private', 'authorizations', 'secret-output-' + hash(row.path) + '.json')
         || row.result.exitCode !== 0 || row.result.signal !== null || row.result.errorCode !== null
@@ -177,16 +185,16 @@ export async function secretOutputs(capture, config) {
         || !Array.isArray(row.environment.variables) || row.environment.variables.some(value => typeof value.name !== 'string' || !/^[0-9a-f]{64}$/.test(value.valueSha256))
         || row.kind !== undefined && row.kind !== 'state-outbox-copy'
         || JSON.stringify(row.producer) !== JSON.stringify(row.kind ? stateCopyProducer(config, row.command, row.args, row.path, row.sourcePath) : secretProducer(config, row.command, row.args, row.path))
-        || JSON.stringify(row.file) !== JSON.stringify(binding(row.path))
-        || JSON.stringify(row.parents) !== JSON.stringify(ancestry(dirname(row.path)))) throw new Error('secret output custody');
-      const info = fs.lstatSync(row.path);
+        || !removed && (JSON.stringify(row.file) !== JSON.stringify(binding(row.path))
+        || JSON.stringify(row.parents) !== JSON.stringify(ancestry(dirname(row.path))))) throw new Error('secret output custody');
+      const info = fs.lstatSync(payloadPath);
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw new Error('secret output object');
       const permission = await import(pathToFileURL(join(config.root, 'dist/platform/owner-only.js')).href);
       if (process.platform === 'win32') {
-        const descriptor = permission.readSecurityDescriptors([row.path])[0];
+        const descriptor = permission.readSecurityDescriptors([payloadPath])[0];
         if (!descriptor || !permission.isOwnerOnlySecurityDescriptor(descriptor.sddl, descriptor.ownerSid, permission.currentUserSid(), 'file')) throw new Error('secret output permissions');
       }
-      const bytes = Buffer.from(permission.readOwnerOnlyFile(row.path, 65_536));
+      const bytes = Buffer.from(permission.readOwnerOnlyFile(payloadPath, 65_536));
       if (row.kind === 'state-outbox-copy') {
         if (!isDeepStrictEqual(row.environment, row.intendedEnvironment)) throw new Error('state output environment custody');
         let snapshotPath;
@@ -220,7 +228,7 @@ export async function secretOutputs(capture, config) {
       if (response.command !== 'keys generate' || response.error !== null
         || response.result?.public_key !== raw.toString('base64') || response.result?.key_id !== hash(raw).slice(0, 32)
         || JSON.stringify(Object.keys(response.result).sort()) !== JSON.stringify(['key_id', 'public_key'])) throw new Error('secret output response');
-      approved.push({ path: row.path, sha256: hash(bytes), keyId: hash(raw).slice(0, 32), authorizationSha256: hash(fs.readFileSync(path)), fingerprints: equivalents(bytes).map(hash) });
+      approved.push({ path: row.path, ...(removed ? { removed } : {}), sha256: hash(bytes), keyId: hash(raw).slice(0, 32), authorizationSha256: hash(fs.readFileSync(path)), fingerprints: equivalents(bytes).map(hash) });
     } catch { valid = false; }
   }
   return { valid, approved };

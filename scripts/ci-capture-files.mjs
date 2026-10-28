@@ -1,5 +1,6 @@
 // Finite custody for the CI driver's five explicitly owned directories.
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { resolve, join, relative, isAbsolute, sep, dirname } from 'node:path';
 
@@ -101,13 +102,25 @@ export function equivalents(bytes) {
 }
 
 export function retain(capture, path, purpose) {
+  const typedSnapshot = process.platform === 'win32' && purpose === 'SECRET_OUTPUT';
+  if (typedSnapshot) {
+    const receipt = fs.lstatSync(join(capture, 'receipt.json'));
+    if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size !== 0) throw new Error('capture typed snapshot is closed');
+  }
   const observed = binding(path);
   const bytes = fs.readFileSync(path);
   const sha256 = hash(bytes);
   const stored = join(capture, 'private', 'bytes', sha256);
   try { fs.writeFileSync(stored, bytes, { flag: 'wx', mode: 0o600 }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
+
   if (!fs.readFileSync(stored).equals(bytes) || observed.sha256 !== sha256 || JSON.stringify(observed) !== JSON.stringify(binding(path))) throw new Error('capture unstable retained file');
+  if (typedSnapshot) {
+    // Admit generated-secret snapshots through the existing held native-file
+    // protection. Ordinary retained egress keeps its unchanged fast path.
+    const permission = createRequire(import.meta.url)('../dist/platform/owner-only.js');
+    permission.restrictOwnerOnlyCreatedFile(stored, permission.currentUserSid());
+  }  if (typedSnapshot && (!fs.readFileSync(stored).equals(bytes) || JSON.stringify(observed) !== JSON.stringify(binding(path)))) throw new Error('capture unstable typed snapshot');
   const record = { path: resolve(path), sha256, purpose };
   if (purpose === 'EGRESS') {
     const output = { ...record, purpose: 'SECRET_OUTPUT' };

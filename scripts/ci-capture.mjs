@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { resolve, join, dirname, relative, sep } from 'node:path';
+import { resolve, join, dirname, relative, sep, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrivateDirectory, assertPrivateDirectories } from './private-scratch.mjs';
 import { findLeaks, sentinelRedactor } from './leak-check.mjs';
+import { hasCaptureLeaks } from './ci-capture-scan.mjs';
 import { variables, hash, inside, files, directories, registered, equivalents, retain, anchor, ancestry, binding, namespace } from './ci-capture-files.mjs';
 import { secretOutputs, unexpectedSecretMatches } from './ci-secret-output.mjs';
 
@@ -259,28 +260,55 @@ function authorizedDeclaration(capture, config, declared, path) {
   const observed = read(ledger);
   return observed.pathSha256 === key && observed.purpose === 'INPUT' && /^[0-9a-f]{64}$/.test(observed.declarationSha256);
 }
-function scan(capture, config, retained, approved = []) {
+async function scan(capture, config, retained, approved = []) {
   const options = { root: config.root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources') };
   // Keep the scanner's exact declaration and evidence-priority semantics on the
   // original paths. Private byte copies provide custody, never source credit.
   const paths = [...new Set([...retained.filter(record => record.purpose !== 'INPUT').map(record => record.path), ...captureEgress(capture, retained)])];
   const authorized = new Set(approved.map(row => row.path));
-  let leakFree = !findLeaks({ ...options, paths, testTmp: config.testTmp, evidenceDir: config.evidenceDir });
-  let noUnexpectedLeaks = authorized.size ? !findLeaks({ ...options, paths: paths.filter(path => !authorized.has(path)), testTmp: config.testTmp, evidenceDir: config.evidenceDir }) : Boolean(leakFree);
+  const removed = new Map(approved.filter(row => row.removed).map(row => [row.path, row]));
+  const replay = (options, row) => {
+    try { fs.lstatSync(row.path); throw new Error('capture removed output reappeared'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const path = row.removed.path;
+    if (!same(binding(path), row.removed.storage)) throw new Error('capture removed output changed');
+    const bytes = fs.readFileSync(path), text = bytes.toString('utf8');
+    if (hash(bytes) !== row.sha256 || !Buffer.from(text).equals(bytes) || !same(binding(path), row.removed.storage)) throw new Error('capture removed output payload');
+    // Canonical PEM is exact UTF-8. Replay its complete bytes and original name
+    // independently through the unchanged engine, without a synthetic filename.
+    const hit = findLeaks({ ...options, paths: [], commandOutput: basename(row.path) }) ||
+      findLeaks({ ...options, paths: [], commandOutput: text });
+    return hit ? { ...hit, path: row.path } : null;
+  };
+  const originalScan = options => {
+    const paths = options.paths ?? [];
+    const hit = findLeaks({ ...options, paths: paths.filter(path => !removed.has(path)) });
+    if (hit) return hit;
+    for (const path of paths) if (removed.has(path)) { const hit = replay(options, removed.get(path)); if (hit) return hit; }
+    return null;
+  };
+  const originalScanParallel = async options => {
+    const paths = options.paths ?? [];
+    if (await hasCaptureLeaks({ ...options, paths: paths.filter(path => !removed.has(path)) })) return true;
+    for (const path of paths) if (removed.has(path) && replay(options, removed.get(path))) return true;
+    return false;
+  };
+  let leakFree = !await originalScanParallel({ ...options, paths, testTmp: config.testTmp, evidenceDir: config.evidenceDir });
+  let noUnexpectedLeaks = authorized.size ? !await originalScanParallel({ ...options, paths: paths.filter(path => !authorized.has(path)), testTmp: config.testTmp, evidenceDir: config.evidenceDir }) : Boolean(leakFree);
   const declared = declarationSet(config.testTmp);
   const unproven = paths.filter(path => (declared.has(path) || declared.has('sha256:' + hash(path))) && !authorizedDeclaration(capture, config, declared, path));
   // The unchanged engine gets every unproved declaration target as EGRESS too;
   // a later append cannot retroactively suppress bytes already written there.
-  if (unproven.length && findLeaks({ ...options, paths: unproven })) { leakFree = false; if (!authorized.size) noUnexpectedLeaks = false; }
-  if (authorized.size && unproven.some(path => !authorized.has(path)) && findLeaks({ ...options, paths: unproven.filter(path => !authorized.has(path)) })) noUnexpectedLeaks = false;
+  if (unproven.length && originalScan({ ...options, paths: unproven })) { leakFree = false; if (!authorized.size) noUnexpectedLeaks = false; }
+  if (authorized.size && unproven.some(path => !authorized.has(path)) && originalScan({ ...options, paths: unproven.filter(path => !authorized.has(path)) })) noUnexpectedLeaks = false;
   const secretOutputMatches = [];
   for (const row of approved) {
-    const match = findLeaks({ ...options, paths: [row.path] });
+    const match = originalScan({ ...options, paths: [row.path] });
     if (match) { leakFree = false; secretOutputMatches.push({ pathSha256: hash(row.path), sha256: row.sha256, encoding: match.encoding }); }
   }
-  if (unexpectedSecretMatches(capture, retained, approved, findLeaks)) noUnexpectedLeaks = false;
+  if (unexpectedSecretMatches(capture, retained, approved, originalScan)) noUnexpectedLeaks = false;
   const roots = [...config.roots, ...config.outputs.filter(path => fs.existsSync(path)), capture];
-  const names = new Set([...retained.map(record => record.path), ...roots.flatMap(directories), ...roots.flatMap(path => ancestry(dirname(path)).map(row => row.path))]);
+  const names = new Set([...retained.map(record => record.path), ...approved.flatMap(row => row.removed?.names ?? []), ...roots.flatMap(directories), ...roots.flatMap(path => ancestry(dirname(path)).map(row => row.path))]);
   // Includes empty directories and all ancestor names. NUL cannot occur in a
   // filename, so one unchanged-engine pass retains every original name without
   // rebuilding source recognition for each directory and retained artifact.
@@ -355,7 +383,7 @@ export async function verifyCapture(root, capture) {
     return 1;
   }
   const outputs = await secretOutputs(capture, config);
-  const checked = scan(capture, config, records(capture, config), outputs.approved);
+  const checked = await scan(capture, config, records(capture, config), outputs.approved);
   const redact = sentinelRedactor({ root, sentinels: join(capture, 'private', 'sentinels.json'), sentinelDir: join(capture, 'private', 'sources') });
   if (!outputs.valid || !checked.noUnexpectedLeaks || checked.leakFree !== receipt.result.leakFree || checked.authorizedMatches !== receipt.result.authorizedMatches
     || !same(checked.secretOutputMatches, receipt.secretOutputMatches)
@@ -509,7 +537,7 @@ async function captureCommand(root, capture, command) {
   let leakFree = false, policySatisfied = false, authorizedMatches = 0, secretOutputMatches = [];
   const outputsPolicy = await secretOutputs(capture, config);
   try {
-    const checked = scan(capture, config, retained, outputsPolicy.approved);
+    const checked = await scan(capture, config, retained, outputsPolicy.approved);
     ({ leakFree, authorizedMatches, secretOutputMatches } = checked);
     policySatisfied = outputsPolicy.valid && checked.noUnexpectedLeaks;
     if (!policySatisfied) reasons.add('output_leak');

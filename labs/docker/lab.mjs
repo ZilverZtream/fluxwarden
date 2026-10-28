@@ -24,7 +24,7 @@ export const imagePins = Object.freeze({
   toxiproxy: 'ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e',
 });
 
-export function createLab({ owner: declaration, run = runDocker, clock = () => performance.now(),
+export function createLab({ owner: declaration, run, clock = () => performance.now(),
   delay: pause = (ms, signal) => delay(ms, undefined, { signal }),
   permissions = { create: createPrivateDirectory, assert: assertPrivateDirectory }, signal } = {}) {
   const owner = validateOwner(declaration);
@@ -34,7 +34,30 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
   const attempt = randomBytes(8).toString('hex');
   let deadline = 0, acquired = false, reserved = false, busy = false, sequence = 0;
   let identities = {}, channelIds = {}, bootstrapSentinels = [];
+  let verifiedContainers;
   const imageProofs = new Map();
+  // Docker CLI exec/cp accept immutable IDs (docker/cli
+  // cli/command/container/{exec,cp}.go). Compose still owns the lifecycle.
+  const nativeRun = (argv, configured) => {
+    if (verifiedContainers) {
+      const prefix = composeArguments(owner, override, []);
+      if (prefix.every((value, index) => argv[index] === value)) {
+        const args = argv.slice(prefix.length);
+        const selected = args[0] === 'exec' && args[1] === '-T' ? args[2]
+          : args[0] === 'cp' && args.length === 3 ? args[1].split(':')[0] : undefined;
+        if (selected !== undefined) {
+          const ids = [...verifiedContainers.values()];
+          const id = verifiedContainers.get(selected);
+          if (ids.length !== services.length || new Set(ids).size !== services.length || ids.some(value => typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) || !id) throw fail('container-binding');
+          const direct = args[0] === 'exec' ? ['exec', id, ...args.slice(3)]
+            : ['cp', `${id}:${args[1].slice(selected.length + 1)}`, args[2]];
+          return runDocker(['--config', owner.project, ...direct], configured);
+        }
+      }
+    }
+    return runDocker(argv, configured);
+  };
+  const dispatch = run ?? nativeRun;
   const context = (cleanup = false) => ({ clock, delay: pause, signal: cleanup ? undefined : signal, deadline });
   const journal = async (stage, result) => {
     await writeFile(join(owner.evidenceRoot, `lab-${attempt}-command-${String(++sequence).padStart(4, '0')}.json`),
@@ -46,7 +69,7 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
     // Finish the bounded Compose startup before rolling it back. Interrupting its
     // frontend can leave container creation overlapping down's resource inventory.
     // The checks around this call still reject cancellation before any node setup.
-    try { result = await run(argv, { cwd: owner.runtimeRoot, env, timeoutMs: Math.max(1, Math.min(limit, deadline - clock())), signal: cleanup || stage === 'up' ? undefined : signal }); }
+    try { result = await dispatch(argv, { cwd: owner.runtimeRoot, env, timeoutMs: Math.max(1, Math.min(limit, deadline - clock())), signal: cleanup || stage === 'up' ? undefined : signal }); }
     catch { throw fail(`${stage} subprocess`); }
     if (!result || !Number.isInteger(result.exitCode) || typeof result.stdout !== 'string' || typeof result.stderr !== 'string') throw fail(stage);
     await journal(stage, result);
@@ -106,7 +129,7 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
     if (ids.length !== 7) throw fail('container-inventory');
     const raw = await execute('inspect', ['--config', owner.project, 'inspect', ...ids]);
     const inspected = rows(parse(raw, 'inspect'), 'inspect');
-    if (inspected.length !== 7) throw fail('inspect');
+    if (inspected.length !== 7 || new Set(ids).size !== ids.length || inspected.some(container => typeof container.Id !== 'string' || !ids.includes(container.Id))) throw fail('inspect');
     const wanted = new Set();
     for (const container of inspected) {
       const config = record(container.Config, 'inspect'), labels = record(config.Labels, 'inspect');
@@ -146,6 +169,7 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
     }
     for (const key of ['cpus', 'memoryBytes', 'pids']) if (observed.reduce((sum, value) => sum + value[key], 0) > owner.resources[key]) throw fail('resource-budget');
     await writeFile(join(owner.evidenceRoot, `lab-${attempt}-container-${String(++sequence)}.json`), JSON.stringify(inspected.map(container => ({ Id: container.Id, Image: container.Image, Config: { Image: container.Config.Image, Labels: container.Config.Labels }, State: { Running: container.State.Running, Health: { Status: container.State.Health.Status } }, HostConfig: { NanoCpus: container.HostConfig.NanoCpus, Memory: container.HostConfig.Memory, PidsLimit: container.HostConfig.PidsLimit, PortBindings: container.HostConfig.PortBindings } }))), { mode: 0o600 });
+    verifiedContainers = new Map(observed.map(container => [container.service, container.containerId]));
     return observed;
   }
   async function copyBootstrap() {
@@ -205,10 +229,12 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
     await clearOwnedDirectory(owner.runtimeRoot);
     await releaseOwner(owner, context(true));
     reserved = false; acquired = false;
+    verifiedContainers = undefined;
     await writeFile(join(owner.evidenceRoot, `lab-${attempt}-cleanup.json`), JSON.stringify({ project: owner.project, containers: [], volumes: [], removedTemporaryState: true }), { mode: 0o600 });
   }
   async function up() {
     if (busy) throw fail('owner-busy'); busy = true; deadline = clock() + generalTimeout;
+    verifiedContainers = undefined;
     let releaseWorker;
     try {
       // Role credentials are optional; an owner without a policy keeps only the copied bootstrap files.
@@ -314,7 +340,7 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
         const credentialPermissions = createCredentialPermissions(owner);
         const certificates = Object.fromEntries(nodes.map(node => [node, identities[node].certificate.path]));
         const permissionRequest = createPermissionRequest({ owner, permissions: credentialPermissions, certificates });
-        const ordinaryProcess = (argv, options) => run(argv.slice(1), options);
+        const ordinaryProcess = (argv, options) => dispatch(argv.slice(1), options);
         const provisioned = await provisionAuthorizationFixtures({ owner, policy: credentialPolicy, identities, topology,
           permissions: credentialPermissions, permissionRequest, runProcess: ordinaryProcess, signal });
         try {
@@ -355,6 +381,7 @@ export function createLab({ owner: declaration, run = runDocker, clock = () => p
   // readiness observations as bring-up. This neither starts nor reconfigures it.
   async function observe() {
     if (busy) throw fail('owner-busy'); busy = true; deadline = clock() + generalTimeout;
+    verifiedContainers = undefined;
     try {
       await assertRoots();
       const manifest = record(parse(await readFile(join(owner.runtimeRoot, 'lab.json'), 'utf8'), 'manifest'), 'manifest');

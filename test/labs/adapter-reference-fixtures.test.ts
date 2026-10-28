@@ -45,7 +45,7 @@ function sourceFixture() {
   const manifest = { ...reference.manifest, nodes, credentials };
   const adapter = { version: 1, network: 'regtest', disposable: true, project: reference.owner.project, composeFile: join(root, 'compose.yml'),
     lnd: { service: 'lnd-r', host: '127.0.0.1', port: reference.owner.ports.lndRest, pubkey: reference.manifest.nodes['lnd-r']?.pubkey ?? '', tlsCert: lndCertificate, macaroon: lndCredential },
-    cln: { service: 'cln-m', host: '127.0.0.1', port: reference.owner.ports.clnRest, pubkey: reference.manifest.nodes['cln-m']?.pubkey ?? '', tlsCert: clnCertificate, rune: clnCredential }, wrongCert: join(root, 'wrong.pem') };
+    cln: { service: 'cln-m', host: 'localhost', port: reference.owner.ports.clnRest, pubkey: reference.manifest.nodes['cln-m']?.pubkey ?? '', tlsCert: clnCertificate, rune: clnCredential }, wrongCert: join(root, 'wrong.pem') };
   writeFileSync(ownerPath, JSON.stringify(reference.owner));
   const writeManifest = () => { writeFileSync(join(reference.owner.runtimeRoot, 'lab.json'), JSON.stringify(manifest)); };
   const writeAdapter = () => { writeFileSync(adapterPath, JSON.stringify(adapter)); };
@@ -119,6 +119,15 @@ it('CP-044/ARC-044-001 active endpoint TLS and complete credential must bind the
     () => { f.adapter.lnd.tlsCert = f.foreignCertificate; },
     () => { f.adapter.lnd.port += 1; },
     () => { f.adapter.lnd.host = 'localhost'; },
+    () => { f.adapter.cln.host = '127.0.0.1'; },
+    () => { f.adapter.cln.port += 1; },
+    () => { f.adapter.cln.tlsCert = f.foreignCertificate; },
+    () => { writeFileSync(f.foreignCredential, f.rune); f.adapter.cln.rune = f.foreignCredential; },
+    () => {
+      f.adapter.cln.service = 'cln-p'; f.adapter.cln.pubkey = f.reference.manifest.nodes['cln-p']?.pubkey ?? '';
+      f.manifest.nodes['cln-p'] = { ...f.manifest.nodes['cln-p'], kind: 'cln', certificate: structuredClone(f.manifest.nodes['cln-m']?.['certificate']) };
+      f.manifest.credentials['cln-p'] = structuredClone(f.manifest.credentials['cln-m'] ?? {});
+    },
     () => {
       f.adapter.lnd.service = 'lnd-p'; f.adapter.lnd.pubkey = f.reference.manifest.nodes['lnd-p']?.pubkey ?? '';
       f.manifest.nodes['lnd-p'] = { ...f.manifest.nodes['lnd-p'], kind: 'lnd', certificate: structuredClone(f.manifest.nodes['lnd-r']?.['certificate']) };
@@ -133,6 +142,7 @@ it('CP-044/ARC-044-001 active endpoint TLS and complete credential must bind the
       } finally {
         Object.assign(f.adapter, structuredClone(adapter)); Object.assign(f.manifest, structuredClone(manifest));
         writeFileSync(f.lndCredential, f.macaroon);
+        writeFileSync(f.foreignCredential, f.foreignBytes);
         const originalRune = f.sources[1];
         if (originalRune) writeFileSync(originalRune.path, f.rune);
         f.writeManifest(); f.writeAdapter();

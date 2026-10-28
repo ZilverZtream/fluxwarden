@@ -2,10 +2,11 @@
 // lifecycle and its allocation fencing (labs/docker/owner.mjs). No retained
 // observation or PASS result is synthesized by this preparation tool.
 import { createHash, randomUUID, randomInt } from 'node:crypto';
-import { readFile, writeFile, appendFile, copyFile, lstat } from 'node:fs/promises';
+import { readFile, writeFile, appendFile, copyFile, lstat, realpath } from 'node:fs/promises';
 import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { dirname, isAbsolute, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createPrivateDirectory, assertPrivateDirectories } from './private-scratch.mjs';
 import { preparePinnedCredentialSources } from './live-credential-sources.mjs';
@@ -49,12 +50,29 @@ async function publishEnvironment(env) {
 
 export async function prepareOwnedLive(parent, sourceCommit) {
   if (!isAbsolute(parent) || !/^[a-f0-9]{40}$/.test(sourceCommit)) throw new Error('required-live preparation: absolute private parent and source required');
+  const sentinelRoot = process.env.FLUXWARDEN_SENTINEL_DIR;
+  const contains = (base, path) => { const part = relative(base, path); return part === '' || (!isAbsolute(part) && part !== '..' && !part.startsWith('..' + (process.platform === 'win32' ? '\\' : '/'))); };
+  const overlaps = (first, second) => contains(first, second) || contains(second, first);
+  if (sentinelRoot !== undefined) {
+    if (!isAbsolute(sentinelRoot) || sentinelRoot !== resolve(sentinelRoot)) throw new Error('required-live preparation: canonical private sentinel root required');
+    await assertPrivateDirectories([sentinelRoot]);
+    const canonical = await realpath(sentinelRoot);
+    if ((process.platform === 'win32' ? canonical.toLowerCase() !== sentinelRoot.toLowerCase() : canonical !== sentinelRoot) ||
+      contains(sentinelRoot, resolve(parent)) || ['FLUXWARDEN_TEST_TMP', 'TEMP', 'TMP', 'FLUXWARDEN_EVIDENCE_DIR',
+        'FLUXWARDEN_CI_CAPTURE_DIR', 'FLUXWARDEN_CI_CAPTURE'].map(name => process.env[name])
+        .filter(Boolean).some(path => overlaps(sentinelRoot, resolve(path)))) throw new Error('required-live preparation: separate canonical sentinel root required');
+  }
   const directory = await createPrivateDirectory(parent, 'release-live-');
+  if (sentinelRoot && overlaps(sentinelRoot, directory)) throw new Error('required-live preparation: separate sentinel root required');
   const id = randomUUID(), ownerId = `ci-${id}`, base = randomInt(20000, 60000);
   const owners = [];
-  for (let index = 0; index < 3; index++) {
+  for (let index = 0; index < 5; index++) {
     const ownerRoot = await createPrivateDirectory(directory, `owner-${index}-`), paths = {};
-    for (const [key, prefix] of [['runtimeRoot', 'runtime-'], ['tmpRoot', 'tmp-'], ['sentinelRoot', 'sentinels-'], ['evidenceRoot', 'evidence-']]) paths[key] = await createPrivateDirectory(ownerRoot, prefix);
+    for (const [key, prefix] of [['runtimeRoot', 'runtime-'], ['tmpRoot', 'tmp-'], ['sentinelRoot', 'sentinels-'], ['evidenceRoot', 'evidence-']]) {
+      // Originals enter the authenticated global source namespace at creation;
+      // plans, runtime state and evidence remain outside that INPUT namespace.
+      paths[key] = await createPrivateDirectory(key === 'sentinelRoot' && sentinelRoot ? sentinelRoot : ownerRoot, prefix);
+    }
     const owner = { version: 1, id: `${ownerId}-${index}`, project: `fluxwarden-lab-${id}-${index}`, ...paths,
       ports: { lndRest: base + index * 3, clnRest: base + index * 3 + 1, toxiproxy: base + index * 3 + 2 },
       resources: { cpus: 2, memoryBytes: 2147483648, pids: 512 },
@@ -76,12 +94,12 @@ export async function prepareOwnedLive(parent, sourceCommit) {
   await put(credentialPlan, { version: 2, authorized: true, disposable: true, network: 'regtest', staticRoot,
     sourceManifest: sources.sourceManifest, bindingSourceManifest: sources.bindingSourceManifest,
     budget: { cpus: 8, memoryBytes: 8589934592, pids: 2048, workers: 2 },
-    owners: owners.slice(1).map(({ declaration }) => ({ declaration, imagePins,
+    owners: owners.slice(3).map(({ declaration }) => ({ declaration, imagePins,
       endpointRefs: Object.fromEntries(lightning.map(node => [node, { node, transport: 'owned-node-https', certificate: { node }, roles: ['read', 'execute'] }])),
       changePassword: { kind: 'fresh-denial-control' } })) });
   const path = join(directory, 'live-plan.json');
   await put(path, { ...owners[0].owner, schemaVersion: 1, sourceCommit, exclusive: true, network: 'regtest', authorized: true, disposable: true,
-    ownerId: owners[0].owner.id, directory, staticRoot, owner: owners[0].owner, ownerPath: owners[0].declaration, cohortOwners: owners.slice(1).map(row => row.declaration) });
+    ownerId: owners[0].owner.id, directory, staticRoot, owner: owners[0].owner, ownerPath: owners[0].declaration, cohortOwners: owners.slice(1, 3).map(row => row.declaration) });
   // Concrete two-owner lifecycle inputs. The independent suite observes outcomes.
   const scenarios = [
     { outcome: 'child-failure', trigger: { kind: 'owned-child-exit', service: 'lnd-p' } },
@@ -91,7 +109,7 @@ export async function prepareOwnedLive(parent, sourceCommit) {
     { outcome: 'SIGINT', trigger: { kind: 'SIGINT' } }, { outcome: 'SIGTERM', trigger: { kind: 'SIGTERM' } },
   ];
   const resourcePlan = join(directory, 'lifecycle-plan.json');
-  await put(resourcePlan, { version: 2, authorized: true, disposable: true, network: 'regtest', owners: owners.slice(1).map(({ declaration }) => ({ declaration, scenarios })) });
+  await put(resourcePlan, { version: 2, authorized: true, disposable: true, network: 'regtest', owners: owners.slice(1, 3).map(({ declaration }) => ({ declaration, scenarios })) });
   return { path, environment: { FLUXWARDEN_REQUIRE_LIVE: '1', FLUXWARDEN_LAB_PLAN: path, FLUXWARDEN_LAB_OWNER: owners[0].declaration,
     FLUXWARDEN_LAB_RESOURCE_PLAN: resourcePlan, FLUXWARDEN_LAB_CREDENTIAL_PLAN: credentialPlan, FLUXWARDEN_REFERENCE_ROOT: sources.referenceRoot } };
 }
@@ -109,12 +127,12 @@ async function selectedPlan() {
   return { plan, owner };
 }
 
-export async function startOwnedLive(publishToWorkflow = false, profile = '') {
+export async function startOwnedLive(publishToWorkflow = false, profile = '', signal) {
   const { plan, owner } = await selectedPlan();
   const { createLab } = await import('../labs/docker/lab.mjs');
   const controller = new AbortController(), interrupt = () => controller.abort();
   process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
-  const lab = createLab({ owner, signal: controller.signal });
+  const lab = createLab({ owner, signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal });
   let acquired = false;
   try {
     const manifest = await lab.up(); acquired = true;
@@ -125,7 +143,7 @@ export async function startOwnedLive(publishToWorkflow = false, profile = '') {
     await put(oraclePath, { authorized: true, disposable: true, network: 'regtest', project: owner.project, composeFile,
       imagePins: Object.fromEntries(services.map(service => [service, manifest.images[service.split('-')[0]].reference])),
       pubkeys: Object.fromEntries(lightning.map(node => [node, manifest.nodes[node].pubkey])) });
-    const node = (name, port, credentialKey) => ({ service: name, host: '127.0.0.1', port,
+    const node = (name, port, credentialKey) => ({ service: name, host: name.startsWith('cln-') ? 'localhost' : '127.0.0.1', port,
       tlsCert: manifest.nodes[name].certificate.path, [credentialKey]: manifest.credentials[name].execute.path, pubkey: manifest.nodes[name].pubkey });
     const adapterPath = join(plan.directory, `adapter-plan-${invocation}.json`);
     await put(adapterPath, { version: 1, disposable: true, network: 'regtest', project: owner.project, composeFile,
@@ -136,7 +154,12 @@ export async function startOwnedLive(publishToWorkflow = false, profile = '') {
         tlsCertificate: manifest.nodes['lnd-r'].certificate.path, macaroon: manifest.credentials['lnd-r'].execute.path,
         clnCertificate: manifest.nodes['cln-m'].certificate.path, rune: manifest.credentials['cln-m'].execute.path } }] });
     const environment = { FLUXWARDEN_LAB_ORACLE_OWNER: oraclePath, FLUXWARDEN_LAB_ADAPTER_PLAN: adapterPath, FLUXWARDEN_TOXIPROXY_OWNERS: faultPath };
-    if (profile === 'planner') {
+    if (profile === 'reference-read') {
+      const { produceReferenceRead } = await import('../labs/docker/reference-read.mjs');
+      const reference = await produceReferenceRead({ ownerPath: plan.ownerPath, sourceCommit: plan.sourceCommit, adapterPath,
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal });
+      environment.FLUXWARDEN_LAB_CP012_REFERENCE = reference.path;
+    } else if (profile === 'planner') {
       const capture = capturePlanner({ ownerPath: plan.ownerPath, sourceCommit: plan.sourceCommit });
       environment.FLUXWARDEN_LAB_CAPTURE_DIR = capture.captureDir;
     } else if (profile === 'chaos') {
@@ -154,6 +177,11 @@ export async function startOwnedLive(publishToWorkflow = false, profile = '') {
 }
 
 export async function stopOwnedLive() {
+  // Share the native recorder instance used by output authorization.
+  if (process.env.FLUXWARDEN_CI_CAPTURE) {
+    const receipt = await lstat(join(process.env.FLUXWARDEN_CI_CAPTURE, 'receipt.json'));
+    if (receipt.isFile() && !receipt.isSymbolicLink() && receipt.size === 0) createRequire(import.meta.url)('./ci-capture-preload.mjs');
+  }
   const { plan, owner } = await selectedPlan();
   let started;
   try { started = await read(join(plan.directory, 'started.json')); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
@@ -164,13 +192,13 @@ export async function stopOwnedLive() {
   await (await import('node:fs/promises')).unlink(join(plan.directory, 'started.json'));
   await (await import('node:fs/promises')).unlink(join(plan.directory, 'startup-environment.json'));
   for (const key of ['FLUXWARDEN_LAB_ORACLE_OWNER', 'FLUXWARDEN_LAB_ADAPTER_PLAN', 'FLUXWARDEN_TOXIPROXY_OWNERS',
-    'FLUXWARDEN_LAB_CAPTURE_DIR', 'FLUXWARDEN_CHAOS_REFERENCE_PLAN']) Reflect.deleteProperty(process.env, key);
+    'FLUXWARDEN_LAB_CAPTURE_DIR', 'FLUXWARDEN_CHAOS_REFERENCE_PLAN', 'FLUXWARDEN_LAB_CP012_REFERENCE']) Reflect.deleteProperty(process.env, key);
 }
 
-export async function startFaultPeer() {
+export async function startFaultPeer(signal) {
   const { plan } = await selectedPlan(), owner = await read(plan.cohortOwners[0]);
   const { createLab } = await import('../labs/docker/lab.mjs');
-  const lab = createLab({ owner }), manifest = await lab.up();
+  const lab = createLab({ owner, signal }), manifest = await lab.up();
   try {
     const faultPath = process.env.FLUXWARDEN_TOXIPROXY_OWNERS, faults = await read(faultPath);
     faults.owners.push({ project: owner.project, ports: owner.ports, resources: owner.resources, allowToxiproxyRestart: true, credentials: {

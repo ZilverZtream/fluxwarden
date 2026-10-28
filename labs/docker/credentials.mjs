@@ -39,6 +39,10 @@ export async function bakeLabCredentials({ owner: declaration, policy: configure
       if (!isAbsolute(owner[key]) || owner[key].split(/[\\/]/).includes('..') || resolve(owner[key]) !== owner[key]) throw failure('path');
     }
     const policy = validateCredentialPolicy(configured);
+    // lightningd/runes.c rate_limit_check uses a minimum 60/r seconds between uses.
+    const rate = BigInt(policy.callsPerMinute);
+    const interval = (60000n + rate - 1n) / rate;
+    const rateRetryMs = Number(interval > 1000n ? 1000n : interval);
     if (!object(authorizationFixtures)) throw failure('fixtures');
     const fixture = (node, operation) => {
       const value = authorizationFixtures[node]?.[operation];
@@ -95,7 +99,7 @@ export async function bakeLabCredentials({ owner: declaration, policy: configure
         // rejection is retried, within the same fixed deadline, without changing the rune.
         // clnrest answers a rune refusal with 401 and relays a checkrune refusal with 500.
         if (!lnd && [401, 403, 500].includes(answer.statusCode) && body.code === 1502 && /rate|per-second|per-minute|too soon/i.test(message)) {
-          try { await delay(1000, undefined, { signal }); } catch { throw failure('timeout'); }
+          try { await delay(rateRetryMs, undefined, { signal }); } catch { throw failure('timeout'); }
           continue;
         }
         // clnrest succeeds with 201; lnd's REST gateway with 200.
